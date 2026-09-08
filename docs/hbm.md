@@ -104,6 +104,39 @@ the size of the game stops mattering:
 | `0x1_8240_0000` | 2 MiB | IOP RAM (optional) |
 | `0x1_8260_0000` | ~1.96 GiB | free: working buffers, headroom |
 
+### Why 6 GiB, and what falls outside it
+
+6 GiB is chosen so that the overwhelming majority of titles are **entirely
+resident** and the cache never misses after staging. A single-layer DVD5 is
+4.38 GiB, comfortably inside it. What sits outside divides into three cases,
+and they are genuinely different problems:
+
+* **Genuine dual-layer single-disc titles.** Gran Turismo 4 is the usual
+  example; God of War, God of War II and Xenosaga Episode I are in the same
+  class. These are one disc of up to 7.95 GiB, so a 6 GiB cache holds most but
+  not all of it. **These work**: the cache keeps the working set and takes an
+  occasional miss, which the IOP sees as a slow sector. Nothing special is
+  needed for them.
+* **Multi-disc games.** Each disc is its own image and each fits easily; the
+  game asks the player to swap discs as it always did. What this needs is not
+  memory but a *disc change* — the interface tells the CDVD block the disc went
+  away and came back, and the new image is staged. That is a feature to build,
+  not a limit to work around, and it is the same thing a person with a real
+  drive does.
+* **Patched combined images**, where someone has merged both discs of a
+  two-disc game into one file. These are the awkward case, and not because of
+  size: the filesystem layout is not what the game expects, and the game's own
+  disc-swap logic has nothing to swap to. That is a compatibility problem
+  rather than a memory one, so it is **deliberately deferred**, with a list of
+  known-unsupported images kept rather than a half-working guess at handling
+  them.
+
+Sizing the HBM region to swallow the largest image anyone has ever built would
+cost the space the BIOS ROM and the EE's main memory need, and those are what
+make the system fast. 6 GiB is the allocation that serves nearly every disc
+fully and degrades gracefully rather than the one that serves every conceivable
+file and starves everything else.
+
 ### One mechanism, not two
 
 The point of a cache here is that **a small disc is simply one that never

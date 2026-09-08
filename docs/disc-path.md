@@ -111,6 +111,18 @@ Two stages, and the second is the one worth having:
   7.95 GiB against 8 GiB of HBM, which fits only by leaving nothing for
   anything else, which is why a cache and not a copy.
 
+### What is supported
+
+| | |
+|---|---|
+| single-layer disc (up to 4.38 GiB) | fully resident in the cache; never misses after staging |
+| dual-layer single-disc title (up to 7.95 GiB) | works, partially resident, occasional miss |
+| multi-disc game, one image per disc | each disc fits; needs a *disc change* in the interface, which is a feature rather than a limit |
+| **patched image merging both discs into one file** | **not supported**, and deferred deliberately — the problem is the filesystem layout and the game's own swap logic, not the size. A list of known images is kept rather than a half-working guess |
+
+`tools/ps2iop/discsource.py info` classifies an image against those cases, so
+the answer comes from the tooling rather than from someone remembering.
+
 **This is the reason the CDVD block must be built with a sector *source* behind
 an interface, rather than with a host round trip baked into it.** The IOP
 cannot tell the two apart, and the second can then replace the first without

@@ -36,6 +36,31 @@ import argparse, errno, os, sys, time
 
 SECTOR = 2048
 
+# The HBM disc cache, from docs/hbm.md. An image at or under this is entirely
+# resident once staged and never misses; a larger one still works, with the
+# cache holding its working set.
+CACHE_BYTES = 6 * 1024**3
+DVD5_BYTES  = 4_700_372_992          # single layer, nominal
+DVD9_BYTES  = 8_543_666_176          # dual layer, nominal
+
+
+def classify(size):
+    """Where an image falls against the cache, per docs/disc-path.md."""
+    if size <= CACHE_BYTES:
+        layer = "single-layer" if size <= DVD5_BYTES else "dual-layer"
+        return ("resident",
+                f"{layer}, fits the {CACHE_BYTES//1024**3} GiB cache entirely: "
+                "no misses once staged")
+    if size <= DVD9_BYTES:
+        return ("cached",
+                "dual-layer, larger than the cache: works, with the working set "
+                "resident and the occasional slow sector")
+    return ("oversize",
+            f"{size/1024**3:.2f} GiB is beyond a dual-layer disc. That usually means "
+            "two discs merged into one image, which is not supported -- the "
+            "filesystem layout is not what the game expects and its own disc-swap "
+            "logic has nothing to swap to. Use the separate per-disc images.")
+
 
 class DiscSource:
     """A PS2 disc, whatever it is physically stored on."""
@@ -118,7 +143,10 @@ def main():
     if a.cmd == "info":
         print(f"{d.path}")
         print(f"   kind      {d.kind}")
-        print(f"   size      {d.size} bytes, {d.sectors} sectors of {SECTOR}")
+        print(f"   size      {d.size} bytes ({d.size/1024**3:.2f} GiB), "
+              f"{d.sectors} sectors of {SECTOR}")
+        verdict, why = classify(d.size)
+        print(f"   cache     {verdict}: {why}")
         # is it a PS2 disc? ask the reader that already knows
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         try:
