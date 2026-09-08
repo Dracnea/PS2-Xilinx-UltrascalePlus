@@ -88,12 +88,27 @@ in minutes where reasoning did not.
 - **Host disc server**: the image lives on the PC and is served over the PCIe
   link the card already has.
 
-*Test that proves it, and it uses your own game disc:* point the IOP at the
-image and have the BIOS's own `CDVDMAN` and `ROMDRV`/`IOMAN` read it — the
-ISO9660 volume descriptor, the root directory, then `SYSTEM.CNF`, which names
-the game's boot ELF (`BOOT2 = cdrom0:\SLUS_xxx.xx;1`). Reading that line off
-your disc, through the real BIOS driver stack, proves the whole disc path
-without a single pixel being drawn.
+*Test that proves it, and the pass criterion is already written down.*
+`tools/ps2iop/isoread.py` walks a disc from the host exactly as the BIOS will
+— volume descriptor at sector 16, root directory record, root directory,
+`SYSTEM.CNF` — and on the Star Wars Battlefront II disc on this machine it
+reports:
+
+```
+   label '2_01',  root directory at LBA 261
+   SYSTEM.CNF at LBA 2265115:  BOOT2 = cdrom0:\SLUS_212.40;1
+   SLUS_212.40 at LBA 2265116, 166708 bytes, valid ELF magic
+```
+
+When the hardware reads that same disc through `CDVDMAN`/`IOMAN` and answers
+`SLUS_212.40`, the disc path works. No pixel is drawn and no EE is involved.
+
+Note what the real disc teaches about the read path: **the files the BIOS needs
+are at the far end.** SYSTEM.CNF is at LBA 2,265,115 of a 2,278,160-sector
+volume, so an LBA truncated to 16 or 20 bits would find the volume descriptor
+and then fail on the one file that matters. `tools/ps2iop/mkiso.py --sectors`
+builds a sparse test image with that same shape — kilobytes on disk, far-end
+LBAs — so the failure can be found without a 4.7 GB image in the loop.
 
 **So: three blocks from now, loading a game image is a real and useful test.**
 It is not playing the game. It is the console proving it can find one.
@@ -128,6 +143,15 @@ PCSX2's software renderer frame for frame.
 
 DMA arbitration, timing between the three processors, and the real boot chain.
 Only here does "load a game ISO and play it" become the test.
+
+## The memory problem, alongside the clock one
+
+The IOP alone takes 70 % of an FK33's UltraRAM, and the GS's 4 MB of local
+memory is another 128 URAM on top. A whole console will not fit on the smaller
+card with everything on-chip, and the answer is almost certainly HBM -- which
+both cards have and neither design has touched yet. [cards.md](cards.md) has
+the numbers and the options. This does not block anything today; it is the kind
+of number that decides an architecture, so it is better known now.
 
 ## The clock problem, stated plainly
 

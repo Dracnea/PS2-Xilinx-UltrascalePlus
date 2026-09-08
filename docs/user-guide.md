@@ -160,7 +160,21 @@ tools/ps2iop/romdir.py /path/to/your/bios.bin --boot        # the 29 modules IOP
 tools/ps2iop/romdir.py /path/to/your/bios.bin --hw SIFMAN   # the registers one touches
 ```
 
-A game ISO has no use here yet. The CDVD block answers the boot-time status
+### Looking at a disc from the host
+
+Before any of the disc path exists in hardware, `isoread.py` does from the PC
+what the IOP will have to do, which is how you find out what your own disc
+should produce:
+
+```sh
+tools/ps2iop/isoread.py /path/to/your.iso            # what does it boot?
+tools/ps2iop/isoread.py /path/to/your.iso --list     # the root directory
+tools/ps2iop/mkiso.py test.iso --sectors 2278160     # a sparse, disc-shaped test image
+```
+
+It reads only the filesystem metadata and `SYSTEM.CNF`; it is not an extractor.
+
+A game ISO has no use on the card yet. The CDVD block answers the boot-time status
 commands and has no sector path; when it gets one, the image will be served
 from the host over PCIe and this page will say how. Keep both files out of the
 repository — `.gitignore` refuses `*.bin` so one cannot be committed by

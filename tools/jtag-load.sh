@@ -2,7 +2,11 @@
 #
 # Load a bitstream into the C1100 over its on-board USB JTAG (the FT4232H).
 #
-#   tools/jtag-load.sh bitstreams/<image>.bit
+#   tools/jtag-load.sh bitstreams/<image>.bit [device-glob]
+#
+# `device-glob` picks the JTAG device when more than one card is on the chain,
+# e.g. `xcvu33p*` for an FK33 or `xcu55n*` for a C1100. With none given the
+# first device Vivado sees is used, which is right for a single-card machine.
 #
 # Uses Vivado's hardware manager (Vivado or the free Vivado Lab Edition on
 # PATH: `vivado` / `vivado_lab`), which drives the Alveo's USB JTAG directly.
@@ -15,6 +19,7 @@
 # does it) to re-enumerate, or warm-reboot.
 set -uo pipefail
 BIT=${1:?bitstream}
+DEV_GLOB=${2:-}
 [[ -f $BIT ]] || { echo "no such file: $BIT" >&2; exit 1; }
 BIT=$(readlink -f "$BIT")
 
@@ -30,8 +35,13 @@ cat > "$TCL" <<TCL
 open_hw_manager
 connect_hw_server -allow_non_jtag
 open_hw_target
-set dev [lindex [get_hw_devices xcu55n*] 0]
-if {\$dev eq ""} { set dev [lindex [get_hw_devices] 0] }
+set want {$DEV_GLOB}
+if {\$want ne ""} {
+    set dev [lindex [get_hw_devices \$want] 0]
+    if {\$dev eq ""} { puts "no JTAG device matching \$want"; exit 1 }
+} else {
+    set dev [lindex [get_hw_devices] 0]
+}
 current_hw_device \$dev
 puts "device: \$dev"
 set_property PROGRAM.FILE {$BIT} \$dev

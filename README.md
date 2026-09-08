@@ -79,11 +79,15 @@ Running one on a card, and loading your own BIOS, is
 ## Hardware
 
 The C1100 is the bring-up target and the only card verified on silicon here.
-The design is not tied to it: the IOP costs 35 % of the C1100's UltraRAM, most
-of that the 4 MB BIOS ROM, so the shape of a port to another UltraScale+ card
-is mostly a platform file and a check that the memory fits. `fit/run_fit.sh`
-takes a part number precisely so a candidate can be sized before anyone
-commits to it.
+A second target, the SQRL Forest Kitten 33 (`xcvu33p`), builds and closes
+timing but **has never run** — no FK33 is attached to the machine this was
+developed on. What each card costs, and what porting to a third involves, is
+[docs/cards.md](docs/cards.md).
+
+The number that shapes the future is UltraRAM: the IOP needs 224 of them, which
+is 35 % of the C1100 and **70 % of the FK33**, and 128 of the 224 are the 4 MB
+BIOS ROM. The Graphics Synthesizer's local memory is another 128. Both cards
+have unused HBM, which is where those two are likely to end up.
 
 ## BIOS and disc images
 

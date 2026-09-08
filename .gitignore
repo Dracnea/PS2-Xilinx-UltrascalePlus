@@ -27,9 +27,23 @@ sim/*.out
 sim/*.hex
 fit/*.out
 
-# BIOS and disc images are the operator's own dumps and never belong here
+# BIOS and disc images are the operator's own dumps and never belong here.
+# This repository is public: a game image committed here would be redistributing
+# someone else's copyrighted work, and git history cannot be quietly corrected
+# afterwards. Keep this list ahead of the files, not behind them.
 *.bin
 !bitstreams/*.bin
+*.iso
+*.ISO
+*.img
+*.cue
+*.bin.*
+*.mdf
+*.mds
+*.nrg
+*.chd
+discs/
+bios/
 
 # LiteScope writes its config next to wherever the build was started
 /zanalyzer_*.csv

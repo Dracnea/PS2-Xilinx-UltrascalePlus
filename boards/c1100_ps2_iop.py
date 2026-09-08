@@ -142,7 +142,16 @@ class _IOPClocks(LiteXModule):
     > confirmed on this card. *Verify by:* status.locked reading 1 after the
     > bitstream loads; if it does not, fall back to DIVCLK 1 / MULT 11.0.
     """
-    def __init__(self, platform, clk100, rst):
+    def __init__(self, platform, clkref, rst, clkin_period=10.0, divclk_divide=2,
+                 ref_clk_name="clk100_p"):
+        """`clkref` is the buffered single-ended board reference.
+
+        The VCO is always 1106.25 MHz, so the three outputs are the same on
+        every card; only the way of getting there changes.  From the C1100's
+        100 MHz that is DIVCLK 2 / MULT 22.125; from the FK33's 200 MHz it is
+        DIVCLK 4 with the same multiplier, which keeps the value that survives
+        the three-decimal formatting bitgen's DRC checks.
+        """
         self.cd_iop   = ClockDomain()
         self.cd_iop2x = ClockDomain()
         self.cd_iop3x = ClockDomain()
@@ -154,14 +163,14 @@ class _IOPClocks(LiteXModule):
             p_BANDWIDTH       = "OPTIMIZED",
             p_COMPENSATION    = "AUTO",
             p_REF_JITTER1     = 0.01,
-            p_CLKIN1_PERIOD   = 10.0,
-            p_DIVCLK_DIVIDE   = 2,
+            p_CLKIN1_PERIOD   = clkin_period,
+            p_DIVCLK_DIVIDE   = divclk_divide,
             p_CLKFBOUT_MULT_F = 22.125,
             p_CLKOUT0_DIVIDE_F = 30.0,
             p_CLKOUT1_DIVIDE  = 15,
             p_CLKOUT2_DIVIDE  = 10,
             p_CLKOUT0_PHASE   = 0.0, p_CLKOUT1_PHASE = 0.0, p_CLKOUT2_PHASE = 0.0,
-            i_CLKIN1   = clk100, i_CLKIN2 = 0, i_CLKINSEL = 1,
+            i_CLKIN1   = clkref, i_CLKIN2 = 0, i_CLKINSEL = 1,
             i_CLKFBIN  = fb,     o_CLKFBOUT = fb,
             i_RST      = rst,    i_PWRDWN = 0,
             i_DADDR = 0, i_DCLK = 0, i_DEN = 0, i_DI = 0, i_DWE = 0,
@@ -190,7 +199,7 @@ class _IOPClocks(LiteXModule):
             "set_clock_groups -asynchronous "
             "-group [get_clocks -of_objects [get_pins {{iop_mmcm/CLKOUT0 iop_mmcm/CLKOUT1 iop_mmcm/CLKOUT2}}]] "
             "-group [get_clocks -of_objects [get_pins sys_mmcm/CLKOUT0]] "
-            "-group [get_clocks clk100_p]")
+            f"-group [get_clocks {ref_clk_name}]")
 
 
 # IOP with host control ----------------------------------------------------------------------------
