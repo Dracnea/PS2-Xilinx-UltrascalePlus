@@ -12,6 +12,8 @@
 #   0A  CDVD: no disc, N ready 0x4A, S command 03/00 returns 03 06 02 00,
 #       N command 00 completes with I_STAT bit 0 and INTC bit 2
 #   0B  byte enables on a register stub: sw, then sh low, sh high, sb
+#   0C  SIF mailbox: SMFLAG set, wait for the bench to set MSFLAG bit 16,
+#       clear it, read MSCOM, write/read SMCOM
 #   AA  all passed          EE  a check failed (the failing stage is the
 #                               POST value before it)
 
@@ -445,6 +447,51 @@ wa:     lbu     $t2, 0x08($t0)          # CDVD I_STAT
         bne     $t2, $t3, fail
         nop
         li      $t0, 0x0B
+        sb      $t0, 0($s7)
+
+# ---- 0C: the SIF mailbox, both sides ----------------------------------------
+# This is SIFMAN's init handshake in miniature.  The IOP sets its own ready bit
+# in SMFLAG, then spins on MSFLAG bit 16 until the EE answers -- which on real
+# hardware is the EE and here is the testbench.  With the SIF as a plain
+# read-back stub this loop never ends, which is exactly where a real BIOS
+# stopped on the C1100 on 2026-09-08.
+        li      $t0, 0x1D000030         # SMFLAG
+        li      $t1, 0x00010000
+        sw      $t1, 0($t0)             # IOP sets its ready bit
+        lw      $t2, 0($t0)
+        nop
+        bne     $t2, $t1, fail          # a write to SMFLAG sets, so it reads back
+        nop
+        li      $t0, 0x1D000020         # MSFLAG
+sifw:   lw      $t2, 0($t0)             # wait for the bench to set bit 16
+        nop
+        andi    $t2, $t2, 0x0000
+        lw      $t2, 0($t0)
+        nop
+        li      $t3, 0x00010000
+        and     $t2, $t2, $t3
+        beq     $t2, $zero, sifw
+        nop
+        sw      $t3, 0($t0)             # a write to MSFLAG clears
+        lw      $t2, 0($t0)
+        nop
+        and     $t2, $t2, $t3
+        bne     $t2, $zero, fail        # bit 16 must be gone
+        nop
+        li      $t0, 0x1D000000         # MSCOM: written by the bench, read-only here
+        lw      $t2, 0($t0)
+        nop
+        li      $t3, 0x5A5A1234
+        bne     $t2, $t3, fail
+        nop
+        li      $t0, 0x1D000010         # SMCOM: the IOP's own mailbox word
+        li      $t1, 0x0BADF00D
+        sw      $t1, 0($t0)
+        lw      $t2, 0($t0)
+        nop
+        bne     $t2, $t1, fail
+        nop
+        li      $t0, 0x0C
         sb      $t0, 0($s7)
 
 # ---- done -----------------------------------------------------------------

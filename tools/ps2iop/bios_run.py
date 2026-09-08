@@ -67,6 +67,9 @@ def main():
                     help="drive everything over UARTbone instead of PCIe (no driver, no root)")
     ap.add_argument("--port", type=int, default=1234)
     ap.add_argument("--no-scope", action="store_true")
+    ap.add_argument("--ee-init", action="store_true",
+                    help="after the boot has settled, answer the IOP's SIF init as the "
+                         "Emotion Engine would (set MSFLAG bit 16), and keep watching")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip reading the loaded ROM back through the peek port before the run")
     ap.add_argument("--verify-samples", type=int, default=64)
@@ -135,6 +138,25 @@ def main():
         time.sleep(0.002)
     s = iop_post.status(dev)
     say(f"after {a.seconds:g} s: POST {s['post']:02X} post_count {s['post_count']} cpu_error {s['cpu_error']} mem_idle {s['mem_idle']}")
+
+    if a.ee_init and "iop_sif_msflag" in dev.regs:
+        say("-- answering the IOP's SIF init as the Emotion Engine --")
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            iop_post.sif_ee_init(dev)
+        for line in buf.getvalue().splitlines():
+            say("  " + line)
+        t0 = time.time(); seen = None; last_count = -1
+        while time.time() - t0 < a.seconds:
+            s = iop_post.status(dev)
+            if s["post"] != seen or s["post_count"] != last_count:
+                seen = s["post"]; last_count = s["post_count"]
+                say(f"[EE+{time.time() - t0:7.3f}s] POST {seen:02X}  (count {s['post_count']}, cpu_error {s['cpu_error']})")
+            time.sleep(0.002)
+        s = iop_post.status(dev)
+        say(f"after the EE answer: POST {s['post']:02X} post_count {s['post_count']} "
+            f"cpu_error {s['cpu_error']} mem_idle {s['mem_idle']}")
 
     # POST ring
     cnt = dev.rd("zpost_count"); cyc = dev.rd("zpost_cycles")

@@ -20,7 +20,7 @@ On a Xilinx Alveo U55N / Varium C1100 (`xcu55n`), verified on silicon:
 |---|---|
 | IOP subsystem | R3000A CPU, memory mux, 2 MB RAM and 4 MB ROM in UltraRAM, INTC, six timers, SPU2 (two PSX SPU cores), SIO2 with a digital pad, CDVD with no disc |
 | Boot test | 12 POST stages, RAM, cache, timers, interrupts, SPU2, SIO2, CDVD — passes on the card in 10 ms |
-| **A real 4 MB retail BIOS** | **boots**: POST `FC 02 03 04 05 08 09` in 1.654 ms, then IOPBOOT loads **21 of the IOP kernel's 29 modules** and waits for an Emotion Engine that is not there |
+| **A real 4 MB retail BIOS** | **the IOP kernel boots to completion**: POST `FC 02 03 04 05 08 09` in 1.654 ms, then all 29 modules are processed and the IOP raises `SMFLAG = SIFINIT \| CMDINIT \| BOOTEND`. The Emotion Engine's half of the SIF mailbox is played by the host |
 | Cost | 22,639 LUTs (2.6 %), 83 BRAM, 227 URAM (35 %) of the C1100, timing closed with +0.376 ns |
 
 The detail, with measurements: [docs/ps2-bios-boot.md](docs/ps2-bios-boot.md)

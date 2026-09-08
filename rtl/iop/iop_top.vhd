@@ -52,6 +52,18 @@ entity iop_top is
       peek_addr  : in  std_logic_vector(24 downto 0) := (others => '0');
       peek_data  : out std_logic_vector(31 downto 0) := (others => '0');
       peek_valid : out std_logic := '0';
+      -- SIF host side: the Emotion Engine's half of the mailbox at 0x1D000000.
+      -- There is no EE, so the host plays it; see iop_sif.vhd.  sif_host_sel
+      -- picks what a write does: 0 MSCOM, 1 MSFLAG set, 2 MSFLAG clear,
+      -- 3 SMFLAG clear, 4 CTRL, 5 BD6.
+      sif_host_sel  : in  unsigned(2 downto 0) := (others => '0');
+      sif_host_data : in  std_logic_vector(31 downto 0) := (others => '0');
+      sif_host_we   : in  std_logic := '0';
+      sif_mscom     : out std_logic_vector(31 downto 0);
+      sif_smcom     : out std_logic_vector(31 downto 0);
+      sif_msflag    : out std_logic_vector(31 downto 0);
+      sif_smflag    : out std_logic_vector(31 downto 0);
+      sif_ctrl      : out std_logic_vector(31 downto 0);
       -- POST register (0x1F802070): what the boot code says about its progress
       post_code  : out std_logic_vector(7 downto 0) := (others => '0');
       post_wr    : out std_logic := '0';
@@ -702,7 +714,28 @@ begin
    idma  : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_dma_addr,  bus_dma_writeMask,  bus_dma_dataWrite,  bus_dma_read,  bus_dma_write,  bus_dma_dataRead);
    idma2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_dma2_addr, bus_dma2_writeMask, bus_dma2_dataWrite, bus_dma2_read, bus_dma2_write, bus_dma2_dataRead);
    issb2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_ssb2_addr, bus_ssb2_writeMask, bus_ssb2_dataWrite, bus_ssb2_read, bus_ssb2_write, bus_ssb2_dataRead);
-   isif  : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_sif_addr,  bus_sif_writeMask,  bus_sif_dataWrite,  bus_sif_read,  bus_sif_write,  bus_sif_dataRead);
+
+   -- the SIF is real (iop_sif.vhd); the host supplies the EE's half
+   isif : entity work.iop_sif
+   port map
+   (
+      clk1x         => clk1x,
+      reset         => reset_int,
+      bus_addr      => bus_sif_addr,
+      bus_writeMask => bus_sif_writeMask,
+      bus_dataWrite => bus_sif_dataWrite,
+      bus_read      => bus_sif_read,
+      bus_write     => bus_sif_write,
+      bus_dataRead  => bus_sif_dataRead,
+      host_sel      => sif_host_sel,
+      host_data     => sif_host_data,
+      host_we       => sif_host_we,
+      host_mscom    => sif_mscom,
+      host_smcom    => sif_smcom,
+      host_msflag   => sif_msflag,
+      host_smflag   => sif_smflag,
+      host_ctrl     => sif_ctrl
+   );
 
    -- CDVD register block, no disc (see iop_cdvd.vhd)
    icdvd : entity work.iop_cdvd

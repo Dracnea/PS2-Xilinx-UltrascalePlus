@@ -83,7 +83,7 @@ def add_iop_sources(platform, root=REPO_ROOT):
         join(up, "SyncRamDualByteEnable.vhd"), join(up, "dpram.vhd"), join(up, "export.vhd"),
         join(up, "divider.vhd"), join(up, "datacache.vhd"), join(up, "cpu.vhd"), join(up, "timer.vhd"),
         join(up, "memctrl.vhd"),
-        join(rtl, "iop", "iop_regstub.vhd"), join(rtl, "iop", "iop_console.vhd"), join(rtl, "iop", "iop_intc.vhd"),
+        join(rtl, "iop", "iop_regstub.vhd"), join(rtl, "iop", "iop_sif.vhd"), join(rtl, "iop", "iop_console.vhd"), join(rtl, "iop", "iop_intc.vhd"),
         join(rtl, "iop", "iop_timer32.vhd"), join(rtl, "iop", "iop_ram.vhd"),
         join(up, "spu.vhd"), join(up, "spu_ram.vhd"), join(up, "spu_gauss.vhd"),
         join(rtl, "iop", "iop_spuram.vhd"), join(rtl, "iop", "iop_spu2.vhd"),
@@ -216,6 +216,15 @@ class IOPBringup(LiteXModule, AutoCSR):
                list) and a retail BIOS prints nothing to the serial port.
     peek_count fetches completed since power-up, so a dump can check that it
                read as many distinct words as it asked for.
+    sif_data   value for the next SIF host write.
+    sif_go     writing it performs that write, the value selecting what:
+               0 MSCOM, 1 MSFLAG set, 2 MSFLAG clear, 3 SMFLAG clear, 4 CTRL,
+               5 BD6.  This is the Emotion Engine's half of the SIF mailbox,
+               and the host plays the EE because there is no EE: the BIOS's
+               SIFMAN spins on MSFLAG bit 16 until it is answered
+               (docs/ps2-bios-boot.md).
+    sif_mscom / sif_smcom / sif_msflag / sif_smflag / sif_regctrl
+               the mailbox as it stands, readable at any time.
     """
     def __init__(self, platform, locked):
         self.reset      = CSRStorage(1, reset=1, description="1 holds the IOP in reset")
@@ -234,6 +243,13 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.peek_addr  = CSRStorage(25, description="IOP byte address to read (bit 23 selects ROM); writing fetches it")
         self.peek_data  = CSRStatus(32,  description="the word at peek_addr; reading advances peek_addr by 4 and fetches the next")
         self.peek_count = CSRStatus(32,  description="peek fetches completed since power-up")
+        self.sif_data   = CSRStorage(32, description="value for the next SIF host write")
+        self.sif_go     = CSRStorage(3,  description="write to perform it: 0 MSCOM, 1 MSFLAG set, 2 MSFLAG clear, 3 SMFLAG clear, 4 CTRL, 5 BD6")
+        self.sif_mscom  = CSRStatus(32,  description="SIF MSCOM (EE -> IOP mailbox word)")
+        self.sif_smcom  = CSRStatus(32,  description="SIF SMCOM (IOP -> EE mailbox word)")
+        self.sif_msflag = CSRStatus(32,  description="SIF MSFLAG: the EE sets, the IOP clears. The BIOS waits here for bit 16")
+        self.sif_smflag = CSRStatus(32,  description="SIF SMFLAG: the IOP sets, the EE clears")
+        self.sif_regctrl = CSRStatus(32, description="SIF CTRL as the IOP last wrote it")
 
         # --- sys -> iop -------------------------------------------------------
         reset_iop = Signal()
@@ -288,6 +304,26 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.specials += MultiReg(peek_data_iop, self.peek_data.status, "sys")
         self.sync += If(peek_done_sync.o, self.peek_count.status.eq(self.peek_count.status + 1))
         self.peek_iop = (peek_req_sync.o, peek_addr_iop, peek_data_iop, peek_valid_iop)
+
+        # --- SIF host side: the host is the EE ---------------------------------
+        # Same shape as the peek port: the value settles through a MultiReg and
+        # the strobe crosses a cycle later as a pulse, so the data is stable in
+        # the iop domain before the write happens.
+        sif_sel_iop  = Signal(3)
+        sif_data_iop = Signal(32)
+        self.specials += MultiReg(self.sif_go.storage, sif_sel_iop, "iop")
+        self.specials += MultiReg(self.sif_data.storage, sif_data_iop, "iop")
+        sif_arm, sif_go = Signal(), Signal()
+        self.sync += [sif_arm.eq(self.sif_go.re), sif_go.eq(sif_arm)]
+        self.sif_we_sync = sif_we_sync = PulseSynchronizer("sys", "iop")
+        self.comb += sif_we_sync.i.eq(sif_go)
+        sif_out = {n: Signal(32, name="sif_" + n) for n in
+                   ("mscom", "smcom", "msflag", "smflag", "ctrl")}
+        for n, csr in (("mscom", self.sif_mscom), ("smcom", self.sif_smcom),
+                       ("msflag", self.sif_msflag), ("smflag", self.sif_smflag),
+                       ("ctrl", self.sif_regctrl)):
+            self.specials += MultiReg(sif_out[n], csr.status, "sys")
+        self.sif_iop = (sif_we_sync.o, sif_sel_iop, sif_data_iop, sif_out)
 
         # --- iop -> sys -------------------------------------------------------
         post_code = Signal(8)
@@ -356,6 +392,14 @@ class IOPBringup(LiteXModule, AutoCSR):
             i_rom_wr    = rom_wr,
             i_rom_addr  = rom_ptr,
             i_rom_data  = rom_word,
+            i_sif_host_sel   = self.sif_iop[1],
+            i_sif_host_data  = self.sif_iop[2],
+            i_sif_host_we    = self.sif_iop[0],
+            o_sif_mscom      = self.sif_iop[3]["mscom"],
+            o_sif_smcom      = self.sif_iop[3]["smcom"],
+            o_sif_msflag     = self.sif_iop[3]["msflag"],
+            o_sif_smflag     = self.sif_iop[3]["smflag"],
+            o_sif_ctrl       = self.sif_iop[3]["ctrl"],
             i_peek_req       = self.peek_iop[0],
             i_peek_addr      = self.peek_iop[1],
             o_peek_data      = self.peek_iop[2],

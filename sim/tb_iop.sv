@@ -18,6 +18,12 @@ module tb_iop;
    wire        con_wr; wire [7:0] con_data;      // the IOP's serial console (Kprintf)
    always @(posedge clk1x) if (con_wr) $write("%c", con_data);
    reg         vblank = 0, hblank = 0;
+   // the SIF's host side: the bench stands in for the Emotion Engine
+   reg  [2:0]  sif_sel = 0;
+   reg  [31:0] sif_data = 0;
+   reg         sif_we = 0;
+   wire [31:0] sif_mscom, sif_smcom, sif_msflag, sif_smflag, sif_ctrl;
+
    // memory peek: the host-side port that dumps IOP RAM/ROM while the CPU is reset
    reg         peek_req = 0;
    reg  [24:0] peek_addr = 0;
@@ -31,8 +37,30 @@ module tb_iop;
       .rom_wr(rom_wr), .rom_addr(rom_addr), .rom_data(rom_data),
       .post_code(post_code), .post_wr(post_wr), .con_wr(con_wr), .con_data(con_data),
       .peek_req(peek_req), .peek_addr(peek_addr), .peek_data(peek_data), .peek_valid(peek_valid),
+      .sif_host_sel(sif_sel), .sif_host_data(sif_data), .sif_host_we(sif_we),
+      .sif_mscom(sif_mscom), .sif_smcom(sif_smcom), .sif_msflag(sif_msflag),
+      .sif_smflag(sif_smflag), .sif_ctrl(sif_ctrl),
       .cpu_error(cpu_error), .mem_idle(mem_idle)
    );
+
+   task sif_write(input [2:0] sel, input [31:0] d);
+      begin
+         @(posedge clk1x);
+         sif_sel <= sel; sif_data <= d; sif_we <= 1;
+         @(posedge clk1x);
+         sif_we <= 0;
+      end
+   endtask
+
+   // Stand in for the EE: once the IOP has published its ready bit in SMFLAG,
+   // answer the way the EE does -- put a word in MSCOM and set MSFLAG bit 16,
+   // which is the bit SIFMAN spins on.
+   initial begin
+      wait (sif_smflag[16] === 1'b1);
+      $display("[%0t] bench(EE): IOP set SMFLAG=%08x, answering", $time, sif_smflag);
+      sif_write(3'd0, 32'h5A5A1234);      // MSCOM
+      sif_write(3'd1, 32'h00010000);      // set MSFLAG bit 16
+   end
 
    reg [127:0] spu_row;
    reg [31:0] image [0:1048575];        // up to the full 4 MB ROM (a real BIOS)

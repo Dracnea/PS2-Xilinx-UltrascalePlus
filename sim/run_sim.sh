@@ -37,7 +37,7 @@ xvhdl -2008 --work mem \
   "$UP/SyncRamDualByteEnable.vhd" "$UP/dpram.vhd" "$UP/export.vhd" "$UP/divider.vhd" "$UP/datacache.vhd" \
   "$UP/cpu.vhd" "$UP/timer.vhd" "$UP/memctrl.vhd" \
   "$UP/spu_gauss.vhd" "$UP/spu_ram.vhd" "$UP/spu.vhd" \
-  "$RTL/iop/iop_regstub.vhd" "$RTL/iop/iop_console.vhd" "$RTL/iop/iop_intc.vhd" "$RTL/iop/iop_timer32.vhd" \
+  "$RTL/iop/iop_regstub.vhd" "$RTL/iop/iop_sif.vhd" "$RTL/iop/iop_console.vhd" "$RTL/iop/iop_intc.vhd" "$RTL/iop/iop_timer32.vhd" \
   "$RTL/iop/iop_ram.vhd" "$RTL/iop/iop_spuram.vhd" "$RTL/iop/iop_spu2.vhd" \
   "$RTL/iop/iop_sio2.vhd" "$RTL/iop/iop_cdvd.vhd" \
   "$RTL/iop/iop_memorymux.vhd" "$RTL/iop/iop_top.vhd" \

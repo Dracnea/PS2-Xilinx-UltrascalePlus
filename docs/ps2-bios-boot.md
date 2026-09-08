@@ -301,6 +301,129 @@ comes up and then waits for the Emotion Engine is the correct behaviour of
 this design, and the next block of work — a real DMA controller and a SIF with
 something on the far end — is what moves the number past 21.
 
+## Why it stops after SIFCMD, measured — 2026-09-08
+
+The module map said the boot reaches #21 `SIFCMD` and goes no further, with the
+CPU still running. The obvious guess was the DMA controller. **That guess was
+wrong**, and the card said so.
+
+With the BIOS still in ROM and the CPU spinning, the LiteScope on the CPU's
+memory bus was armed with an unconditional trigger and caught the loop. 309 bus
+events, and only three addresses in them:
+
+```
+   0xBD000020   x155     SIF MSFLAG
+   0x001FFD80   x77      a kernel flag in IOP RAM
+   0xBF801078   x77      INTC I_CTRL  (read clears it: CpuSuspendIntr)
+
+   LD 0xbd000020 = 00000000
+   LD 0xbd000020 = 00000000      (read twice: sceSifGetMSFLAG de-glitches)
+   LD 0x001ffd80 = 00000001
+   LD 0xbf801078 = 00000001
+   ... forever
+```
+
+No instruction fetches appear because the loop fits inside the 4 KB
+instruction cache, so only its data accesses reach the bus.
+
+Disassembling `SIFMAN` from the ROM finds the loop exactly:
+
+```
+ SIFMAN .text+0x1c8   lui   $s1,0x0001          ; 0x00010000
+ SIFMAN .text+0x1ec   jal   0x00000eb0
+ SIFMAN .text+0x1f4   jal   0x0000008c          ; sceSifGetMSFLAG
+ SIFMAN .text+0x204   addu  $s0,$v0,$zero
+ SIFMAN .text+0x208   and   $s0,$s0,$s1         ; MSFLAG & 0x00010000
+ SIFMAN .text+0x20c   beq   $s0,$zero,0x1ec     ; spin while clear
+```
+
+**The IOP is waiting for MSFLAG bit 16 — and MSFLAG is written by the Emotion
+Engine, never by the IOP.** A register stub returns zero forever, so the wait
+cannot end. Nothing about DMA is involved: no DMA register appears in the
+trace at all.
+
+## The SIF, with the host standing in for the EE
+
+`rtl/iop/iop_sif.vhd` replaces the stub with the real mailbox. The registers
+are semaphores rather than storage, which is the part a stub cannot fake:
+
+| | | |
+|---|---|---|
+| `0x00` | MSCOM | EE writes, IOP reads |
+| `0x10` | SMCOM | IOP writes, EE reads |
+| `0x20` | MSFLAG | **the EE sets bits; an IOP write clears the bits it names** |
+| `0x30` | SMFLAG | **the IOP sets bits (a write ORs them in); the EE clears** |
+| `0x40` | CTRL | stored |
+| `0x60` | BD6 | SIFMAN reads it early and compares against `0x1D000060` |
+
+Both sides act in the same cycle rather than one assignment overwriting the
+other — the IOP clears MSFLAG while the EE sets it, and sequencing those would
+silently drop whichever lost, which in a mailbox is a hang waiting to happen.
+
+There is no Emotion Engine, so **the host plays it**. `iop_sif`'s host port is
+on CSRs (`iop_sif_data` + `iop_sif_go`, and the five registers readable), and
+`tools/ps2iop/iop_post.py sif ee-init` performs the EE's side of the
+handshake: put a word in MSCOM, then set MSFLAG bit 16.
+
+```sh
+tools/ps2iop/iop_post.py --csr <image>.csr.csv sif            # show the mailbox
+tools/ps2iop/iop_post.py --csr <image>.csr.csv sif ee-init    # answer as the EE
+tools/ps2iop/bios_run.py <rom0.bin> --ee-init                 # boot, then answer
+```
+
+Verified in simulation: boot-test stage `0C` is the same handshake in
+miniature — the IOP publishes `SMFLAG = 0x00010000`, the testbench notices,
+writes `MSCOM` and sets `MSFLAG` bit 16, and the IOP sees it, clears it and
+reads the mailbox back. With the SIF as a stub that stage never ends.
+
+### On silicon, 2026-09-08 19:40 — the IOP kernel finishes booting
+
+Bitstream `d48bfa2a4fb7071dc221e376163701f0`, over PCIe (the 4 MB BIOS loads in
+**1.8 s** at 581k words/s, against sixteen minutes over the UART), verified
+against the file at 97 sampled windows first.
+
+From a cold boot the mailbox is empty and the CPU is on the MSFLAG spin. One
+host write — MSFLAG bit 16, the Emotion Engine's part — and:
+
+```
+before the EE answers:  MSCOM 00000000  SMCOM 00000000  MSFLAG 00000000  SMFLAG 00000000
+after:                  MSCOM 00000000  SMCOM 00019600  MSFLAG 00010000  SMFLAG 00070000
+```
+
+`SMFLAG = 0x00070000` is `SIF_STAT_SIFINIT | SIF_STAT_CMDINIT |
+SIF_STAT_BOOTEND` (0x10000 / 0x20000 / 0x40000 in PS2SDK). **BOOTEND is the
+IOP telling the EE that its boot is over.** `SMCOM = 0x00019600` is the IOP
+publishing the address of its SIF0 receive buffer in RAM, which is the other
+half of what the handshake is for. Reproducible from reset.
+
+The module map moves accordingly — 21 before, **28** after:
+
+```
+ 22 REBOOT    0x0001a930      25 CDVDFSV   0x00039330
+ 23 LOADFILE  0x0001ae30      27 FILEIO    0x0003fd30
+ 24 CDVDMAN   0x0001ce30      28 SECRMAN   0x00041a30
+```
+
+`CDVDMAN` is 113,728 bytes of driver and it initialised against the CDVD
+register block with no disc behind it, which is the answer to whether the stub
+was good enough for the boot: it was.
+
+**All 29 are accounted for.** `EESYNC`, `SIFINIT` and `IGREETING` are absent
+from RAM because they are meant to be: their entry points return 1
+(`NO_RESIDENT_END`), so LOADCORE runs them once and frees them. EESYNC
+demonstrably ran — it is the module that calls `sceSifSetSMFLAG(0x40000)`,
+and BOOTEND is set.
+
+Afterwards the CPU goes quiet: an 8184-sample capture of the CPU's memory bus
+contains **no bus events at all**, and the stall detector reads 113,743 idle
+cycles (3.1 ms) without tripping its 114 ms threshold. So it is running and
+occasionally waking — the shape of a kernel idle thread with a timer — rather
+than either spinning or hung.
+
+> *Verify by:* the exact identity of the idle loop is inferred from the absence
+> of bus traffic and from the stall detector, not from a program counter. The
+> instruction cache satisfies the loop, so the fetches never reach the bus.
+
 ## Known limitations
 
 - `iop_regstub` ignores the bus write mask: a halfword or byte store writes the

@@ -14,7 +14,7 @@ them.
 A PS2 is three processors and their peripherals. Counting blocks that need
 separate design and separate verification:
 
-### The IOP — 7 done, 3 partial, 3 stubbed
+### The IOP — 8 done, 3 partial, 2 stubbed
 
 | block | state |
 |---|---|
@@ -29,7 +29,7 @@ separate design and separate verification:
 | SIO2 | *partial* — command queue and a digital pad on port 0; no memory card, no multitap, no DMA |
 | CDVD | *partial* — the register block answers the boot-time status commands; no disc, no sector path |
 | **IOP DMAC** | **stub** — reads back what is written, moves nothing |
-| **SIF** (the link to the EE) | **stub** — same |
+| **SIF** (the link to the EE) | **works** — `rtl/iop/iop_sif.vhd`, with the host playing the EE; the IOP kernel boots to BOOTEND through it |
 | SSBUS2 config | **stub**, and that is probably fine forever |
 
 ### The Emotion Engine — 0 of 12
@@ -50,28 +50,38 @@ PCIe transport **works**; the video path from card to host **works** (verified
 at 60 fps with a test pattern). Still needed: a disc-image server, a real
 controller path, and an audio path.
 
-**Totals: 7 blocks working, 3 partial, 3 stubbed, 16 not started.**
+**Totals: 8 blocks working, 3 partial, 2 stubbed, 16 not started.**
 
 ## The milestones, in order
 
-### 1. The IOP kernel finishes booting — 2 blocks
+### 1. The IOP kernel finishes booting — **done, 2026-09-08**
 
-Today a real BIOS boots and loads **21 of the IOP kernel's 29 modules**,
-stopping after `SIFCMD` because the SIF is a stub with no EE behind it
-([ps2-bios-boot.md](ps2-bios-boot.md)). Two blocks close that:
+**Corrected 2026-09-08.** This step was first written as "DMAC and SIF, in
+that order". Measuring where the boot actually stops showed the DMAC has
+nothing to do with it: the CPU spins on `SIF MSFLAG` waiting for bit 16, which
+only the Emotion Engine sets, and no DMA register appears anywhere in the
+trace ([ps2-bios-boot.md](ps2-bios-boot.md)).
 
-- **IOP DMAC.** PSX_MiSTer has a PS1 DMA controller and the IOP's is that plus
-  a second bank of channels and the control block at `0x1F801500`, so this
-  follows the pattern the rest of the IOP was built on. It unblocks SPU2,
-  CDVD and SIF transfers at once.
-- **SIF with a host-side stand-in for the EE.** The IOP's SIF half is real
-  hardware; what is missing is something to answer it. The host can play the
-  EE's part over PCIe well enough for `EESYNC` to complete.
+- **SIF, with the host standing in for the EE.** *Done in RTL and simulation*
+  (`rtl/iop/iop_sif.vhd`), pending the hardware run. The mailbox registers are
+  semaphores, which is precisely what a read-back stub cannot imitate.
+- **IOP DMAC** — still wanted, because SPU2, CDVD and the SIF's bulk transfers
+  all move data by DMA on a real console, but it is *not* what is blocking the
+  boot. PSX_MiSTer has a PS1 DMA controller and the IOP's is that plus a
+  second bank of channels at `0x1F801500`, so it follows the pattern the rest
+  of the IOP was built on. Whether the remaining eight modules need it to
+  finish loading is now an open question the SIF run will answer.
 
-*Test that proves it:* `iop_ram_map.py` reports 29 of 29 modules in RAM, and
-the kernel reaches its idle loop instead of spinning.
+**Done with one block, not two.** The SIF alone did it: on the card, one host
+write of MSFLAG bit 16 takes the IOP from 21 modules to 28, and `SMFLAG`
+reaches `SIFINIT | CMDINIT | BOOTEND` — the IOP announcing that its boot is
+over ([ps2-bios-boot.md](ps2-bios-boot.md)). The DMAC was never involved.
 
-### 2. The disc path — 2 more blocks, and **this is where your ISO first gets loaded**
+The lesson is worth keeping: the block that looks like the blocker and the
+block that is the blocker are not always the same, and a bus trace settles it
+in minutes where reasoning did not.
+
+### 2. The disc path — **the next block, and the one that needs your game disc**
 
 - **CDVD sector path**: the N-command read path, sector buffering and its DMA
   channel.
@@ -135,7 +145,7 @@ have to be made until step 3, but it should not be a surprise when it arrives.
 
 | you want to | blocks still needed | realistic milestone |
 |---|---|---|
-| see the IOP kernel finish booting | 2 | the next thing being worked on |
-| **load your own game disc and have the console read it** | **3** | **the first genuinely useful ISO test** |
+| see the IOP kernel finish booting | **0 — done 2026-09-08** | `SMFLAG = BOOTEND`, 28 modules |
+| **load your own game disc and have the console read it** | **2** | **the next thing being worked on** |
 | see the PS2 browser screen | ~15 | after the EE |
 | play a game | ~19 plus integration | the end of the road |

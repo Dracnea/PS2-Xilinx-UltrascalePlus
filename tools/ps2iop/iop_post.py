@@ -10,6 +10,7 @@ watch the POST register.
     iop_post.py ... peek ADDR [--words N]                  # read IOP memory (CPU must be in reset)
     iop_post.py ... dump FILE [--addr A] [--length N]      # dump IOP RAM to a file, 2 MB by default
     iop_post.py ... verify ROM.bin [--samples N]           # read the ROM back and compare with the file
+    iop_post.py ... sif [show|ee-init|set NAME VALUE]      # the EE's half of the SIF mailbox
 
 `run` writes `iop_pad0` before releasing reset. The CSR resets to 0xFFFF (nothing
 pressed) but boot_test.s stage 09 expects the pad to answer 0x5A3C, which is what
@@ -271,6 +272,48 @@ def peek(dev, addr, words=1):
 
 ROM_BASE = 0x800000        # bit 23 of a peek address selects the ROM
 
+# SIF host writes: what iop_sif_go selects
+SIF_MSCOM, SIF_MSFLAG_SET, SIF_MSFLAG_CLR, SIF_SMFLAG_CLR, SIF_CTRL, SIF_BD6 = range(6)
+SIF_STAT_SIFINIT = 0x00010000     # the bit SIFMAN spins on, set by the EE
+
+
+def sif_write(dev, sel, value):
+    """One write to the SIF as the Emotion Engine would make it."""
+    dev.wr("iop_sif_data", value)
+    dev.wr("iop_sif_go", sel)
+
+
+def sif_show(dev):
+    r = {n: dev.rd("iop_sif_" + n) for n in
+         ("mscom", "smcom", "msflag", "smflag", "regctrl")}
+    print(f"  MSCOM  {r['mscom']:08x}   (EE -> IOP mailbox word)")
+    print(f"  SMCOM  {r['smcom']:08x}   (IOP -> EE mailbox word)")
+    print(f"  MSFLAG {r['msflag']:08x}   (EE sets, IOP clears)"
+          + ("   bit16 SIFINIT set" if r["msflag"] & SIF_STAT_SIFINIT else ""))
+    print(f"  SMFLAG {r['smflag']:08x}   (IOP sets, EE clears)"
+          + ("   bit16 the IOP is ready and waiting" if r["smflag"] & SIF_STAT_SIFINIT else ""))
+    print(f"  CTRL   {r['regctrl']:08x}")
+    return r
+
+
+def sif_ee_init(dev, mscom=0x00000000):
+    """Answer the IOP's SIF init the way the Emotion Engine does.
+
+    The BIOS's SIFMAN publishes its own ready bit in SMFLAG and then spins on
+    MSFLAG bit 16 until the EE answers (SIFMAN .text+0x1ec on the 0220A ROM).
+    With no EE, nothing ever sets it and the boot stops there with the CPU
+    still running -- which is exactly what the card did on 2026-09-08. This
+    plays the EE's part: put a word in MSCOM, then set MSFLAG bit 16.
+    """
+    before = sif_show(dev)
+    if not (before["smflag"] & SIF_STAT_SIFINIT):
+        print("note: the IOP has not published its ready bit yet; setting MSFLAG anyway")
+    sif_write(dev, SIF_MSCOM, mscom)
+    sif_write(dev, SIF_MSFLAG_SET, SIF_STAT_SIFINIT)
+    time.sleep(0.05)
+    print("after answering as the EE:")
+    return sif_show(dev)
+
 
 def verify(dev, path, samples=64, window=16):
     """Read the loaded ROM back through the peek port and compare it with the file.
@@ -346,6 +389,10 @@ def main():
     p = sub.add_parser("peek");  p.add_argument("addr", type=lambda x: int(x, 0))
     p.add_argument("--words", type=int, default=8)
     p = sub.add_parser("verify"); p.add_argument("rom"); p.add_argument("--samples", type=int, default=64)
+    p = sub.add_parser("sif")
+    p.add_argument("action", nargs="?", default="show", choices=["show", "ee-init", "set"])
+    p.add_argument("name", nargs="?", choices=["mscom", "msflag-set", "msflag-clear", "smflag-clear", "ctrl", "bd6"])
+    p.add_argument("value", nargs="?", type=lambda x: int(x, 0), default=0)
     p = sub.add_parser("dump");  p.add_argument("file")
     p.add_argument("--addr", type=lambda x: int(x, 0), default=0)
     p.add_argument("--length", type=lambda x: int(x, 0), default=2 * 1024 * 1024)
@@ -366,6 +413,19 @@ def main():
     elif a.cmd == "peek":
         for i, w in enumerate(peek(dev, a.addr, a.words)):
             print(f"  {a.addr + 4 * i:08x}: {w:08x}")
+    elif a.cmd == "sif":
+        if "iop_sif_msflag" not in dev.regs:
+            sys.exit("this bitstream has no SIF host port; it predates rtl/iop/iop_sif.vhd")
+        if a.action == "show":
+            sif_show(dev)
+        elif a.action == "ee-init":
+            sif_ee_init(dev)
+        else:
+            sel = {"mscom": SIF_MSCOM, "msflag-set": SIF_MSFLAG_SET,
+                   "msflag-clear": SIF_MSFLAG_CLR, "smflag-clear": SIF_SMFLAG_CLR,
+                   "ctrl": SIF_CTRL, "bd6": SIF_BD6}[a.name]
+            sif_write(dev, sel, a.value)
+            sif_show(dev)
     elif a.cmd == "verify":
         sys.exit(verify(dev, a.rom, a.samples))
     elif a.cmd == "dump":
