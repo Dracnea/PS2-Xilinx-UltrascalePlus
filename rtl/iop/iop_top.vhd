@@ -158,6 +158,7 @@ architecture arch of iop_top is
    signal bus_sif_dataRead  : std_logic_vector(31 downto 0);
    signal bus_cdvd_addr     : unsigned(5 downto 0);
    signal bus_cdvd_writeMask, bus_sio2_writeMask, bus_spu2_writeMask : std_logic_vector(3 downto 0);
+   signal bus_dma_writeMask, bus_dma2_writeMask, bus_ssb2_writeMask, bus_sif_writeMask : std_logic_vector(3 downto 0);
    signal bus_cdvd_dataWrite: std_logic_vector(31 downto 0);
    signal bus_cdvd_read, bus_cdvd_write : std_logic;
    signal bus_cdvd_dataRead : std_logic_vector(31 downto 0);
@@ -448,6 +449,7 @@ begin
       bus_irq_write        => bus_irq_write,
       bus_irq_dataRead     => bus_irq_dataRead,
       bus_dma_addr         => bus_dma_addr,
+      bus_dma_writeMask    => bus_dma_writeMask,
       bus_dma_dataWrite    => bus_dma_dataWrite,
       bus_dma_read         => bus_dma_read,
       bus_dma_write        => bus_dma_write,
@@ -480,16 +482,19 @@ begin
       bus_tmr2_write       => bus_tmr2_write,
       bus_tmr2_dataRead    => bus_tmr2_dataRead,
       bus_dma2_addr        => bus_dma2_addr,
+      bus_dma2_writeMask   => bus_dma2_writeMask,
       bus_dma2_dataWrite   => bus_dma2_dataWrite,
       bus_dma2_read        => bus_dma2_read,
       bus_dma2_write       => bus_dma2_write,
       bus_dma2_dataRead    => bus_dma2_dataRead,
       bus_ssb2_addr        => bus_ssb2_addr,
+      bus_ssb2_writeMask   => bus_ssb2_writeMask,
       bus_ssb2_dataWrite   => bus_ssb2_dataWrite,
       bus_ssb2_read        => bus_ssb2_read,
       bus_ssb2_write       => bus_ssb2_write,
       bus_ssb2_dataRead    => bus_ssb2_dataRead,
       bus_sif_addr         => bus_sif_addr,
+      bus_sif_writeMask    => bus_sif_writeMask,
       bus_sif_dataWrite    => bus_sif_dataWrite,
       bus_sif_read         => bus_sif_read,
       bus_sif_write        => bus_sif_write,
@@ -694,10 +699,10 @@ begin
    );
 
    -- stubs: programmed and read back, nothing behind them yet
-   idma  : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_dma_addr,  bus_dma_dataWrite,  bus_dma_read,  bus_dma_write,  bus_dma_dataRead);
-   idma2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_dma2_addr, bus_dma2_dataWrite, bus_dma2_read, bus_dma2_write, bus_dma2_dataRead);
-   issb2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_ssb2_addr, bus_ssb2_dataWrite, bus_ssb2_read, bus_ssb2_write, bus_ssb2_dataRead);
-   isif  : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_sif_addr,  bus_sif_dataWrite,  bus_sif_read,  bus_sif_write,  bus_sif_dataRead);
+   idma  : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_dma_addr,  bus_dma_writeMask,  bus_dma_dataWrite,  bus_dma_read,  bus_dma_write,  bus_dma_dataRead);
+   idma2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_dma2_addr, bus_dma2_writeMask, bus_dma2_dataWrite, bus_dma2_read, bus_dma2_write, bus_dma2_dataRead);
+   issb2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_ssb2_addr, bus_ssb2_writeMask, bus_ssb2_dataWrite, bus_ssb2_read, bus_ssb2_write, bus_ssb2_dataRead);
+   isif  : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_sif_addr,  bus_sif_writeMask,  bus_sif_dataWrite,  bus_sif_read,  bus_sif_write,  bus_sif_dataRead);
 
    -- CDVD register block, no disc (see iop_cdvd.vhd)
    icdvd : entity work.iop_cdvd

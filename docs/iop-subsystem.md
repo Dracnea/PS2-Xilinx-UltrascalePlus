@@ -131,12 +131,11 @@ no Emotion Engine behind it and the DMA controller is a register stub
 ([docs/ps2-bios-boot.md](ps2-bios-boot.md)). Those two are
 therefore the next real blocks, in that order.
 
-The nearest job is the write mask on the four stub buses. `iop_regstub`
-stores whole 32-bit words and the memory mux does not export a write mask for
-the DMA, DMA2, SSBUS2 or SIF buses (it does for CDVD, SIO2 and SPU2), so the
-halfword stores SIFMAN makes to DMA block counts clobber the other half. It
-costs nothing today, because nothing behind those registers acts on them, and
-it has to be right before the DMA controller does.
+(Done 2026-09-08: the write mask now reaches all four stub buses, so a
+halfword or byte store to a stub keeps the rest of the register. Boot-test
+stage 0B checks it, and fails with POST EE if the mask is removed.)
+
+The order from here is in [docs/roadmap.md](roadmap.md).
 
 Still on the IOP: an SPU2 register decode in front of the two PSX cores
 (and 2 MB shared RAM), the IOP DMAC (SPU2, SIO2, CDVD and SIF all move their

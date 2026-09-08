@@ -7,8 +7,10 @@ a BIOS, and gets the picture back.
 
 **Where this is today: the I/O processor works and boots a real BIOS.** The
 Emotion Engine, the Vector Units and the Graphics Synthesizer do not exist
-yet. Nothing here plays a game, and the road to that is long and honestly
-described in [docs/ps2-hardware-study.md](docs/ps2-hardware-study.md).
+yet. Nothing here plays a game.
+[docs/roadmap.md](docs/roadmap.md) counts what exists against what does not
+and says which milestone is which — including the one three blocks away where
+your own game disc first becomes a useful test.
 
 ## What runs
 

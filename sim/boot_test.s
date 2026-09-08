@@ -11,6 +11,7 @@
 #       INTC bit 17 set and acknowledged
 #   0A  CDVD: no disc, N ready 0x4A, S command 03/00 returns 03 06 02 00,
 #       N command 00 completes with I_STAT bit 0 and INTC bit 2
+#   0B  byte enables on a register stub: sw, then sh low, sh high, sb
 #   AA  all passed          EE  a check failed (the failing stage is the
 #                               POST value before it)
 
@@ -407,6 +408,43 @@ wa:     lbu     $t2, 0x08($t0)          # CDVD I_STAT
         li      $t2, 0xFFFFFFFB
         sw      $t2, 0($t1)
         li      $t0, 0x0A
+        sb      $t0, 0($s7)
+
+# ---- 0B: byte enables reach the register stubs ------------------------------
+# The DMA block is a read-back stub, but it has to store the lanes a store
+# actually names.  SIFMAN writes DMA block counts with `sh` (0x1F8010A4,
+# 0x1F801524, 0x1F801534), and until 2026-09-08 iop_regstub stored whole words
+# and silently zeroed the other half.  Channel 4's MADR is untouched by the
+# rest of this test, so it is used as scratch.
+        li      $t0, 0x1F8010C0
+        li      $t1, 0xAABBCCDD
+        sw      $t1, 0($t0)
+        lw      $t2, 0($t0)
+        nop
+        bne     $t2, $t1, fail          # the word write must read back whole
+        nop
+        li      $t1, 0x1234
+        sh      $t1, 0($t0)             # low halfword only
+        lw      $t2, 0($t0)
+        nop
+        li      $t3, 0xAABB1234
+        bne     $t2, $t3, fail
+        nop
+        li      $t1, 0x5678
+        sh      $t1, 2($t0)             # high halfword only
+        lw      $t2, 0($t0)
+        nop
+        li      $t3, 0x56781234
+        bne     $t2, $t3, fail
+        nop
+        li      $t1, 0x99
+        sb      $t1, 1($t0)             # one byte only
+        lw      $t2, 0($t0)
+        nop
+        li      $t3, 0x56789934
+        bne     $t2, $t3, fail
+        nop
+        li      $t0, 0x0B
         sb      $t0, 0($s7)
 
 # ---- done -----------------------------------------------------------------

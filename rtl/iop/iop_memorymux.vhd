@@ -114,6 +114,7 @@ entity iop_memorymux is
       bus_irq_dataRead     : in  std_logic_vector(31 downto 0);
       
       bus_dma_addr         : out unsigned(6 downto 0); 
+      bus_dma_writeMask    : out std_logic_vector(3 downto 0);
       bus_dma_dataWrite    : out std_logic_vector(31 downto 0);
       bus_dma_read         : out std_logic;
       bus_dma_write        : out std_logic;
@@ -147,18 +148,21 @@ entity iop_memorymux is
       bus_tmr2_dataRead     : in  std_logic_vector(31 downto 0);
 
       bus_dma2_addr         : out unsigned(6 downto 0); 
+      bus_dma2_writeMask    : out std_logic_vector(3 downto 0);
       bus_dma2_dataWrite    : out std_logic_vector(31 downto 0);
       bus_dma2_read         : out std_logic;
       bus_dma2_write        : out std_logic;
       bus_dma2_dataRead     : in  std_logic_vector(31 downto 0);
 
       bus_ssb2_addr         : out unsigned(6 downto 0); 
+      bus_ssb2_writeMask    : out std_logic_vector(3 downto 0);
       bus_ssb2_dataWrite    : out std_logic_vector(31 downto 0);
       bus_ssb2_read         : out std_logic;
       bus_ssb2_write        : out std_logic;
       bus_ssb2_dataRead     : in  std_logic_vector(31 downto 0);
 
       bus_sif_addr         : out unsigned(6 downto 0); 
+      bus_sif_writeMask    : out std_logic_vector(3 downto 0);
       bus_sif_dataWrite    : out std_logic_vector(31 downto 0);
       bus_sif_read         : out std_logic;
       bus_sif_write        : out std_logic;
@@ -449,6 +453,7 @@ begin
       bus_dma_read      <= '0';
       bus_dma_write     <= '0';
       bus_dma_addr      <= address(6 downto 0);
+      bus_dma_writeMask <= writeMask_buf;
       bus_dma_dataWrite <= dataWrite_buf;
       if (address >= 16#1F801080# and address < 16#1F801100#) then
          bus_dma_read  <= enableRead;
@@ -499,6 +504,7 @@ begin
       bus_dma2_read      <= '0';
       bus_dma2_write     <= '0';
       bus_dma2_addr      <= address(6 downto 0);
+      bus_dma2_writeMask <= writeMask_buf;
       bus_dma2_dataWrite <= dataWrite_buf;
       if (address >= 16#1F801500# and address < 16#1F801580#) then
          bus_dma2_read  <= enableRead;
@@ -509,6 +515,7 @@ begin
       bus_ssb2_read      <= '0';
       bus_ssb2_write     <= '0';
       bus_ssb2_addr      <= address(6 downto 0);
+      bus_ssb2_writeMask <= writeMask_buf;
       bus_ssb2_dataWrite <= dataWrite_buf;
       if (address >= 16#1F801400# and address < 16#1F801480#) then
          bus_ssb2_read  <= enableRead;
@@ -519,6 +526,7 @@ begin
       bus_sif_read      <= '0';
       bus_sif_write     <= '0';
       bus_sif_addr      <= address(6 downto 0);
+      bus_sif_writeMask <= writeMask_buf;
       bus_sif_dataWrite <= dataWrite_buf;
       if (address >= 16#1D000000# and address < 16#1D000070#) then
          bus_sif_read  <= enableRead;
