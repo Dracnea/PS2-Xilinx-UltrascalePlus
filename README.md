@@ -39,7 +39,8 @@ rtl/altera_compat/   stand-ins for Intel megafunctions
 third_party/PSX_MiSTer/   submodule: the CPU, SPU, timers and memory controller
 sim/          xsim testbench and the R3000 boot test, with its assembler
 fit/          out-of-context synthesis, for sizing a die before a full build
-tools/        host side: load a ROM, watch POST, read memory back, read a rom0
+tools/        host side: load a ROM, watch POST, read memory back, read a rom0,
+              read a disc from an image, a block device or a drive
 docs/         measurements and what they establish
 bitstreams/   built images, so a card can be brought up without a Vivado seat
 ```

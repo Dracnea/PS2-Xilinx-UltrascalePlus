@@ -83,10 +83,19 @@ in minutes where reasoning did not.
 
 ### 2. The disc path — **the next block, and the one that needs your game disc**
 
-- **CDVD sector path**: the N-command read path, sector buffering and its DMA
-  channel.
-- **Host disc server**: the image lives on the PC and is served over the PCIe
-  link the card already has.
+- **IOP DMAC, channel 3.** Sector data reaches IOP memory by DMA; `CDVDMAN`
+  programs `0x1F8010B0`/`B4`/`B8` and waits for the interrupt. The DMAC was not
+  what blocked the kernel boot, but it *is* what blocks the disc.
+- **CDVD sector path**: the N-command read, sector buffering, the completion
+  interrupt.
+- **A sector source**: host-served over PCIe first, then the whole image in the
+  card's HBM, which the IOP cannot tell apart. [hbm.md](hbm.md),
+  [disc-path.md](disc-path.md).
+
+The host side of this is **done and checked against a real disc**:
+`discsource.py` reads sectors from an image, a block device or an optical
+drive through one interface, and `isoread.py` walks the filesystem the way the
+BIOS will.
 
 *Test that proves it, and the pass criterion is already written down.*
 `tools/ps2iop/isoread.py` walks a disc from the host exactly as the BIOS will
@@ -143,6 +152,21 @@ PCSX2's software renderer frame for frame.
 
 DMA arbitration, timing between the three processors, and the real boot chain.
 Only here does "load a game ISO and play it" become the test.
+
+## Where the memory goes
+
+Full analysis in [hbm.md](hbm.md); the short version, because it changes the
+plan for the FK33:
+
+- **The BIOS ROM should move to HBM.** IOP instruction fetch from ROM already
+  costs ~33 IOP cycles through the memory controller's BIOS delay; an HBM read
+  is ~4-6. It frees 128 UltraRAM for nothing, and that alone takes the IOP from
+  70 % to 30 % of an FK33 — enough room for the GS's 4 MB alongside it.
+- **The GS's local memory should not.** It is a 2048-bit random-access port at
+  ~38 GB/s; one HBM channel gives 14.4 and handles random access worse. That is
+  what UltraRAM is for.
+- **The disc should live in HBM.** 8 GB holds a dual-layer image, so the card
+  can hold the whole game and the host leaves the read path entirely.
 
 ## The memory problem, alongside the clock one
 
