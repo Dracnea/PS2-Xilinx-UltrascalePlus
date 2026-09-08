@@ -14,6 +14,8 @@
 #   0B  byte enables on a register stub: sw, then sh low, sh high, sb
 #   0C  SIF mailbox: SMFLAG set, wait for the bench to set MSFLAG bit 16,
 #       clear it, read MSCOM, write/read SMCOM
+#   0D  DMA channel 6 (OTC): builds a four-entry ordering table in RAM, checks
+#       the linked list and the end marker, the DICR flag and INTC bit 3
 #   AA  all passed          EE  a check failed (the failing stage is the
 #                               POST value before it)
 
@@ -492,6 +494,90 @@ sifw:   lw      $t2, 0($t0)             # wait for the bench to set bit 16
         bne     $t2, $t1, fail
         nop
         li      $t0, 0x0C
+        sb      $t0, 0($s7)
+
+# ---- 0D: DMA channel 6 (OTC) builds an ordering table ------------------------
+# The one DMA channel that needs no peripheral: it walks backwards through RAM
+# writing a linked list, each word holding the address of the previous entry
+# and the last word written holding 0x00FFFFFF. That makes it the channel that
+# can prove the DMA controller with nothing else present.
+#   MADR = the highest address, BCR = the number of entries,
+#   CHCR = 0x11000002: decrement (bit 1), SyncMode 0, start/busy (bit 24),
+#                      trigger (bit 28)
+        li      $t0, 0x1F8010F0         # DPCR: enable channel 6 (bits 27-24)
+        lw      $t1, 0($t0)
+        nop
+        lui     $t2, 0x0800
+        or      $t1, $t1, $t2
+        sw      $t1, 0($t0)
+        li      $t0, 0x1F8010F4         # DICR: master enable + channel 6 enable
+        lui     $t1, 0x00C0             # bit 23 master enable, bit 22 channel 6
+        sw      $t1, 0($t0)             #   (DICR enables are bits 16-22 for ch 0-6)
+        lw      $t1, 0($t0)
+        nop
+        lui     $t2, 0x00C0
+        and     $t1, $t1, $t2
+        bne     $t1, $t2, fail          # both bits must read back
+
+        li      $t0, 0x1F8010E0         # channel 6 MADR
+        li      $t1, 0x0003FFFC         # highest entry: 4 words at 0x3FFF0..0x3FFFC
+        sw      $t1, 0($t0)
+        li      $t1, 4                  # BCR: four entries
+        sw      $t1, 4($t0)
+        li      $t1, 0x11000002         # CHCR: decrement, start
+        sw      $t1, 8($t0)
+
+        li      $t3, 0x00100000         # spin until start/busy clears
+otcw:   lw      $t1, 8($t0)
+        nop
+        andi    $t2, $t1, 0x0000
+        lui     $t2, 0x0100
+        and     $t2, $t1, $t2
+        beq     $t2, $zero, otcd
+        nop
+        addiu   $t3, $t3, -1
+        bne     $t3, $zero, otcw
+        nop
+        b       fail                    # never completed
+        nop
+otcd:
+        li      $t0, 0xA003FFFC         # read the table back, uncached
+        lw      $t1, 0($t0)
+        nop
+        li      $t2, 0x0003FFF8
+        bne     $t1, $t2, fail          # top entry points at the one below
+        nop
+        lw      $t1, -4($t0)
+        nop
+        li      $t2, 0x0003FFF4
+        bne     $t1, $t2, fail
+        nop
+        lw      $t1, -8($t0)
+        nop
+        li      $t2, 0x0003FFF0
+        bne     $t1, $t2, fail
+        nop
+        lw      $t1, -12($t0)
+        nop
+        li      $t2, 0x00FFFFFF
+        bne     $t1, $t2, fail          # the last word written is the end marker
+        nop
+        li      $t0, 0x1F8010F4         # DICR: channel 6 flag must be set
+        lw      $t1, 0($t0)
+        nop
+        lui     $t2, 0x4000             # bit 30 = channel 6 flag
+        and     $t2, $t1, $t2
+        beq     $t2, $zero, fail
+        nop
+        li      $t0, 0x1F801070         # INTC I_STAT bit 3 (DMA)
+        lw      $t1, 0($t0)
+        nop
+        andi    $t2, $t1, 0x0008
+        beq     $t2, $zero, fail
+        nop
+        li      $t2, 0xFFFFFFF7
+        sw      $t2, 0($t0)             # acknowledge
+        li      $t0, 0x0D
         sb      $t0, 0($s7)
 
 # ---- done -----------------------------------------------------------------

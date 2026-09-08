@@ -105,7 +105,10 @@ Two stages, and the second is the one worth having:
 * **HBM-backed.** Stream the whole image into the card's 8 GB of HBM once, and
   the CDVD block reads sectors from memory with no host in the loop. A 4.7 GB
   disc at PCIe speed is a few seconds to load and then behaves like a disc that
-  is simply *there*. See [hbm.md](hbm.md).
+  is simply *there*. [hbm.md](hbm.md) has the memory map: the disc gets 5 GB at
+  the bottom, which leaves the BIOS ROM, the EE's future 32 MB of main memory
+  and nearly 3 GB of headroom above it. A dual-layer DVD9 title is the one case
+  that does not fit and keeps the host-served path.
 
 The IOP cannot tell the two apart, so the first can ship and be replaced.
 

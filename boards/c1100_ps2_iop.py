@@ -83,7 +83,7 @@ def add_iop_sources(platform, root=REPO_ROOT):
         join(up, "SyncRamDualByteEnable.vhd"), join(up, "dpram.vhd"), join(up, "export.vhd"),
         join(up, "divider.vhd"), join(up, "datacache.vhd"), join(up, "cpu.vhd"), join(up, "timer.vhd"),
         join(up, "memctrl.vhd"),
-        join(rtl, "iop", "iop_regstub.vhd"), join(rtl, "iop", "iop_sif.vhd"), join(rtl, "iop", "iop_console.vhd"), join(rtl, "iop", "iop_intc.vhd"),
+        join(rtl, "iop", "iop_regstub.vhd"), join(rtl, "iop", "iop_sif.vhd"), join(rtl, "iop", "iop_dma.vhd"), join(rtl, "iop", "iop_console.vhd"), join(rtl, "iop", "iop_intc.vhd"),
         join(rtl, "iop", "iop_timer32.vhd"), join(rtl, "iop", "iop_ram.vhd"),
         join(up, "spu.vhd"), join(up, "spu_ram.vhd"), join(up, "spu_gauss.vhd"),
         join(rtl, "iop", "iop_spuram.vhd"), join(rtl, "iop", "iop_spu2.vhd"),

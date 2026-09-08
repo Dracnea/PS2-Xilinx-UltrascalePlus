@@ -47,8 +47,10 @@ makes a whole console plausible on the FK33:
 
 ### 2. Game data — **move it, and this is the interesting one**
 
-8 GB holds an entire dual-layer disc with room to spare. Stream the image into
-HBM once over PCIe and the disc is simply *there*: the CDVD block reads sectors
+8 GB holds an entire single-layer disc -- a DVD5 is 4.7 GB -- with room for
+everything else on this list. (A dual-layer DVD9 title at up to 8.5 GB does
+*not* fit, and keeps the host-served path; see the memory map below.) Stream the
+image into HBM once over PCIe and the disc is simply *there*: the CDVD block reads sectors
 from HBM with no host in the loop, no per-sector round trip, and seek times
 that are a memory latency rather than a drive's. That is much closer to how a
 console behaves than a host answering every sector, and it is the reason the
@@ -77,6 +79,33 @@ UltraRAM is the right primitive for this: 4096 x 72 bits per block, two ports,
 a couple of cycles of latency, and the bandwidth scales with how many blocks
 are ganged. The GS's local memory is the one thing on this list that genuinely
 wants to be on the die.
+
+## A memory map
+
+8 GB is enough for the disc *and* everything else that wants to leave the die,
+with room left over. Sizes are what the console actually has; the disc region
+is sized for a single-layer DVD.
+
+| base | size | region | notes |
+|---|---:|---|---|
+| `0x0_0000_0000` | 5 GB | **disc image** | a DVD5 is 4.7 GB; the Battlefront II disc measured here is 4.67 GB |
+| `0x1_4000_0000` | 32 MB | EE main memory | the console's RDRAM, for when there is an EE |
+| `0x1_4200_0000` | 4 MB | **IOP BIOS ROM** | frees 128 UltraRAM, the change worth making first |
+| `0x1_4240_0000` | 2 MB | IOP RAM | optional; only if a later block needs the UltraRAM |
+| `0x1_4260_0000` | ~2.9 GB | free | game data staged for fast access, and headroom |
+
+So the two things this repository wants soonest — the disc and the BIOS ROM —
+together use 5.004 GB of 8, and the EE's future main memory is a rounding error
+next to the disc. Nothing here is tight.
+
+**The exception, stated plainly: dual-layer discs.** A DVD9 PS2 title is up to
+8.5 GB and does not fit in HBM alongside anything, or at all. Those keep the
+host-served path, or stream a window of the disc into HBM around wherever the
+game is reading. Most PS2 games are single-layer, so this is a case to handle
+rather than a reason to design differently.
+
+**The GS's 4 MB is deliberately absent from this map.** It stays in UltraRAM,
+for the bandwidth reason above.
 
 ## Order of work
 

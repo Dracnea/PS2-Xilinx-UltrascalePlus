@@ -171,6 +171,16 @@ architecture arch of iop_top is
    signal bus_cdvd_addr     : unsigned(5 downto 0);
    signal bus_cdvd_writeMask, bus_sio2_writeMask, bus_spu2_writeMask : std_logic_vector(3 downto 0);
    signal bus_dma_writeMask, bus_dma2_writeMask, bus_ssb2_writeMask, bus_sif_writeMask : std_logic_vector(3 downto 0);
+   -- DMA controller: its RAM master port and the arbitration against the mux
+   signal dma_ram_req    : std_logic;
+   signal dma_ram_addr   : std_logic_vector(23 downto 0);
+   signal dma_ram_wdata  : std_logic_vector(31 downto 0);
+   signal dma_grant      : std_logic;
+   signal ramarb_busy    : std_logic := '0';
+   signal ramarb_dma     : std_logic := '0';
+   signal ram_done_mux   : std_logic;
+   signal ram_dataWrite_m: std_logic_vector(31 downto 0);
+   signal irq_dma        : std_logic;
    signal bus_cdvd_dataWrite: std_logic_vector(31 downto 0);
    signal bus_cdvd_read, bus_cdvd_write : std_logic;
    signal bus_cdvd_dataRead : std_logic_vector(31 downto 0);
@@ -275,11 +285,43 @@ begin
    -- Only while the CPU is held in reset, so the mux never has a request in
    -- flight and no arbitration is needed: the RAM port is simply switched over.
    peek_mode   <= reset_int;
-   ram_ena_m   <= peek_req  when peek_mode = '1' else ram_ena;
-   ram_rnw_m   <= '1'       when peek_mode = '1' else ram_rnw;
-   ram_Adr_m   <= peek_addr when peek_mode = '1' else ram_Adr;
-   ram_be_m    <= "1111"    when peek_mode = '1' else ram_be;
-   ram_cache_m <= '0'       when peek_mode = '1' else ram_cache;
+   -- The RAM port has three possible masters: the CPU's memory mux, the host's
+   -- peek port (only while the CPU is in reset), and the DMA controller. The
+   -- DMA is granted a cycle only when the mux has nothing in flight and is not
+   -- itself starting one, so a transfer never interleaves with a CPU access.
+   -- The mux is shown only its own completions, or a DMA write would look to
+   -- it like an answer to a request it never made.
+   dma_grant <= '1' when (dma_ram_req = '1' and ramarb_busy = '0' and ram_ena = '0'
+                          and peek_mode = '0' and reset_int = '0') else '0';
+
+   ram_ena_m   <= peek_req  when peek_mode = '1' else (ram_ena or dma_grant);
+   ram_rnw_m   <= '1'       when peek_mode = '1' else
+                  '0'       when dma_grant = '1' else ram_rnw;
+   ram_Adr_m   <= peek_addr when peek_mode = '1' else
+                  ('0' & dma_ram_addr) when dma_grant = '1' else ram_Adr;
+   ram_be_m    <= "1111"    when peek_mode = '1' else
+                  "1111"    when dma_grant = '1' else ram_be;
+   ram_cache_m <= '0'       when peek_mode = '1' else
+                  '0'       when dma_grant = '1' else ram_cache;
+   ram_dataWrite_m <= dma_ram_wdata when dma_grant = '1' else ram_dataWrite;
+
+   ram_done_mux <= ram_done and not ramarb_dma;
+
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if (reset = '1') then
+            ramarb_busy <= '0';
+            ramarb_dma  <= '0';
+         elsif (ram_done = '1') then
+            ramarb_busy <= '0';
+            ramarb_dma  <= '0';
+         elsif (ram_ena_m = '1' and peek_mode = '0') then
+            ramarb_busy <= '1';
+            ramarb_dma  <= dma_grant;
+         end if;
+      end if;
+   end process;
    -- iop_ram's reset only forces its FSM to IDLE; release it whenever a peek
    -- is in flight so the read can complete with the CPU still in reset.
    ram_reset   <= reset_int and not (peek_busy or peek_req);
@@ -565,7 +607,7 @@ begin
       ram_rnw       => ram_rnw_m,
       ram_Adr       => ram_Adr_m,
       ram_be        => ram_be_m,
-      ram_dataWrite => ram_dataWrite,
+      ram_dataWrite => ram_dataWrite_m,
       ram_cache     => ram_cache_m,
       ram_done      => ram_done,
       ram_dataRead  => ram_dataRead,
@@ -678,11 +720,12 @@ begin
    end process;
 
    -- interrupt sources, PS2SDK intrman numbering
-   process (vblank, irqTimer0, irqTimer1, irqTimer2, irqTimer3, irqTimer4, irqTimer5, irq_spu, irq_sio2, irq_cdvd)
+   process (vblank, irqTimer0, irqTimer1, irqTimer2, irqTimer3, irqTimer4, irqTimer5, irq_spu, irq_sio2, irq_cdvd, irq_dma)
    begin
       irq_local     <= (others => '0');
       irq_local(0)  <= vblank;
       irq_local(2)  <= irq_cdvd;
+      irq_local(3)  <= irq_dma;
       irq_local(9)  <= irq_spu(0) or irq_spu(1);
       irq_local(17) <= irq_sio2;
       irq_local(4)  <= irqTimer0;
@@ -711,8 +754,36 @@ begin
    );
 
    -- stubs: programmed and read back, nothing behind them yet
-   idma  : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_dma_addr,  bus_dma_writeMask,  bus_dma_dataWrite,  bus_dma_read,  bus_dma_write,  bus_dma_dataRead);
-   idma2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_dma2_addr, bus_dma2_writeMask, bus_dma2_dataWrite, bus_dma2_read, bus_dma2_write, bus_dma2_dataRead);
+   -- the DMA controller: both register banks, and a master port on the RAM
+   idma : entity work.iop_dma
+   port map
+   (
+      clk1x          => clk1x,
+      reset          => reset_int,
+      bus_addr       => bus_dma_addr,
+      bus_writeMask  => bus_dma_writeMask,
+      bus_dataWrite  => bus_dma_dataWrite,
+      bus_read       => bus_dma_read,
+      bus_write      => bus_dma_write,
+      bus_dataRead   => bus_dma_dataRead,
+      bus2_addr      => bus_dma2_addr,
+      bus2_writeMask => bus_dma2_writeMask,
+      bus2_dataWrite => bus_dma2_dataWrite,
+      bus2_read      => bus_dma2_read,
+      bus2_write     => bus_dma2_write,
+      bus2_dataRead  => bus_dma2_dataRead,
+      ram_req        => dma_ram_req,
+      ram_addr       => dma_ram_addr,
+      ram_wdata      => dma_ram_wdata,
+      ram_gnt        => dma_grant,
+      dev_valid      => '0',            -- the CDVD read path is not built yet
+      dev_data       => ZERO32,
+      dev_ready      => open,
+      irq            => irq_dma,
+      dbg_channel    => open,
+      dbg_words      => open,
+      dbg_running    => open
+   );
    issb2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_ssb2_addr, bus_ssb2_writeMask, bus_ssb2_dataWrite, bus_ssb2_read, bus_ssb2_write, bus_ssb2_dataRead);
 
    -- the SIF is real (iop_sif.vhd); the host supplies the EE's half

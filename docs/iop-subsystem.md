@@ -28,11 +28,13 @@ subsystem is [docs/ps2-bios-boot.md](ps2-bios-boot.md).
 | `iop_spuram.vhd` | 512 KB of SPU work RAM per core as 128-bit-row UltraRAM behind `spu_ram`'s SDRAM-style port | new |
 | `iop_sio2.vhd` | SIO2 at 0x1F808200: SEND1/2/3, FIFOs, CTRL, RECV1-3, I_STAT, INTC bit 17; a PS1-protocol digital pad answers on port 0 from the `pad0_buttons` port, everything else reads as absent | new |
 | `iop_cdvd.vhd` | CDVD at 0x1F402000: N/S command ports, status, error, I_STAT, INTC bit 2; answers the boot-time S commands with PCSX2's values and reports no disc | new |
+| `iop_dma.vhd` | the DMA controller: 13 channels in two banks, DPCR/DICR and their bank-2 twins, DMACEN, the interrupt on INTC bit 3. **Channel 6 (OTC) is complete** — it needs no peripheral, so it is the one channel that can prove the controller on its own. Channel 3 (CDVD) has its device handshake and moves nothing until the CDVD read path feeds it. Every other channel accepts its registers and reports completion, as the stub did | new (OTC word format and CHCR/DICR semantics from PSX_MiSTer `dma.vhd`) |
+| `iop_sif.vhd` | the SIF mailbox at 0x1D000000: MSCOM, SMCOM, MSFLAG, SMFLAG, CTRL, BD6. The flag registers are semaphores, not storage — the EE sets MSFLAG and the IOP's write clears it, and SMFLAG is the reverse — which is what a register stub could not imitate and what stopped the BIOS boot | new |
 | `iop_regstub.vhd` | a read-back register file standing in for a peripheral that does not exist yet | new |
 | (unmodified) `cpu.vhd`, `memctrl.vhd`, `timer.vhd`, `datacache.vhd`, `divider.vhd`, the RAM/FIFO wrappers | PSX_MiSTer, GPL-2.0, Robert Peip | via `cores/PSX/upstream` |
 
-**Stubs** (programmed and read back, no behaviour): DMA (0x1F801080 and
-0x1F801500), SSBUS config 2 (0x1F801400), SIF (0x1D000000). Not present at
+**Stubs** (programmed and read back, no behaviour): SSBUS config 2
+(0x1F801400). DMA and the SIF used to be here and are now real blocks. Not present at
 all: the PS1's SPU window, pads/SIO, GPU, MDEC, CD-ROM; reads there return
 zero. What the three new blocks do *not* do: SPU2 has the PS1 register map
 and no DMA; SIO2 has no memory cards, multitap or DMA channels 11/12; CDVD
