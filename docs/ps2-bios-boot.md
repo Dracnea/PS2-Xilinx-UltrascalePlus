@@ -424,6 +424,24 @@ than either spinning or hung.
 > of bus traffic and from the stall detector, not from a program counter. The
 > instruction cache satisfies the loop, so the fetches never reach the bus.
 
+### The DMA controller does not disturb any of it — 2026-09-08
+
+Adding a third master to the RAM port is exactly the kind of change that breaks
+something that already worked, so it was checked rather than assumed. With
+`iop_dma` present (md5 `244d7d90a68435b6b5e978fa09e8d179`), the same 4 MB
+`0220A` image, verified against the file at 65 windows:
+
+```
+before the EE answers:  POST 09   SMFLAG 00000000
+after MSFLAG bit 16:    SMFLAG 00070000 = SIFINIT | CMDINIT | BOOTEND
+                        SMCOM  00019600   cpu_error 0
+module map:             reached #28 SECRMAN, 22 of 29 fingerprinted
+```
+
+Identical to the run before the DMAC existed. The boot test also passes all
+fifteen stages on the card in 5.54 ms, `0D` among them, which is the DMA
+controller moving real data on real fabric.
+
 ## Known limitations
 
 - `iop_regstub` ignores the bus write mask: a halfword or byte store writes the

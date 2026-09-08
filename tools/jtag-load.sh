@@ -4,9 +4,12 @@
 #
 #   tools/jtag-load.sh bitstreams/<image>.bit [device-glob]
 #
-# `device-glob` picks the JTAG device when more than one card is on the chain,
-# e.g. `xcvu33p*` for an FK33 or `xcu55n*` for a C1100. With none given the
-# first device Vivado sees is used, which is right for a single-card machine.
+# `device-glob` picks the JTAG device when more than one card is on the chain.
+# It matches the name Vivado's hardware manager gives the device, which is NOT
+# the part number: a C1100 appears as `xcu50_u55n_0`, so `xcu55n*` matches
+# nothing. With no glob the first device is used, which is right for a
+# single-card machine. A glob that matches nothing is an error, and the message
+# lists what is actually on the chain.
 #
 # Uses Vivado's hardware manager (Vivado or the free Vivado Lab Edition on
 # PATH: `vivado` / `vivado_lab`), which drives the Alveo's USB JTAG directly.
@@ -38,7 +41,12 @@ open_hw_target
 set want {$DEV_GLOB}
 if {\$want ne ""} {
     set dev [lindex [get_hw_devices \$want] 0]
-    if {\$dev eq ""} { puts "no JTAG device matching \$want"; exit 1 }
+    if {\$dev eq ""} {
+        puts "no JTAG device matching '\$want'"
+        puts "devices on the chain: [get_hw_devices]"
+        puts "(that is the hardware manager's name, not the part number)"
+        exit 1
+    }
 } else {
     set dev [lindex [get_hw_devices] 0]
 }
