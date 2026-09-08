@@ -1,0 +1,35 @@
+# Vivado / LiteX build output
+build/
+*.jou
+*.log
+.Xil/
+__pycache__/
+*.pyc
+
+# Build output is not tracked -- except the images promoted into bitstreams/,
+# which are kept so a card can be brought up without a Vivado seat.
+*.bit
+!bitstreams/*.bit
+*.mcs
+*.ltx
+csr.csv
+!bitstreams/*.csr.csv
+analyzer.csv
+build_id.v
+build_id.vh
+
+venv/
+
+# simulation and fit scratch
+sim/work/
+sim/work_dbg/
+sim/*.out
+sim/*.hex
+fit/*.out
+
+# BIOS and disc images are the operator's own dumps and never belong here
+*.bin
+!bitstreams/*.bin
+
+# LiteScope writes its config next to wherever the build was started
+/zanalyzer_*.csv

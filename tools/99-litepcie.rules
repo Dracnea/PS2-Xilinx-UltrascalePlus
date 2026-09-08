@@ -1,0 +1,5 @@
+# Give the plugdev group access to LitePCIe device nodes, so bring-up and
+# measurement tools do not need root for every run.
+#   sudo cp tools/99-litepcie.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+KERNEL=="litepcie[0-9]*", MODE="0660", GROUP="plugdev"
