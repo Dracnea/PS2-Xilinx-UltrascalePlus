@@ -165,10 +165,11 @@ plan for the FK33:
 - **The GS's local memory should not.** It is a 2048-bit random-access port at
   ~38 GB/s; one HBM channel gives 14.4 and handles random access worse. That is
   what UltraRAM is for.
-- **The disc should live in HBM.** 8 GB holds a single-layer image (4.7 GB) with
-  the BIOS ROM, the EE's future 32 MB and ~3 GB to spare, so the card holds the
-  whole game and the host leaves the read path entirely. Dual-layer DVD9 titles
-  are the exception and keep the host-served path.
+- **The disc should live in HBM, as a cache rather than a copy.** A maximal
+  dual-layer title is 7.95 GiB against 8 GiB of HBM — it fits only by leaving
+  room for nothing else, and some images are larger still. Caching 1 MiB chunks
+  makes the size of the game stop mattering: a single-layer disc never misses,
+  a dual-layer one keeps its working set. One mechanism instead of two.
 
 ## The memory problem, alongside the clock one
 

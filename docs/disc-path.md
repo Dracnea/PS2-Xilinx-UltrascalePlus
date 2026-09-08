@@ -102,13 +102,19 @@ Two stages, and the second is the one worth having:
   that sector from the `DiscSource` and writes it back over PCIe. Simple, needs
   no HBM, and the round trip is milliseconds — slower than a real drive but
   entirely usable for bring-up.
-* **HBM-backed.** Stream the whole image into the card's 8 GB of HBM once, and
-  the CDVD block reads sectors from memory with no host in the loop. A 4.7 GB
-  disc at PCIe speed is a few seconds to load and then behaves like a disc that
-  is simply *there*. [hbm.md](hbm.md) has the memory map: the disc gets 5 GB at
-  the bottom, which leaves the BIOS ROM, the EE's future 32 MB of main memory
-  and nearly 3 GB of headroom above it. A dual-layer DVD9 title is the one case
-  that does not fit and keeps the host-served path.
+* **HBM-backed.** The card's HBM holds a **cache** of the disc rather than a
+  copy of it, so the size of the game stops being a question the design has to
+  answer: a single-layer title ends up resident in its entirety and never
+  misses, and a dual-layer one keeps its working set resident and takes an
+  occasional miss. One mechanism, not a small-disc path and a large-disc path.
+  [hbm.md](hbm.md) has the geometry and the arithmetic — a maximal DVD9 is
+  7.95 GiB against 8 GiB of HBM, which fits only by leaving nothing for
+  anything else, which is why a cache and not a copy.
+
+**This is the reason the CDVD block must be built with a sector *source* behind
+an interface, rather than with a host round trip baked into it.** The IOP
+cannot tell the two apart, and the second can then replace the first without
+touching anything above it.
 
 The IOP cannot tell the two apart, so the first can ship and be replaced.
 

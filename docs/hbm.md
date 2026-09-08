@@ -47,10 +47,9 @@ makes a whole console plausible on the FK33:
 
 ### 2. Game data — **move it, and this is the interesting one**
 
-8 GB holds an entire single-layer disc -- a DVD5 is 4.7 GB -- with room for
-everything else on this list. (A dual-layer DVD9 title at up to 8.5 GB does
-*not* fit, and keeps the host-served path; see the memory map below.) Stream the
-image into HBM once over PCIe and the disc is simply *there*: the CDVD block reads sectors
+8 GiB is enough to hold a single-layer disc outright and enough to keep the
+working set of even the largest dual-layer title resident. Stage the image into
+HBM and the disc is simply *there*: the CDVD block reads sectors
 from HBM with no host in the loop, no per-sector round trip, and seek times
 that are a memory latency rather than a drive's. That is much closer to how a
 console behaves than a host answering every sector, and it is the reason the
@@ -80,32 +79,70 @@ a couple of cycles of latency, and the bandwidth scales with how many blocks
 are ganged. The GS's local memory is the one thing on this list that genuinely
 wants to be on the die.
 
-## A memory map
+## A memory map, and why the disc region is a cache
 
-8 GB is enough for the disc *and* everything else that wants to leave the die,
-with room left over. Sizes are what the console actually has; the disc region
-is sized for a single-layer DVD.
+The disc does **not** get a whole-image copy, and the arithmetic is worth
+setting out because it is closer than it looks.
 
-| base | size | region | notes |
-|---|---:|---|---|
-| `0x0_0000_0000` | 5 GB | **disc image** | a DVD5 is 4.7 GB; the Battlefront II disc measured here is 4.67 GB |
-| `0x1_4000_0000` | 32 MB | EE main memory | the console's RDRAM, for when there is an EE |
-| `0x1_4200_0000` | 4 MB | **IOP BIOS ROM** | frees 128 UltraRAM, the change worth making first |
-| `0x1_4240_0000` | 2 MB | IOP RAM | optional; only if a later block needs the UltraRAM |
-| `0x1_4260_0000` | ~2.9 GB | free | game data staged for fast access, and headroom |
+A dual-layer DVD9 holds 8.54 x 10^9 bytes, which is **7.95 GiB**. The HBM on
+these parts is two 4 GiB stacks, **8 GiB** = 8.59 x 10^9 bytes. So a maximal
+DVD9 image does technically fit — with about 50 MiB to spare, and nothing left
+for the EE's 32 MiB of main memory, the BIOS ROM, or any headroom at all. Some
+images are larger still: Gran Turismo 4 is the usual example of a title that
+fills a DVD9, and PAL releases of it are reported at over 9 GB. God of War,
+God of War II and Xenosaga Episode I are in the same class.
 
-So the two things this repository wants soonest — the disc and the BIOS ROM —
-together use 5.004 GB of 8, and the EE's future main memory is a rounding error
-next to the disc. Nothing here is tight.
+Treating "does this game fit?" as a question the design has to answer is the
+wrong shape. So the disc region is a **cache over the host-held image**, and
+the size of the game stops mattering:
 
-**The exception, stated plainly: dual-layer discs.** A DVD9 PS2 title is up to
-8.5 GB and does not fit in HBM alongside anything, or at all. Those keep the
-host-served path, or stream a window of the disc into HBM around wherever the
-game is reading. Most PS2 games are single-layer, so this is a case to handle
-rather than a reason to design differently.
+| base | size | region |
+|---|---:|---|
+| `0x0_0000_0000` | 6 GiB | **disc sector cache**, 6144 chunks of 1 MiB |
+| `0x1_8000_0000` | 32 MiB | EE main memory, for when there is an EE |
+| `0x1_8200_0000` | 4 MiB | **IOP BIOS ROM** |
+| `0x1_8240_0000` | 2 MiB | IOP RAM (optional) |
+| `0x1_8260_0000` | ~1.96 GiB | free: working buffers, headroom |
 
-**The GS's 4 MB is deliberately absent from this map.** It stays in UltraRAM,
-for the bandwidth reason above.
+### One mechanism, not two
+
+The point of a cache here is that **a small disc is simply one that never
+misses.** A 4.7 GiB single-layer title is resident in its entirety after it is
+staged and behaves exactly like a whole-image copy; an 8.5 GB title keeps its
+working set resident and takes an occasional miss. There is no "small game
+path" and "large game path" to write, test and keep in step — which is what
+makes it worth building this way from the start rather than retrofitting it
+when the first DVD9 title fails.
+
+Sketch, at the level a later implementation should start from:
+
+* **Chunk**: 1 MiB, 512 sectors. Big enough that the tag table is small and a
+  miss amortises over many sectors; small enough that a miss costs a
+  millisecond rather than a second.
+* **Tags**: 6144 entries, one per slot, holding the disc chunk resident there
+  and a valid bit. 24 KiB — block RAM, not HBM.
+* **Mapping**: direct-mapped, `slot = chunk mod 6144`, which is a mask rather
+  than a divide if the count is a power of two (4096 slots = 4 GiB is the
+  tidier choice if the arithmetic matters more than the capacity).
+* **Miss**: the CDVD read stalls, the host is asked for that chunk, it lands by
+  DMA, the tag updates, the read completes. The IOP sees a slow sector, which
+  is exactly what a real drive gives it.
+* **Prefetch**: reading near the end of a chunk fetches the next one. Game
+  streaming is overwhelmingly sequential, so this is most of the benefit for
+  very little logic.
+
+> **NOTE (unverified):** hit rates, the right chunk size and whether prefetch
+> is worth its complexity are all guesses until something real reads a disc.
+> *Verify by: logging the CDVD sector requests of an actual boot and an actual
+> game load, then replaying them against candidate cache geometries offline —
+> which needs no gateware and can be done as soon as the CDVD read path
+> produces a request log.*
+
+**None of this is needed for the first working version.** The host-served path
+serves any disc of any size today, just slowly. The cache is what makes it
+behave like a console, and the reason it is written down now is so that the
+CDVD block is built with a sector *source* behind an interface rather than a
+host round trip baked into it.
 
 ## Order of work
 
