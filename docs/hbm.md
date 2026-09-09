@@ -284,6 +284,94 @@ behave like a console, and the reason it is written down now is so that the
 CDVD block is built with a sector *source* behind an interface rather than a
 host round trip baked into it.
 
+## Staging a disc into HBM by DMA — working, 2026-09-09
+
+The whole 4.34 GiB Star Wars Battlefront II image goes into HBM in **6.3 s**
+(0.74 GB/s), and reading it back finds the filesystem where it belongs:
+
+```
+LBA 16      signature 'CD001'  label '2_01'   root directory at LBA 261
+root dir    SYSTEM.CNF at LBA 2265115, 57 bytes
+SYSTEM.CNF  BOOT2 = cdrom0:\SLUS_212.40;1
+SLUS_212.40 at LBA 2265116, magic \x7fELF
+```
+
+That walk uses **only what HBM returned**, not the file, so it is the same
+traversal `CDVDMAN` will make. It also exercises the far-end case
+[disc-path.md](disc-path.md) warns about: `SYSTEM.CNF` sits at LBA 2,265,115 of
+a 2,278,160-sector volume, so a truncated LBA would find the volume descriptor
+and then fail on the one file that matters. Beyond the structures, 400
+non-zero 32-byte beats sampled from 24 windows spanning the image are
+byte-identical, the highest at `0x10a911920` — past the 4 GiB mark, which is
+what checks the 33-bit HBM addressing.
+
+`tools/ps2iop/hbm_stage.py` remains the right tool for a handful of sectors; it
+writes through the probe at about ten CSR round trips per 32-byte beat, which is
+fine for proving the memory and hopeless for a game.
+
+### Four faults, each hiding the next
+
+Worth writing down, because the first three all presented as *"the HBM DMA
+writer hangs"* and none of them was the HBM DMA writer. It reported
+`busy=1 written=0 state=W bursts=1 stalled=1` throughout — correctly saying HBM
+had accepted an address and no data was arriving. The instrumentation added the
+day before is what made each layer legible in one run instead of by inference.
+
+1. **The driver was built for a different design.** `pcie-bringup.sh` defaulted
+   to a hardcoded image when run with no argument. That design places
+   `pcie_dma0` at 0x1800; the image on the card places it at 0x3000, where 0x1800
+   is the HBM probe. Every DMA register write from the driver landed on the probe
+   or on nothing, and every ioctl returned success. The kernel log had recorded
+   it as `Version \x01` — the identifier read at the wrong address — and nobody
+   read the log. Both scripts now prevent this; see
+   [../bitstreams/MANIFEST.md](../bitstreams/MANIFEST.md).
+
+2. **The driver zeroes a register this design does not have.** The driver writes
+   its loopback flag to a fixed `base + 0x40` (`PCIE_DMA_LOOPBACK_ENABLE_OFFSET`),
+   which holds the loopback CSR only in a design built with `with_dma_loopback`.
+   This design sets it False, so `buffering_reader_fifo_control` occupies that
+   address — and `litepcie_dma_init()` calls `set_loopback(fd, 0)` on every run.
+   The buffering FIFO accepts a word only while `level < depth`, so a depth of
+   zero means it never accepts one and the DMA Reader is backpressured forever.
+   It hits the reader's control at 0x3040 and never the writer's at 0x3048, which
+   is the asymmetry that identified it. What makes this one nasty is that
+   **descriptors still retire and the table still drains**: retirement follows the
+   PCIe completions, not the data being consumed, so the reader looks alive from
+   every register software can see. `hbm_dma_stage.c` now restores the depth after
+   init and reads it back.
+
+3. **The packer carried a beat across transfers.** `acc`/`half`/`full` were never
+   cleared on start, so a beat left packed by one run became the first beat of the
+   next and displaced the entire image by 32 bytes. Every byte correct, all of it
+   one beat late — which reads as a working transfer until something checks
+   alignment, and the byte counter says PASS either way. The packer now refuses
+   data unless armed and is flushed by `start`.
+
+4. **The ring cannot be filled while the card is reading it.** The DMA Reader runs
+   its descriptor table in **loop mode**: once enabled it streams the ring
+   continuously and never waits for software. `reader_sw_count` is advisory
+   bookkeeping rather than a gate — `hw_count` was observed *ahead* of it — so a
+   fill-ahead loop is a race against a 1.4 GB/s consumer, and losing it puts real
+   disc data at wrong offsets rather than producing anything that looks like
+   damage. At 1 MiB it never appears, because the transfer fits in the ring and is
+   in place before the reader starts.
+
+   So `hbm_dma_stage.c` does not race. It stages in ring-sized chunks with the
+   reader **stopped** while the ring is filled: stopping it holds the data FIFO,
+   the converter and the buffering FIFO in reset, and `start` flushes the packer,
+   so nothing survives a chunk boundary. The reader then walks descriptors
+   0..N-1 in order over data already in place — ordered by construction rather
+   than by timing. That costs the difference between 1.49 GB/s and 0.74 GB/s,
+   which is 6 s against 3 s for a disc, and buys a result that does not depend on
+   the host winning a race.
+
+The general lesson is the one this project keeps relearning: **a byte counter
+reaching its target is not evidence the bytes are right.** Faults 3 and 4 both
+produced a clean `PASS` with wrong contents, and both were found only by
+comparing against the disc — and fault 4 only by comparing against *non-zero*
+regions, since the first 256 MiB of this image is 99.94 % zeros and a random
+sample of it matches whatever the card happens to hold.
+
 ## Order of work
 
 1. Measure the latency. Everything above turns on a number nobody here has
