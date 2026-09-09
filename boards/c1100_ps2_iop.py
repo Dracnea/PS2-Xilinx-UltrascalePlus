@@ -45,6 +45,7 @@ from litepcie.phy.usppciephy import USPHBMPCIEPHY
 from litepcie.software import generate_litepcie_software
 
 import xilinx_c1100
+from hbm_common import HBM, HBMProbe, HBMDiscSource
 
 REPO_ROOT = normpath(join(dirname(abspath(__file__)), ".."))    # this repository
 
@@ -105,6 +106,12 @@ class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq):
         self.rst    = Signal()
         self.cd_sys = ClockDomain()
+        # The three clocks the HBM IP wants: a 100 MHz reference for its internal
+        # PLL, 100 MHz for APB, and 250 MHz on the AXI ports -- above the IP's
+        # 225 MHz floor and matching USER_AXI_CLK_FREQ in ip/hbm/gen_hbm.tcl.
+        self.cd_hbm_ref = ClockDomain()
+        self.cd_apb     = ClockDomain()
+        self.cd_axi     = ClockDomain()
         self.clk100 = Signal()          # buffered single-ended reference for the IOP MMCM
 
         pads   = platform.request("clk100")
@@ -115,7 +122,10 @@ class _CRG(LiteXModule):
         self.mmcm = mmcm = USPMMCM(speedgrade=-2, name="sys_mmcm")   # named so constraints can find its pins
         self.comb += mmcm.reset.eq(self.rst)
         mmcm.register_clkin(self.clk100, 100e6)
-        mmcm.create_clkout(self.cd_sys, sys_clk_freq, margin=0)
+        mmcm.create_clkout(self.cd_sys,     sys_clk_freq, margin=0)
+        mmcm.create_clkout(self.cd_hbm_ref, 100e6,        margin=0)
+        mmcm.create_clkout(self.cd_apb,     100e6,        margin=0)
+        mmcm.create_clkout(self.cd_axi,     250e6,        margin=0)
 
         platform.add_period_constraint(pads.p, 1e9/100e6)
 
@@ -235,7 +245,11 @@ class IOPBringup(LiteXModule, AutoCSR):
     sif_mscom / sif_smcom / sif_msflag / sif_smflag / sif_regctrl
                the mailbox as it stands, readable at any time.
     """
-    def __init__(self, platform, locked):
+    def __init__(self, platform, locked, hbm_axi=None):
+        # hbm_axi: one HBM pseudo-channel.  Given one, the CDVD's sectors can be
+        # served out of HBM instead of over PCIe; without one (the FK33 target
+        # has no HBM wired yet) the host stays the only source and the mux below
+        # collapses to it.
         self.reset      = CSRStorage(1, reset=1, description="1 holds the IOP in reset")
         self.rom_addr   = CSRStorage(20, description="word address for the next rom_data write")
         self.rom_data   = CSRStorage(32, description="write: store at rom_addr, then rom_addr += 1")
@@ -348,19 +362,59 @@ class IOPBringup(LiteXModule, AutoCSR):
         # can catch this; the card found it on the first real sector read.
         sec_ptr_q = Signal(9)
         self.sync += If(self.cdvd_sec_data.re, sec_ptr_q.eq(sec_ptr))
-        sec_waddr_iop = Signal(9)
-        sec_wdata_iop = Signal(32)
-        self.specials += MultiReg(sec_ptr_q, sec_waddr_iop, "iop")
-        self.specials += MultiReg(self.cdvd_sec_data.storage, sec_wdata_iop, "iop")
         sec_arm, sec_go = Signal(), Signal()
         self.sync += [sec_arm.eq(self.cdvd_sec_data.re), sec_go.eq(sec_arm)]
+
+        # Two possible fillers, one crossing.  The host writing CSRs and the HBM
+        # source both produce the same four signals in the sys domain, and which
+        # one is in charge is a CSR.  Everything below the mux -- the pointer
+        # latch, the MultiRegs, the PulseSynchronizers -- is the plumbing the
+        # card has already proved, so the HBM path inherits it rather than
+        # getting a second copy to get wrong.
+        fill_we   = Signal()
+        fill_addr = Signal(9)
+        fill_data = Signal(32)
+        fill_done = Signal()
+        if hbm_axi is not None:
+            self.hbm_disc = HBMDiscSource(hbm_axi)
+            self.comb += [
+                If(self.hbm_disc.enable.storage,
+                    fill_we.eq(self.hbm_disc.fill_we),
+                    fill_addr.eq(self.hbm_disc.fill_addr),
+                    fill_data.eq(self.hbm_disc.fill_data),
+                    fill_done.eq(self.hbm_disc.fill_done),
+                ).Else(
+                    fill_we.eq(sec_go),
+                    fill_addr.eq(sec_ptr_q),
+                    fill_data.eq(self.cdvd_sec_data.storage),
+                    fill_done.eq(self.cdvd_sec_done.re),
+                ),
+            ]
+        else:
+            self.hbm_disc = None
+            self.comb += [
+                fill_we.eq(sec_go),
+                fill_addr.eq(sec_ptr_q),
+                fill_data.eq(self.cdvd_sec_data.storage),
+                fill_done.eq(self.cdvd_sec_done.re),
+            ]
+
+        sec_waddr_iop = Signal(9)
+        sec_wdata_iop = Signal(32)
+        self.specials += MultiReg(fill_addr, sec_waddr_iop, "iop")
+        self.specials += MultiReg(fill_data, sec_wdata_iop, "iop")
         self.sec_we_sync   = sec_we_sync   = PulseSynchronizer("sys", "iop")
         self.sec_done_sync = sec_done_sync = PulseSynchronizer("sys", "iop")
-        self.comb += sec_we_sync.i.eq(sec_go), sec_done_sync.i.eq(self.cdvd_sec_done.re)
+        self.comb += sec_we_sync.i.eq(fill_we), sec_done_sync.i.eq(fill_done)
         sec_req_iop = Signal()
         sec_lba_iop = Signal(32)
         self.specials += MultiReg(sec_req_iop, self.cdvd_sec_req.fields.want, "sys")
         self.specials += MultiReg(sec_lba_iop, self.cdvd_sec_lba.status, "sys")
+        if self.hbm_disc is not None:
+            self.comb += [
+                self.hbm_disc.req.eq(self.cdvd_sec_req.fields.want),
+                self.hbm_disc.lba.eq(self.cdvd_sec_lba.status),
+            ]
         self.sec_iop = (sec_req_iop, sec_lba_iop, sec_waddr_iop, sec_wdata_iop,
                         sec_we_sync.o, sec_done_sync.o)
 
@@ -516,8 +570,14 @@ class PS2IOPSoC(SoCMini):
 
         self.crg = _CRG(platform, sys_clk_freq)
 
-        # Non-negotiable on this board (see platforms/xilinx_c1100.py).
-        self.comb += platform.request("hbm_cattrip").eq(0)
+        # HBM.  Unlike the targets without it, hbm_cattrip is driven by the IP's
+        # real over-temperature output rather than tied low
+        # (platforms/xilinx_c1100.py, and the note in hbm_common.HBM).
+        self.hbm = HBM(platform, platform.request("hbm_cattrip"))
+        # Channel 0 is the host's way in -- staging sectors, and proving the
+        # memory.  Channel 1 belongs to the CDVD's sector source.  HBM has 32
+        # ports, so the two never contend and nothing needs arbitrating.
+        self.hbm_probe = HBMProbe(self.hbm.axi[0])
 
         # PCIe, exactly as c1100_pcie_video.py (verified on hardware 2026-09-05).
         pcie_pads = platform.request(f"pcie_x{nlanes}")
@@ -542,7 +602,12 @@ class PS2IOPSoC(SoCMini):
 
         # IOP clocks and the IOP.
         self.iop_clocks = _IOPClocks(platform, self.crg.clk100, self.crg.rst)
-        self.iop        = IOPBringup(platform, self.iop_clocks.locked)
+        self.iop        = IOPBringup(platform, self.iop_clocks.locked,
+                                     hbm_axi=self.hbm.axi[1])
+
+        platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_axi.clk)
+        platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_apb.clk)
+        platform.add_false_path_constraints(self.crg.cd_apb.clk, self.crg.cd_axi.clk)
 
         # The sys <-> clk100 reset crossing of c1100_pcie_video.py is covered by
         # the pin-named clock groups in _IOPClocks; its by-name form
