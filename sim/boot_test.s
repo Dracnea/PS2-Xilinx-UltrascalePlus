@@ -685,6 +685,219 @@ cdvdi:
         li      $t0, 0x0E
         sb      $t0, 0($s7)
 
+# ---- 0F..11: walk ISO9660 the way the BIOS will ------------------------------
+# Stage 0E proves one sector arrives.  These prove the disc is a *filesystem*:
+# the volume descriptor names the root directory, the root directory names
+# SYSTEM.CNF, and SYSTEM.CNF names the game.  That exercises what a single
+# sector cannot -- several reads in a row, a directory walked record by record,
+# and an LBA in the millions.  On the Battlefront II disc SYSTEM.CNF is at LBA
+# 2,265,115 of 2,278,160, so an LBA truncated to 16 or 20 bits finds the volume
+# descriptor and then fails here, which is the failure this stage exists for.
+        beq     $s6, $zero, isodone     # no disc: 0A and 0E already covered that
+        nop
+
+# 0F: the root directory's extent, from the PVD already at 0x50000.  Byte 156
+# of a volume descriptor starts the root directory record; its extent is the
+# little-endian word at +2, so byte 158.  Not word-aligned, hence four loads.
+        li      $t0, 0xA005009E
+        lbu     $t1, 0($t0)
+        lbu     $t2, 1($t0)
+        lbu     $t3, 2($t0)
+        lbu     $t4, 3($t0)
+        nop
+        sll     $t2, $t2, 8
+        sll     $t3, $t3, 16
+        sll     $t4, $t4, 24
+        or      $s0, $t1, $t2
+        or      $s0, $s0, $t3
+        or      $s0, $s0, $t4
+        beq     $s0, $zero, fail        # a root directory at LBA 0 is not one
+        nop
+        li      $t0, 0x0F
+        sb      $t0, 0($s7)
+
+# 10: read the root directory and find SYSTEM.CNF in it.
+        move    $a0, $s0
+        li      $a1, 0x00051000
+        bgezal  $zero, rdsec
+        nop
+
+        li      $s2, 0xA0051000         # cursor over the directory records
+        li      $s3, 0                  # bytes consumed
+isoscan:
+        lbu     $t7, 0($s2)             # record length; 0 ends the sector
+        nop
+        beq     $t7, $zero, fail        # ran out of records without a match
+        nop
+        lbu     $t8, 32($s2)            # name length
+        nop
+        li      $t9, 10
+        beq     $t8, $t9, isolen        # "SYSTEM.CNF", or ...
+        nop
+        li      $t9, 12                 # ... "SYSTEM.CNF;1" -- ISO9660 keeps a
+        bne     $t8, $t9, isonext       # version suffix, and this disc uses it
+        nop
+isolen:
+        la      $a2, name_syscnf
+        addiu   $a3, $s2, 33
+        li      $t4, 10
+isocmp:
+        lbu     $t5, 0($a2)
+        lbu     $t6, 0($a3)
+        nop
+        bne     $t5, $t6, isonext
+        nop
+        addiu   $a2, $a2, 1
+        addiu   $a3, $a3, 1
+        addiu   $t4, $t4, -1
+        bne     $t4, $zero, isocmp
+        nop
+        b       isofound
+        nop
+isonext:
+        addu    $s2, $s2, $t7
+        addu    $s3, $s3, $t7
+        li      $t9, 2048
+        sltu    $t8, $s3, $t9
+        bne     $t8, $zero, isoscan
+        nop
+        b       fail                    # SYSTEM.CNF is not in the first sector
+        nop
+
+isofound:
+        lbu     $t1, 2($s2)             # the record's extent, little-endian
+        lbu     $t2, 3($s2)
+        lbu     $t3, 4($s2)
+        lbu     $t4, 5($s2)
+        nop
+        sll     $t2, $t2, 8
+        sll     $t3, $t3, 16
+        sll     $t4, $t4, 24
+        or      $s1, $t1, $t2
+        or      $s1, $s1, $t3
+        or      $s1, $s1, $t4
+        beq     $s1, $zero, fail
+        nop
+        li      $t0, 0x10
+        sb      $t0, 0($s7)
+
+# 11: read SYSTEM.CNF itself and check it names a boot file.  This is the read
+# at LBA 2,265,115 -- the one that needs the whole 32-bit LBA to survive the
+# CDVD command, the DMA and the disc source.
+        move    $a0, $s1
+        li      $a1, 0x00052000
+        bgezal  $zero, rdsec
+        nop
+        li      $t0, 0xA0052000
+        lw      $t1, 0($t0)
+        nop
+        li      $t2, 0x544F4F42         # "BOOT"
+        bne     $t1, $t2, fail
+        nop
+        li      $t0, 0x11
+        sb      $t0, 0($s7)
+
+# 12: the boot file SYSTEM.CNF names, found in the directory and read.
+# "BOOT2 = cdrom0:\SLUS_212.40;1" -- take what follows the backslash up to the
+# first control character, which is exactly the name the directory record
+# carries, version suffix and all.  Nothing here knows this disc: the name is
+# read off the disc and looked up on the disc.
+        li      $s4, 0xA0052000
+        li      $t9, 256                # bounded: it is a line, not a search
+isobs:  lbu     $t5, 0($s4)
+        nop
+        li      $t6, 0x5C               # '\\'
+        beq     $t5, $t6, isobsf
+        nop
+        addiu   $s4, $s4, 1
+        addiu   $t9, $t9, -1
+        bne     $t9, $zero, isobs
+        nop
+        b       fail                    # no path separator: not a BOOT2 line
+        nop
+isobsf: addiu   $s4, $s4, 1             # first character of the name
+        move    $t8, $s4
+        li      $s5, 0                  # its length
+isolen2:
+        lbu     $t5, 0($t8)
+        nop
+        li      $t6, 0x21               # stop at CR, LF, space -- anything below '!'
+        sltu    $t7, $t5, $t6
+        bne     $t7, $zero, isolend
+        nop
+        addiu   $t8, $t8, 1
+        addiu   $s5, $s5, 1
+        li      $t6, 32
+        bne     $s5, $t6, isolen2
+        nop
+isolend:
+        beq     $s5, $zero, fail
+        nop
+
+        li      $s2, 0xA0051000         # walk the root directory again
+        li      $s3, 0
+isoscn2:
+        lbu     $t7, 0($s2)
+        nop
+        beq     $t7, $zero, fail        # the named file is not in this directory
+        nop
+        lbu     $t8, 32($s2)
+        nop
+        bne     $t8, $s5, isonxt2
+        nop
+        move    $a2, $s4
+        addiu   $a3, $s2, 33
+        move    $t4, $s5
+isocmp2:
+        lbu     $t5, 0($a2)
+        lbu     $t6, 0($a3)
+        nop
+        bne     $t5, $t6, isonxt2
+        nop
+        addiu   $a2, $a2, 1
+        addiu   $a3, $a3, 1
+        addiu   $t4, $t4, -1
+        bne     $t4, $zero, isocmp2
+        nop
+        b       isofnd2
+        nop
+isonxt2:
+        addu    $s2, $s2, $t7
+        addu    $s3, $s3, $t7
+        li      $t9, 2048
+        sltu    $t8, $s3, $t9
+        bne     $t8, $zero, isoscn2
+        nop
+        b       fail
+        nop
+
+isofnd2:
+        lbu     $t1, 2($s2)
+        lbu     $t2, 3($s2)
+        lbu     $t3, 4($s2)
+        lbu     $t4, 5($s2)
+        nop
+        sll     $t2, $t2, 8
+        sll     $t3, $t3, 16
+        sll     $t4, $t4, 24
+        or      $a0, $t1, $t2
+        or      $a0, $a0, $t3
+        or      $a0, $a0, $t4
+        beq     $a0, $zero, fail
+        nop
+        li      $a1, 0x00053000
+        bgezal  $zero, rdsec
+        nop
+        li      $t0, 0xA0053000
+        lw      $t1, 0($t0)
+        nop
+        li      $t2, 0x464C457F         # 0x7F 'E' 'L' 'F'
+        bne     $t1, $t2, fail
+        nop
+        li      $t0, 0x12
+        sb      $t0, 0($s7)
+isodone:
+
 # ---- done -----------------------------------------------------------------
         li      $t0, 0xAA
         sb      $t0, 0($s7)
@@ -695,6 +908,64 @@ fail:   li      $t0, 0xEE
         sb      $t0, 0($s7)
 fhalt:  b       fhalt
         nop
+
+# ---- rdsec: read one 2048-byte sector -----------------------------------------
+# $a0 = LBA, $a1 = destination in IOP RAM.  Clobbers $t0-$t3; DPCR and DICR are
+# already set up by 0E.  I_STAT bit 0 is cleared *before* the command: it is
+# write-1-to-clear and latches, so a second read would otherwise see the first
+# read's completion still standing and return immediately with a stale buffer.
+rdsec:
+        li      $t0, 0x1F402008
+        li      $t1, 0x01
+        sb      $t1, 0($t0)             # clear the previous completion
+
+        li      $t0, 0x1F8010B0         # channel 3 (CDVD)
+        sw      $a1, 0($t0)             # MADR
+        li      $t1, 512                # BCR: 512 words = one sector
+        sw      $t1, 4($t0)
+        li      $t1, 0x01000000         # CHCR: to RAM, increment, start
+        sw      $t1, 8($t0)
+
+        li      $t0, 0x1F402005         # eleven N parameters, LBA first
+        sb      $a0, 0($t0)
+        srl     $t1, $a0, 8
+        sb      $t1, 0($t0)
+        srl     $t1, $a0, 16
+        sb      $t1, 0($t0)
+        srl     $t1, $a0, 24
+        sb      $t1, 0($t0)
+        li      $t1, 1
+        sb      $t1, 0($t0)             # one sector
+        sb      $zero, 0($t0)
+        sb      $zero, 0($t0)
+        sb      $zero, 0($t0)
+        sb      $zero, 0($t0)           # retry
+        sb      $zero, 0($t0)           # spindle
+        sb      $zero, 0($t0)           # mode: 2048-byte sectors
+        li      $t0, 0x1F402004
+        li      $t1, 0x06
+        sb      $t1, 0($t0)
+
+        li      $t3, 0x00020000
+rdsecw: li      $t0, 0x1F402008
+        lbu     $t1, 0($t0)
+        nop
+        andi    $t1, $t1, 0x0001
+        bne     $t1, $zero, rdsecd
+        nop
+        addiu   $t3, $t3, -1
+        bne     $t3, $zero, rdsecw
+        nop
+        b       fail
+        nop
+rdsecd: jr      $ra
+        nop
+
+.align 4
+name_syscnf:
+        .word   0x54535953              # 'S' 'Y' 'S' 'T'
+        .word   0x432E4D45              # 'E' 'M' '.' 'C'
+        .word   0x0000464E              # 'N' 'F'
 
 # ---- routine that runs from RAM: sum 1..100 in $v0 ----------------------------
 .align 4

@@ -149,6 +149,54 @@ touching anything above it.
 
 The IOP cannot tell the two apart, so the first can ship and be replaced.
 
+## The console walks the filesystem — 2026-09-09
+
+Boot-test stages `0F`-`12` do on the IOP what `isoread.py` does on the host,
+and they do it with nothing on the host running:
+
+```
+0F  the PVD at LBA 16 names the root directory      -> LBA 261
+10  the root directory names SYSTEM.CNF             -> LBA 2,265,115
+11  SYSTEM.CNF reads back beginning "BOOT2 = "
+12  the name after "cdrom0:\" is looked up in the
+    directory and read                              -> LBA 2,265,116, \x7fELF
+```
+
+Nothing in that chain knows this disc. The root directory's location comes from
+the volume descriptor, the boot file's name is parsed out of SYSTEM.CNF's text,
+and that name is looked up in the directory — so it is a filesystem walk rather
+than four hardcoded reads.
+
+What it adds over stage `0E`, which reads one sector: several reads in a row
+with the completion status cleared between them, a directory traversed record
+by record, and **an LBA in the millions**. SYSTEM.CNF is at LBA 2,265,115 of
+2,278,160, so an LBA truncated anywhere along the CDVD command, the DMA or the
+disc source finds the volume descriptor and then fails here. That is the
+failure these stages exist to catch.
+
+Two things this cost, both worth recording:
+
+* I_STAT bit 0 is **write-1-to-clear and latches**. Stage `0E` never noticed
+  because it reads one sector; a second read polls the *first* read's
+  completion, returns immediately and parses a stale buffer. `rdsec` clears it
+  before every command.
+* ISO9660 keeps a **version suffix**: the record is `SYSTEM.CNF;1` with a name
+  length of 12, not `SYSTEM.CNF` with 10. The first version of stage `10`
+  rejected every record in the directory and failed. Both name lengths are
+  accepted now.
+
+### The same walk, from either source
+
+| sector source | result |
+|---|---|
+| staged in HBM, nothing on the host running | **PASS** |
+| served over PCIe by `discserve.py`, HBM off | **PASS** |
+| HBM base moved one sector | fails at `0E`, as it must |
+
+The two passing rows are the point: the IOP cannot tell the sources apart, so a
+disc image and a staged image are the same console to everything above the
+sector interface.
+
 ## The sector port, and the bug only the card could find (2026-09-09)
 
 The CDVD asks for one sector at a time: `iop_cdvd_sec_req` goes high with the
