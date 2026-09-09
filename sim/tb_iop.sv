@@ -37,7 +37,11 @@ module tb_iop;
    // disc in the tray" once stage 0D has passed, which is the same thing the
    // host does on hardware with `iop_post.py cdvd disc on` before the read
    // test.
-   reg         disc_present = 0;
+   // 1 by default, and settable with +disc=0 to simulate an empty drive.  The
+   // disc is in the drive from t=0 rather than inserted mid-run, because that is
+   // what the card does: the host sets the disc CSR before releasing reset, and
+   // stage 0A reads the disc type once and remembers it.
+   reg         disc_present = 1;
 
    // memory peek: the host-side port that dumps IOP RAM/ROM while the CPU is reset
    reg         peek_req = 0;
@@ -81,12 +85,9 @@ module tb_iop;
       sif_write(3'd1, 32'h00010000);      // set MSFLAG bit 16
    end
 
-   // insert the disc after stage 0D, before the read test
-   always @(posedge clk1x) begin
-      if (post_wr && post_code == 8'h0D) begin
-         disc_present <= 1;
-         $display("[%0t] bench(disc): inserting a disc for the read test", $time);
-      end
+   initial begin
+      void'($value$plusargs("disc=%d", disc_present));
+      $display("bench(disc): drive is %s", disc_present ? "loaded" : "empty");
    end
 
    // serve sectors for as long as the test asks for them

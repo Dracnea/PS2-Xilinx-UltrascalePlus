@@ -73,11 +73,12 @@ run_as_user $POST status
 # discserve.py does not care which (docs/disc-path.md).
 DISC=${DISC:-"discs/Star Wars - Battlefront II (USA) (v2.01).iso"}
 
-step "4. boot_test.s, pad0 = 0x5A3C (what the testbench drives), no disc: expect POST 01..0D then EE at 0E"
+step "4. boot_test.s, pad0 = 0x5A3C (what the testbench drives), empty drive: expect POST 01..0E then AA -- 0E checks the read is refused with CDVD error 0x12"
+run_as_user $POST cdvd disc off
 run_as_user $POST run "$ROM" --timeout 10 --pad0 0x5A3C
 
 if [[ -e $DISC ]]; then
-    step "5. the same run with $DISC in the drive: expect POST 01..0E then AA, PASS"
+    step "5. the same run with $DISC in the drive: expect POST 01..0E then AA, and 0E now checks CD001 in IOP RAM"
     run_as_user $POST cdvd disc on
     run_as_user tools/ps2iop/discserve.py "$DISC" --csr "$CSR" --seconds 30 &
     SERVER=$!

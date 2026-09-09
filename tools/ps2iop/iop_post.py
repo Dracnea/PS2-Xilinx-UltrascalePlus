@@ -395,9 +395,22 @@ def run(dev, path, timeout, pad0=0x5A3C):
     print(f"iop_pad0 = 0x{dev.rd('iop_pad0') & 0xFFFF:04X}")
     load(dev, path)
     seen = None
+    # Stage 0C publishes the IOP's ready bit in SMFLAG and then spins on MSFLAG
+    # forever waiting for the Emotion Engine.  There is no EE on the card, so
+    # the run plays it -- the same two writes the testbench makes.  Without this
+    # the run hangs at 0C and every stage after it goes untested, which is what
+    # the first hardware run of the disc path did.  The IOP's spin has no
+    # timeout, so answering on the next poll is soon enough.
+    have_sif = "iop_sif_smflag" in dev.regs
+    ee_answered = False
     dev.wr("iop_reset", 0)
     t0 = time.time()
     while time.time() - t0 < timeout:
+        if have_sif and not ee_answered and (dev.rd("iop_sif_smflag") & SIF_STAT_SIFINIT):
+            sif_write(dev, SIF_MSCOM, 0x5A5A1234)
+            sif_write(dev, SIF_MSFLAG_SET, SIF_STAT_SIFINIT)
+            ee_answered = True
+            print(f"[{time.time() - t0:7.3f}s] EE: answered the SIF init handshake")
         s = status(dev)
         if s["post"] != seen:
             seen = s["post"]

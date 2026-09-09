@@ -347,12 +347,21 @@ w9:     lw      $t2, 0x80($t0)          # I_STAT
         li      $t0, 9
         sb      $t0, 0($s7)
 
-# ---- 0A: CDVD with no disc --------------------------------------------------
+# ---- 0A: CDVD, with or without a disc ---------------------------------------
+# Everything here except the disc type is independent of whether a disc is in
+# the drive, so the type is recorded rather than asserted to be zero and the
+# same image runs both ways.  It has to: on hardware the disc is inserted by the
+# host before reset, and a test that demanded an empty drive could never reach
+# the sector read in 0E.  $s6 carries the answer to 0E.
         li      $t0, 0x1F402000
-        lbu     $t2, 0x0F($t0)          # disc type: none
+        lbu     $s6, 0x0F($t0)          # disc type: 00 none, 14 a PS2 DVD
         nop
-        bne     $t2, $zero, fail
+        beq     $s6, $zero, adisc
         nop
+        li      $t3, 0x14
+        bne     $s6, $t3, fail          # present, but not a type we serve
+        nop
+adisc:
         lbu     $t2, 0x05($t0)          # N ready
         nop
         li      $t3, 0x4A
@@ -638,6 +647,8 @@ cdvw:   li      $t0, 0x1F402008         # CDVD I_STAT bit 0
         b       fail                    # the read never completed
         nop
 cdvd:
+        beq     $s6, $zero, cdvdnd      # no disc: a different, equally real check
+        nop
         li      $t0, 0xA0050000         # read the sector back, uncached
         lw      $t1, 0($t0)
         nop
@@ -649,6 +660,22 @@ cdvd:
         li      $t2, 0x00013130         # '0' '1' 01 00
         bne     $t1, $t2, fail
         nop
+        b       cdvdi
+        nop
+
+# With an empty drive the read must be refused, not quietly produce nothing:
+# the CDVD answers a read command with error 0x12 and still raises the
+# interrupt.  Checking the error code is what makes the empty-drive run a real
+# negative control for the disc path rather than a skipped stage.
+cdvdnd:
+        li      $t0, 0x1F402000
+        lbu     $t2, 0x06($t0)          # CDVD error byte
+        nop
+        li      $t3, 0x12               # 0x12 = no disc
+        bne     $t2, $t3, fail
+        nop
+
+cdvdi:
         li      $t0, 0x1F801070         # INTC bit 2 (CDVD) must be set
         lw      $t1, 0($t0)
         nop
