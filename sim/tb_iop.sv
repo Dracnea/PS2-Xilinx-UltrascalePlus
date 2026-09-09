@@ -24,6 +24,21 @@ module tb_iop;
    reg         sif_we = 0;
    wire [31:0] sif_mscom, sif_smcom, sif_msflag, sif_smflag, sif_ctrl;
 
+   // CDVD: the bench is the disc. It answers a sector request with a
+   // synthetic ISO9660 volume descriptor -- 0x01 "CD001" 0x01 -- which is what
+   // sector 16 of a real disc holds, so the boot test can check for it.
+   wire        cdvd_sec_req;
+   wire [31:0] cdvd_sec_lba;
+   reg  [8:0]  cdvd_sec_waddr = 0;
+   reg  [31:0] cdvd_sec_wdata = 0;
+   reg         cdvd_sec_we = 0, cdvd_sec_done = 0;
+   // No disc to begin with: stage 0A checks the no-disc answers (a read must
+   // report error 0x12) and would fail with one inserted. The bench "puts a
+   // disc in the tray" once stage 0D has passed, which is the same thing the
+   // host does on hardware with `iop_post.py cdvd disc on` before the read
+   // test.
+   reg         disc_present = 0;
+
    // memory peek: the host-side port that dumps IOP RAM/ROM while the CPU is reset
    reg         peek_req = 0;
    reg  [24:0] peek_addr = 0;
@@ -37,6 +52,10 @@ module tb_iop;
       .rom_wr(rom_wr), .rom_addr(rom_addr), .rom_data(rom_data),
       .post_code(post_code), .post_wr(post_wr), .con_wr(con_wr), .con_data(con_data),
       .peek_req(peek_req), .peek_addr(peek_addr), .peek_data(peek_data), .peek_valid(peek_valid),
+      .cdvd_disc_present(disc_present), .cdvd_disc_type(8'h14),
+      .cdvd_sec_req(cdvd_sec_req), .cdvd_sec_lba(cdvd_sec_lba),
+      .cdvd_sec_waddr(cdvd_sec_waddr), .cdvd_sec_wdata(cdvd_sec_wdata),
+      .cdvd_sec_we(cdvd_sec_we), .cdvd_sec_done(cdvd_sec_done),
       .sif_host_sel(sif_sel), .sif_host_data(sif_data), .sif_host_we(sif_we),
       .sif_mscom(sif_mscom), .sif_smcom(sif_smcom), .sif_msflag(sif_msflag),
       .sif_smflag(sif_smflag), .sif_ctrl(sif_ctrl),
@@ -62,20 +81,69 @@ module tb_iop;
       sif_write(3'd1, 32'h00010000);      // set MSFLAG bit 16
    end
 
+   // insert the disc after stage 0D, before the read test
+   always @(posedge clk1x) begin
+      if (post_wr && post_code == 8'h0D) begin
+         disc_present <= 1;
+         $display("[%0t] bench(disc): inserting a disc for the read test", $time);
+      end
+   end
+
+   // serve sectors for as long as the test asks for them
+   integer si;
+   initial begin
+      forever begin
+         wait (cdvd_sec_req === 1'b1);
+         $display("[%0t] bench(disc): sector %0d requested", $time, cdvd_sec_lba);
+         for (si = 0; si < 512; si = si + 1) begin
+            @(posedge clk1x);
+            cdvd_sec_waddr <= si[8:0];
+            // word 0 is the ISO9660 signature: 01 'C' 'D' '0' then '0' '1' 01
+            if (si == 0)      cdvd_sec_wdata <= 32'h30444301;
+            else if (si == 1) cdvd_sec_wdata <= 32'h00013130;
+            else              cdvd_sec_wdata <= {cdvd_sec_lba[15:0], 7'b0, si[8:0]};
+            cdvd_sec_we <= 1;
+         end
+         @(posedge clk1x); cdvd_sec_we <= 0;
+         @(posedge clk1x); cdvd_sec_done <= 1;
+         @(posedge clk1x); cdvd_sec_done <= 0;
+         wait (cdvd_sec_req === 1'b0);
+      end
+   end
+
    reg [127:0] spu_row;
    reg [31:0] image [0:1048575];        // up to the full 4 MB ROM (a real BIOS)
    // where the CPU was: rings of the last instruction fetches and data accesses
-   reg [31:0] fetch_ring [0:63]; reg [31:0] data_ring [0:31]; reg [31:0] data_ring_d [0:31]; reg data_ring_w [0:31];
+   integer k;      // trap-dump loop variable (declared before first use)
+   integer words;  // ROM words loaded; also sizes the runaway trap
+   reg [31:0] fetch_ring [0:63]; reg [31:0] data_ring [0:31]; reg [31:0] data_ring_d [0:31]; reg data_ring_w [0:31]; reg [31:0] data_ring_pc [0:31];
    integer nfetch = 0, ndata = 0; reg [31:0] last_if = 0;
    always @(posedge clk1x) begin
       if (dut.mem_request && !dut.mem_isData && dut.mem_addressInstr != last_if) begin
          fetch_ring[nfetch % 64] <= dut.mem_addressInstr; nfetch <= nfetch + 1; last_if <= dut.mem_addressInstr;
       end
       if (dut.mem_request && dut.mem_isData) begin
-         data_ring[ndata % 32] <= dut.mem_addressData; data_ring_d[ndata % 32] <= dut.mem_dataWrite; data_ring_w[ndata % 32] <= !dut.mem_rnw; ndata <= ndata + 1;
+         data_ring[ndata % 32] <= dut.mem_addressData; data_ring_d[ndata % 32] <= dut.mem_dataWrite; data_ring_w[ndata % 32] <= !dut.mem_rnw; data_ring_pc[ndata % 32] <= last_if; ndata <= ndata + 1;
+      end
+      // Runaway trap: the test image is well under 0xBFC02000, so a fetch above
+      // that means the CPU has left the code and is grinding through zero-filled
+      // ROM.  Catching it here shows where it went, instead of a ring full of
+      // NOPs 75 ms later.
+      if (!reset && ((post_wr && post_code == 8'h00) || dut.mem_addressInstr > (32'hBFC00000 + words*4 + 64) && dut.mem_addressInstr < 32'hC0000000)) begin
+         $display("[%0t] TRAP: fetch at %08x, pc(last)=%08x, POST %02x", $time, dut.mem_addressInstr, last_if, post_code);
+         $display("   dma state=%0d ch=%0d words=%0d ram_req=%b ram_gnt=%b",
+                  dut.idma.state, dut.idma.ch, dut.idma.words, dut.idma.ram_req, dut.idma.ram_gnt);
+         $display("   cdvd rd_state=%0d rd_pos=%0d rd_left=%0d dev_valid=%b dev_ready=%b istat=%02x irq=%b",
+                  dut.icdvd.rd_state, dut.icdvd.rd_pos, dut.icdvd.rd_left,
+                  dut.icdvd.dev_valid, dut.icdvd.dev_ready, dut.icdvd.istat, dut.icdvd.irq);
+         $display("last %0d instruction fetches (oldest first):", nfetch < 64 ? nfetch : 64);
+         for (k = (nfetch < 64 ? 0 : nfetch - 64); k < nfetch; k = k + 1) $display("   IF  %08x", fetch_ring[k % 64]);
+         $display("last %0d data accesses (oldest first):", ndata < 32 ? ndata : 32);
+         for (k = (ndata < 32 ? 0 : ndata - 32); k < ndata; k = k + 1) $display("   pc=%08x %s %08x %08x", data_ring_pc[k % 32], data_ring_w[k % 32] ? "ST" : "LD", data_ring[k % 32], data_ring_d[k % 32]);
+         $finish;
       end
    end
-   integer i, t0, words, run_ms;
+   integer i, t0, run_ms;
    string romfile;
 
    // One peek: the CPU must already be in reset, which is the port's condition.
@@ -164,7 +232,7 @@ module tb_iop;
       $display("last %0d distinct instruction fetches (oldest first):", nfetch < 64 ? nfetch : 64);
       for (i = (nfetch < 64 ? 0 : nfetch - 64); i < nfetch; i = i + 1) $display("   IF  %08x", fetch_ring[i % 64]);
       $display("last %0d data accesses (oldest first):", ndata < 32 ? ndata : 32);
-      for (i = (ndata < 32 ? 0 : ndata - 32); i < ndata; i = i + 1) $display("   %s %08x %08x", data_ring_w[i % 32] ? "ST" : "LD", data_ring[i % 32], data_ring_d[i % 32]);
+      for (i = (ndata < 32 ? 0 : ndata - 32); i < ndata; i = i + 1) $display("   pc=%08x %s %08x %08x", data_ring_pc[i % 32], data_ring_w[i % 32] ? "ST" : "LD", data_ring[i % 32], data_ring_d[i % 32]);
       $finish;
    end
 endmodule

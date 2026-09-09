@@ -59,6 +59,13 @@ entity iop_top is
       cdvd_log_addr     : in  unsigned(7 downto 0) := (others => '0');
       cdvd_log_data     : out std_logic_vector(31 downto 0);
       cdvd_log_count    : out unsigned(15 downto 0);
+      -- CDVD sector source: the block asks, the host (or later HBM) answers
+      cdvd_sec_req      : out std_logic;
+      cdvd_sec_lba      : out std_logic_vector(31 downto 0);
+      cdvd_sec_waddr    : in  unsigned(8 downto 0) := (others => '0');
+      cdvd_sec_wdata    : in  std_logic_vector(31 downto 0) := (others => '0');
+      cdvd_sec_we       : in  std_logic := '0';
+      cdvd_sec_done     : in  std_logic := '0';
       -- SIF host side: the Emotion Engine's half of the mailbox at 0x1D000000.
       -- There is no EE, so the host plays it; see iop_sif.vhd.  sif_host_sel
       -- picks what a write does: 0 MSCOM, 1 MSFLAG set, 2 MSFLAG clear,
@@ -186,8 +193,25 @@ architecture arch of iop_top is
    signal ramarb_busy    : std_logic := '0';
    signal ramarb_dma     : std_logic := '0';
    signal ram_done_mux   : std_logic;
+   -- one-entry hold for a CPU request that arrives while the DMA has the port
+   signal cpu_pend       : std_logic := '0';
+   signal cpu_issue      : std_logic;
+   signal pend_adr       : std_logic_vector(ram_Adr'range);
+   signal pend_be        : std_logic_vector(3 downto 0);
+   signal pend_rnw       : std_logic;
+   signal pend_cache     : std_logic;
+   signal pend_wdata     : std_logic_vector(31 downto 0);
+   signal cpu_adr        : std_logic_vector(ram_Adr'range);
+   signal cpu_be         : std_logic_vector(3 downto 0);
+   signal cpu_rnw        : std_logic;
+   signal cpu_cache      : std_logic;
+   signal cpu_wdata      : std_logic_vector(31 downto 0);
    signal ram_dataWrite_m: std_logic_vector(31 downto 0);
    signal irq_dma        : std_logic;
+   -- CDVD -> DMA channel 3
+   signal cdvd_dev_valid : std_logic;
+   signal cdvd_dev_data  : std_logic_vector(31 downto 0);
+   signal cdvd_dev_ready : std_logic;
    signal bus_cdvd_dataWrite: std_logic_vector(31 downto 0);
    signal bus_cdvd_read, bus_cdvd_write : std_logic;
    signal bus_cdvd_dataRead : std_logic_vector(31 downto 0);
@@ -299,20 +323,50 @@ begin
    -- The mux is shown only its own completions, or a DMA write would look to
    -- it like an answer to a request it never made.
    dma_grant <= '1' when (dma_ram_req = '1' and ramarb_busy = '0' and ram_ena = '0'
+                          and cpu_pend = '0'
                           and peek_mode = '0' and reset_int = '0') else '0';
 
-   ram_ena_m   <= peek_req  when peek_mode = '1' else (ram_ena or dma_grant);
-   ram_rnw_m   <= '1'       when peek_mode = '1' else
-                  '0'       when dma_grant = '1' else ram_rnw;
-   ram_Adr_m   <= peek_addr when peek_mode = '1' else
-                  ('0' & dma_ram_addr) when dma_grant = '1' else ram_Adr;
-   ram_be_m    <= "1111"    when peek_mode = '1' else
-                  "1111"    when dma_grant = '1' else ram_be;
-   ram_cache_m <= '0'       when peek_mode = '1' else
-                  '0'       when dma_grant = '1' else ram_cache;
-   ram_dataWrite_m <= dma_ram_wdata when dma_grant = '1' else ram_dataWrite;
+   -- iop_ram samples a request only while its FSM is IDLE, so a CPU access that
+   -- lands during a DMA transfer is dropped on the floor and the mux then waits
+   -- for a completion that never comes.  Hold it and replay it when the port is
+   -- free; one entry is enough because the mux keeps a single access in flight.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if (reset = '1') then
+            cpu_pend <= '0';
+         elsif (ram_ena = '1' and ramarb_busy = '1' and peek_mode = '0') then
+            cpu_pend   <= '1';
+            pend_adr   <= ram_Adr;
+            pend_be    <= ram_be;
+            pend_rnw   <= ram_rnw;
+            pend_cache <= ram_cache;
+            pend_wdata <= ram_dataWrite;
+         elsif (cpu_pend = '1' and ramarb_busy = '0') then
+            cpu_pend <= '0';
+         end if;
+      end if;
+   end process;
 
-   ram_done_mux <= ram_done and not ramarb_dma;
+   cpu_issue <= '1' when (ramarb_busy = '0' and (ram_ena = '1' or cpu_pend = '1')) else '0';
+   cpu_adr   <= pend_adr   when cpu_pend = '1' else ram_Adr;
+   cpu_be    <= pend_be    when cpu_pend = '1' else ram_be;
+   cpu_rnw   <= pend_rnw   when cpu_pend = '1' else ram_rnw;
+   cpu_cache <= pend_cache when cpu_pend = '1' else ram_cache;
+   cpu_wdata <= pend_wdata when cpu_pend = '1' else ram_dataWrite;
+
+   ram_ena_m   <= peek_req  when peek_mode = '1' else (cpu_issue or dma_grant);
+   ram_rnw_m   <= '1'       when peek_mode = '1' else
+                  '0'       when dma_grant = '1' else cpu_rnw;
+   ram_Adr_m   <= peek_addr when peek_mode = '1' else
+                  ('0' & dma_ram_addr) when dma_grant = '1' else cpu_adr;
+   ram_be_m    <= "1111"    when peek_mode = '1' else
+                  "1111"    when dma_grant = '1' else cpu_be;
+   ram_cache_m <= '0'       when peek_mode = '1' else
+                  '0'       when dma_grant = '1' else cpu_cache;
+   ram_dataWrite_m <= dma_ram_wdata when dma_grant = '1' else cpu_wdata;
+
+   ram_done_mux <= ram_done and not (ramarb_dma or dma_grant);
 
    process (clk1x)
    begin
@@ -463,7 +517,7 @@ begin
       ram_rnw              => ram_rnw,
       ram_ena              => ram_ena,
       ram_cache            => ram_cache,
-      ram_done             => ram_done,
+      ram_done             => ram_done_mux,
       mem_in_request       => mem_request,
       mem_in_rnw           => mem_rnw,
       mem_in_isData        => mem_isData,
@@ -783,9 +837,9 @@ begin
       ram_addr       => dma_ram_addr,
       ram_wdata      => dma_ram_wdata,
       ram_gnt        => dma_grant,
-      dev_valid      => '0',            -- the CDVD read path is not built yet
-      dev_data       => ZERO32,
-      dev_ready      => open,
+      dev_valid      => cdvd_dev_valid,
+      dev_data       => cdvd_dev_data,
+      dev_ready      => cdvd_dev_ready,
       irq            => irq_dma,
       dbg_channel    => open,
       dbg_words      => open,
@@ -832,7 +886,16 @@ begin
       disc_type     => cdvd_disc_type,
       log_addr      => cdvd_log_addr,
       log_data      => cdvd_log_data,
-      log_count     => cdvd_log_count
+      log_count     => cdvd_log_count,
+      sec_req       => cdvd_sec_req,
+      sec_lba       => cdvd_sec_lba,
+      sec_waddr     => cdvd_sec_waddr,
+      sec_wdata     => cdvd_sec_wdata,
+      sec_we        => cdvd_sec_we,
+      sec_done      => cdvd_sec_done,
+      dev_valid     => cdvd_dev_valid,
+      dev_data      => cdvd_dev_data,
+      dev_ready     => cdvd_dev_ready
    );
 
    -- SIO2 with a digital pad on port 0 (see iop_sio2.vhd)

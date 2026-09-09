@@ -63,7 +63,26 @@ entity iop_cdvd is
       -- watched.  This is how.
       log_addr      : in  unsigned(7 downto 0) := (others => '0');
       log_data      : out std_logic_vector(31 downto 0) := (others => '0');
-      log_count     : out unsigned(15 downto 0) := (others => '0')
+      log_count     : out unsigned(15 downto 0) := (others => '0');
+
+      -- Sector source.  The block asks for one sector at a time and does not
+      -- care where it comes from: the host answers today over PCIe, and HBM
+      -- will answer later without anything above this changing
+      -- (docs/disc-path.md).  sec_req goes high with the wanted LBA; whoever
+      -- is serving writes 512 words through sec_waddr/sec_wdata/sec_we and
+      -- then pulses sec_done.
+      sec_req       : out std_logic := '0';
+      sec_lba       : out std_logic_vector(31 downto 0) := (others => '0');
+      sec_waddr     : in  unsigned(8 downto 0) := (others => '0');
+      sec_wdata     : in  std_logic_vector(31 downto 0) := (others => '0');
+      sec_we        : in  std_logic := '0';
+      sec_done      : in  std_logic := '0';
+
+      -- to DMA channel 3: a word is taken when dev_valid and dev_ready are
+      -- both high
+      dev_valid     : out std_logic := '0';
+      dev_data      : out std_logic_vector(31 downto 0) := (others => '0');
+      dev_ready     : in  std_logic := '0'
    );
 end entity;
 
@@ -77,6 +96,20 @@ architecture arch of iop_cdvd is
    signal logmem   : t_log := (others => (others => '0'));
    signal log_wp   : unsigned(7 downto 0) := (others => '0');
    signal log_n    : unsigned(15 downto 0) := (others => '0');
+
+   -- the sector buffer and the read engine
+   type t_sector is array (0 to 511) of std_logic_vector(31 downto 0);
+   signal secbuf   : t_sector;
+   type t_rd is (RD_IDLE, RD_FETCH, RD_SEND, RD_FINISH);
+   signal rd_state : t_rd := RD_IDLE;
+   signal rd_lba   : unsigned(31 downto 0) := (others => '0');
+   signal rd_left  : unsigned(31 downto 0) := (others => '0');
+   signal rd_pos   : unsigned(9 downto 0) := (others => '0');
+   -- dev_data is registered from secbuf, so it is valid one cycle after rd_pos
+   -- settles.  rd_fresh tracks that: asserting dev_valid before it is set would
+   -- hand the DMA the previous word, which is what a double-registered version
+   -- of this did -- the sector arrived and every word was off by two.
+   signal rd_fresh : std_logic := '0';
 
    signal ncmd      : std_logic_vector(7 downto 0) := (others => '0');
    signal err       : std_logic_vector(7 downto 0) := (others => '0');
@@ -148,13 +181,58 @@ begin
 
          log_data <= logmem(to_integer(log_addr));
          log_count <= log_n;
+         sec_lba   <= std_logic_vector(rd_lba);
+
+         -- whoever is serving sectors fills the buffer
+         if (sec_we = '1') then
+            secbuf(to_integer(sec_waddr)) <= sec_wdata;
+         end if;
+         dev_data <= secbuf(to_integer(rd_pos(8 downto 0)));
 
          if (reset = '1') then
             ncmd <= (others => '0'); err <= (others => '0'); istat <= (others => '0');
             nparam_n <= (others => '0'); log_wp <= (others => '0'); log_n <= (others => '0');
+            rd_state <= RD_IDLE; sec_req <= '0'; dev_valid <= '0'; rd_fresh <= '0';
             scmd <= (others => '0'); sparam_n <= (others => '0');
             sres_n <= (others => '0'); sres_pos <= (others => '0'); ncmd_pend <= (others => '0');
          else
+            -- the read engine: ask for a sector, then hand its words to DMA
+            case rd_state is
+               when RD_IDLE => null;
+               when RD_FETCH =>
+                  if (rd_left = 0) then
+                     rd_state <= RD_FINISH;
+                  else
+                     sec_req <= '1';
+                     if (sec_done = '1') then
+                        sec_req  <= '0';
+                        rd_pos   <= (others => '0');
+                        rd_fresh <= '0';
+                        rd_state <= RD_SEND;
+                     end if;
+                  end if;
+               when RD_SEND =>
+                  if (rd_fresh = '0') then
+                     -- dev_data catches up with rd_pos this cycle
+                     rd_fresh  <= '1';
+                     dev_valid <= '1';
+                  elsif (dev_ready = '1') then
+                     dev_valid <= '0';
+                     rd_fresh  <= '0';
+                     if (rd_pos = 511) then
+                        rd_lba   <= rd_lba + 1;
+                        rd_left  <= rd_left - 1;
+                        rd_state <= RD_FETCH;
+                     else
+                        rd_pos <= rd_pos + 1;
+                     end if;
+                  end if;
+               when RD_FINISH =>
+                  istat(0) <= '1';
+                  irq      <= '1';
+                  rd_state <= RD_IDLE;
+            end case;
+
             if (ncmd_pend /= 0) then
                ncmd_pend <= ncmd_pend - 1;
                if (ncmd_pend = 1) then
@@ -217,6 +295,22 @@ begin
                         -- commands that are not reads and missed one that is.
                         case (din) is
                            when x"06" | x"07" | x"08" => err <= x"12";   -- no disc
+                           when others => null;
+                        end case;
+                     else
+                        -- with a disc, a read command starts the read engine.
+                        -- Parameters, per the layout CDVDMAN passes: LBA in
+                        -- bytes 0-3 and sector count in 4-7, both little
+                        -- endian; byte 8 retry, 9 spindle, 10 mode.
+                        case (din) is
+                           when x"06" | x"07" | x"08" =>
+                              -- the type qualifier is needed: concatenating
+                              -- four byte vectors inside unsigned() leaves the
+                              -- operand type ambiguous with numeric_std in scope
+                              rd_lba  <= unsigned(std_logic_vector'(nparam(3) & nparam(2) & nparam(1) & nparam(0)));
+                              rd_left <= unsigned(std_logic_vector'(nparam(7) & nparam(6) & nparam(5) & nparam(4)));
+                              ncmd_pend <= (others => '0');   -- the engine raises the interrupt
+                              rd_state  <= RD_FETCH;
                            when others => null;
                         end case;
                      end if;

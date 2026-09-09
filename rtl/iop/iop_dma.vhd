@@ -155,7 +155,11 @@ begin
    dbg_channel <= to_unsigned(ch, 4);
    dbg_words   <= words;
    dbg_running <= '1' when state /= IDLE else '0';
-   dev_ready   <= '1' when (state = RUN and ch = 3) else '0';
+   -- dev_ready means "this word is taken", not "I am listening". A word is
+   -- only consumed when the RAM write for it is granted, so gating on the
+   -- state alone let the device advance faster than the DMA consumed and the
+   -- word count never reached zero -- a stall, not a data error.
+   dev_ready   <= '1' when (state = RUN and ch = 3 and ram_gnt = '1') else '0';
 
    process (clk1x)
       variable idx   : integer range 0 to 12;
@@ -311,6 +315,7 @@ begin
                         ram_wdata <= x"00" & std_logic_vector(cur_addr(23 downto 2) - 1) & "00";
                      end if;
                      if (ram_gnt = '1') then
+                        ram_req  <= '0';               -- one grant, one word
                         words    <= words - 1;
                         if (decr = '1') then cur_addr <= cur_addr - 4;
                         else                 cur_addr <= cur_addr + 4; end if;
@@ -322,6 +327,7 @@ begin
                         ram_addr  <= std_logic_vector(cur_addr);
                         ram_wdata <= dev_data;
                         if (ram_gnt = '1') then
+                           ram_req  <= '0';            -- one grant, one word
                            words    <= words - 1;
                            if (decr = '1') then cur_addr <= cur_addr - 4;
                            else                 cur_addr <= cur_addr + 4; end if;
@@ -330,6 +336,7 @@ begin
                   end if;
 
                when FINISH =>
+                  ram_req  <= '0';
                   madr(ch) <= x"00" & std_logic_vector(cur_addr);
                   chcr(ch) <= chcr(ch) and x"FEFFFFFF";       -- clear start/busy (24)
                   if (ch <= 6) then

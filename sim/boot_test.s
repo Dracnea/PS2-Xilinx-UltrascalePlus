@@ -16,6 +16,8 @@
 #       clear it, read MSCOM, write/read SMCOM
 #   0D  DMA channel 6 (OTC): builds a four-entry ordering table in RAM, checks
 #       the linked list and the end marker, the DICR flag and INTC bit 3
+#   0E  CDVD read of sector 16 delivered by DMA channel 3: checks the ISO9660
+#       volume-descriptor signature in RAM and INTC bit 2
 #   AA  all passed          EE  a check failed (the failing stage is the
 #                               POST value before it)
 
@@ -578,6 +580,82 @@ otcd:
         li      $t2, 0xFFFFFFF7
         sw      $t2, 0($t0)             # acknowledge
         li      $t0, 0x0D
+        sb      $t0, 0($s7)
+
+# ---- 0E: a CDVD sector read, delivered by DMA channel 3 ----------------------
+# The read commands are 0x06, 0x07 and 0x08 -- taken from CDVDMAN itself, whose
+# dispatcher has exactly three call sites passing eleven parameters (LBA in
+# bytes 0-3, sector count in 4-7, then retry, spindle, mode).  Read sector 16,
+# which on any ISO9660 disc is the primary volume descriptor: 0x01 'C' 'D' '0'
+# '0' '1' 0x01, so word 0 reads back 0x30444301.
+        li      $t0, 0x1F8010F0         # DPCR: enable channel 3 (bits 15-12)
+        lw      $t1, 0($t0)
+        nop
+        ori     $t1, $t1, 0x8000
+        sw      $t1, 0($t0)
+        li      $t0, 0x1F8010F4         # DICR: master enable + channel 3
+        lui     $t1, 0x0088             # bit 23 master, bit 19 channel 3
+        sw      $t1, 0($t0)
+
+        li      $t0, 0x1F8010B0         # channel 3 (CDVD)
+        li      $t1, 0x00050000         # MADR: land the sector at 0x50000
+        sw      $t1, 0($t0)
+        li      $t1, 512                # BCR: 512 words = one 2048-byte sector
+        sw      $t1, 4($t0)
+        li      $t1, 0x01000000         # CHCR: to RAM, increment, start
+        sw      $t1, 8($t0)
+
+        li      $t0, 0x1F402005         # eleven N parameters
+        li      $t1, 16                 # LBA = 16
+        sb      $t1, 0($t0)
+        sb      $zero, 0($t0)
+        sb      $zero, 0($t0)
+        sb      $zero, 0($t0)
+        li      $t1, 1                  # sector count = 1
+        sb      $t1, 0($t0)
+        sb      $zero, 0($t0)
+        sb      $zero, 0($t0)
+        sb      $zero, 0($t0)
+        sb      $zero, 0($t0)           # retry
+        sb      $zero, 0($t0)           # spindle
+        sb      $zero, 0($t0)           # mode: 2048-byte sectors
+        li      $t0, 0x1F402004         # N command 0x06: read
+        li      $t1, 0x06
+        sb      $t1, 0($t0)
+
+        li      $t3, 0x00020000         # wait for the CDVD completion interrupt
+                                        # (short enough to report EE rather than
+                                        #  outlive the bench's own timeout)
+cdvw:   li      $t0, 0x1F402008         # CDVD I_STAT bit 0
+        lbu     $t1, 0($t0)
+        nop
+        andi    $t1, $t1, 0x0001
+        bne     $t1, $zero, cdvd
+        nop
+        addiu   $t3, $t3, -1
+        bne     $t3, $zero, cdvw
+        nop
+        b       fail                    # the read never completed
+        nop
+cdvd:
+        li      $t0, 0xA0050000         # read the sector back, uncached
+        lw      $t1, 0($t0)
+        nop
+        li      $t2, 0x30444301         # 01 'C' 'D' '0'
+        bne     $t1, $t2, fail
+        nop
+        lw      $t1, 4($t0)
+        nop
+        li      $t2, 0x00013130         # '0' '1' 01 00
+        bne     $t1, $t2, fail
+        nop
+        li      $t0, 0x1F801070         # INTC bit 2 (CDVD) must be set
+        lw      $t1, 0($t0)
+        nop
+        andi    $t2, $t1, 0x0004
+        beq     $t2, $zero, fail
+        nop
+        li      $t0, 0x0E
         sb      $t0, 0($s7)
 
 # ---- done -----------------------------------------------------------------

@@ -266,6 +266,12 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.cdvd_log_addr  = CSRStorage(8,  description="word to read from the CDVD command log (8 words per entry)")
         self.cdvd_log_data  = CSRStatus(32,  description="that word: entry+0 is kind<<31 | opcode<<16 | nparams, +1..+4 the parameter bytes")
         self.cdvd_log_count = CSRStatus(16,  description="commands logged since reset")
+        self.cdvd_sec_req  = CSRStatus(fields=[
+            CSRField("want", size=1,  offset=0,  description="1 when the drive is waiting for a sector"),
+        ])
+        self.cdvd_sec_lba  = CSRStatus(32, description="which sector it is waiting for")
+        self.cdvd_sec_data = CSRStorage(32, description="write 512 words to fill the sector; the write pointer advances on each")
+        self.cdvd_sec_done = CSRStorage(1,  description="write 1 when the 512 words are in: the read continues and the pointer resets")
 
         # --- sys -> iop -------------------------------------------------------
         reset_iop = Signal()
@@ -320,6 +326,33 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.specials += MultiReg(peek_data_iop, self.peek_data.status, "sys")
         self.sync += If(peek_done_sync.o, self.peek_count.status.eq(self.peek_count.status + 1))
         self.peek_iop = (peek_req_sync.o, peek_addr_iop, peek_data_iop, peek_valid_iop)
+
+        # --- CDVD: the sector source -------------------------------------------
+        # The host answers "give me sector N" by writing 512 words and then
+        # pulsing done. The write pointer lives here rather than costing a CSR
+        # write per word to maintain; docs/disc-path.md explains why the source
+        # is behind an interface at all -- HBM replaces the host later without
+        # the IOP or the CDVD block noticing.
+        sec_ptr = Signal(9)
+        self.sync += [
+            If(self.cdvd_sec_done.re, sec_ptr.eq(0)
+            ).Elif(self.cdvd_sec_data.re, sec_ptr.eq(sec_ptr + 1)),
+        ]
+        sec_waddr_iop = Signal(9)
+        sec_wdata_iop = Signal(32)
+        self.specials += MultiReg(sec_ptr, sec_waddr_iop, "iop")
+        self.specials += MultiReg(self.cdvd_sec_data.storage, sec_wdata_iop, "iop")
+        sec_arm, sec_go = Signal(), Signal()
+        self.sync += [sec_arm.eq(self.cdvd_sec_data.re), sec_go.eq(sec_arm)]
+        self.sec_we_sync   = sec_we_sync   = PulseSynchronizer("sys", "iop")
+        self.sec_done_sync = sec_done_sync = PulseSynchronizer("sys", "iop")
+        self.comb += sec_we_sync.i.eq(sec_go), sec_done_sync.i.eq(self.cdvd_sec_done.re)
+        sec_req_iop = Signal()
+        sec_lba_iop = Signal(32)
+        self.specials += MultiReg(sec_req_iop, self.cdvd_sec_req.fields.want, "sys")
+        self.specials += MultiReg(sec_lba_iop, self.cdvd_sec_lba.status, "sys")
+        self.sec_iop = (sec_req_iop, sec_lba_iop, sec_waddr_iop, sec_wdata_iop,
+                        sec_we_sync.o, sec_done_sync.o)
 
         # --- CDVD: disc presence and the command log ---------------------------
         cdvd_present_iop = Signal()
@@ -427,6 +460,12 @@ class IOPBringup(LiteXModule, AutoCSR):
             i_cdvd_log_addr     = self.cdvd_iop[2],
             o_cdvd_log_data     = self.cdvd_iop[3],
             o_cdvd_log_count    = self.cdvd_iop[4],
+            o_cdvd_sec_req      = self.sec_iop[0],
+            o_cdvd_sec_lba      = self.sec_iop[1],
+            i_cdvd_sec_waddr    = self.sec_iop[2],
+            i_cdvd_sec_wdata    = self.sec_iop[3],
+            i_cdvd_sec_we       = self.sec_iop[4],
+            i_cdvd_sec_done     = self.sec_iop[5],
             i_sif_host_sel   = self.sif_iop[1],
             i_sif_host_data  = self.sif_iop[2],
             i_sif_host_we    = self.sif_iop[0],
