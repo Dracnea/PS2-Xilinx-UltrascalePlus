@@ -133,9 +133,9 @@ the RTL or recorded in the file it belongs to:
 
 ## What the CDVD read path found (2026-09-09)
 
-Stage `0E` took four RTL fixes to pass, and three of them are the same bug in
-different clothes: a signal read or driven a cycle away from where it belonged.
-Recording them together because the family is worth recognising on sight.
+Stage `0E` took three RTL fixes to pass, all of them the same bug in different
+clothes: a signal read or driven a cycle away from where it belonged. Recording
+them together because the family is worth recognising on sight.
 
 1. **`ram_done_mux` was computed and connected to nothing.** `iop_top` derived
    the CPU's masked completion correctly and then passed the memory mux the raw
@@ -149,20 +149,30 @@ Recording them together because the family is worth recognising on sight.
    saw a stray completion to unblock it, so the dropped access became a
    permanent stall and the core raised its error flag. The arbiter now holds one
    CPU request and replays it when the port frees.
-3. **`ram_req` was only ever cleared on reset.** A request left standing after
-   the last word kept the arbiter granting the DMA and re-writing that word.
-   OTC hid this completely: the repeated write put the same value back at the
-   same address, so the list still read back correctly.
-4. **`dev_ready` was asserted on state, not on a grant.** Channel 3 held it high
+3. **`dev_ready` was asserted on state, not on a grant.** Channel 3 held it high
    for the whole transfer rather than when a word was actually consumed, so the
    CDVD advanced faster than the DMA took words and the count never reached
    zero.
 
+A fourth change was made here and then withdrawn, which is worth recording
+because the reasoning was wrong in a way that looked right. `ram_req` appeared
+to be cleared only on reset, so a request left standing after the last word
+would have kept the arbiter granting the DMA and re-writing that word — and OTC
+would have hidden it, since the repeated write puts the same value back at the
+same address. Every part of that is true except the premise: the `ram_req <=
+'0'` near the top of `iop_dma`'s clocked process is a **per-cycle default**, not
+a reset assignment, so the request already lasts exactly as long as its
+condition holds. The "fix" only inserted an idle cycle after every granted word,
+making OTC slower for no benefit. It was caught by reverting each fix in turn to
+confirm the test noticed: this was the one the test did not notice, and probing
+the signal showed why. The default is now commented as one, and `sim/tb_iop.sv`
+carries an assertion that would fire if it were ever dropped.
+
 The bench now traps on the first instruction fetch past the end of the loaded
 image and on an unexpected POST 00, dumping the fetch and data rings with the PC
-of each access alongside DMA and CDVD state. All four were found with it. Three
-of them pass any test that checks only whether a transfer *completed*, which is
-the argument for checking contents instead.
+of each access alongside DMA and CDVD state. All three were found with it, and
+each was then confirmed load-bearing by reverting it and checking the test
+failed — which is also how the withdrawn fourth was caught.
 
 ## Next
 

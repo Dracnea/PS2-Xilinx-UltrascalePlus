@@ -173,6 +173,9 @@ begin
       variable start_chcr : std_logic_vector(31 downto 0);
    begin
       if rising_edge(clk1x) then
+         -- Per-cycle defaults, overridden further down: every one of these is
+         -- re-asserted by the branch that wants it, so a request lasts exactly
+         -- as long as its condition holds and needs no explicit clear.
          bus_dataRead  <= (others => '0');
          bus2_dataRead <= (others => '0');
          ram_req       <= '0';
@@ -315,7 +318,6 @@ begin
                         ram_wdata <= x"00" & std_logic_vector(cur_addr(23 downto 2) - 1) & "00";
                      end if;
                      if (ram_gnt = '1') then
-                        ram_req  <= '0';               -- one grant, one word
                         words    <= words - 1;
                         if (decr = '1') then cur_addr <= cur_addr - 4;
                         else                 cur_addr <= cur_addr + 4; end if;
@@ -327,7 +329,6 @@ begin
                         ram_addr  <= std_logic_vector(cur_addr);
                         ram_wdata <= dev_data;
                         if (ram_gnt = '1') then
-                           ram_req  <= '0';            -- one grant, one word
                            words    <= words - 1;
                            if (decr = '1') then cur_addr <= cur_addr - 4;
                            else                 cur_addr <= cur_addr + 4; end if;
@@ -336,7 +337,6 @@ begin
                   end if;
 
                when FINISH =>
-                  ram_req  <= '0';
                   madr(ch) <= x"00" & std_logic_vector(cur_addr);
                   chcr(ch) <= chcr(ch) and x"FEFFFFFF";       -- clear start/busy (24)
                   if (ch <= 6) then

@@ -144,6 +144,27 @@ module tb_iop;
          $finish;
       end
    end
+   // A DMA with no words left must stop asking for the RAM.  iop_dma gets this
+   // right structurally -- ram_req defaults to '0' every cycle at the top of the
+   // process -- so this never fires today.  It is here because a request left
+   // standing would re-write the last word at the same address with the same
+   // value, which no check of RAM contents can ever see; if that default is
+   // dropped, this is the only thing that would notice.
+   integer dma_idle_req = 0;
+   always @(posedge clk1x) begin
+      if (reset) dma_idle_req <= 0;
+      else if (dut.idma.ram_req === 1'b1 && dut.idma.words == 0) begin
+         dma_idle_req <= dma_idle_req + 1;
+         if (dma_idle_req > 16) begin
+            $display("[%0t] FAIL: DMA has no words left but has held ram_req for %0d cycles",
+                     $time, dma_idle_req);
+            $finish;
+         end
+      end else begin
+         dma_idle_req <= 0;
+      end
+   end
+
    integer i, t0, run_ms;
    string romfile;
 

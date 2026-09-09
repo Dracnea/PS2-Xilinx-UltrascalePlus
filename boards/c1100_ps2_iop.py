@@ -338,9 +338,19 @@ class IOPBringup(LiteXModule, AutoCSR):
             If(self.cdvd_sec_done.re, sec_ptr.eq(0)
             ).Elif(self.cdvd_sec_data.re, sec_ptr.eq(sec_ptr + 1)),
         ]
+        # The address has to be the pointer *at the time of the write*, not the
+        # live one.  sec_ptr increments on the CSR strobe, but the write pulse
+        # only reaches the IOP domain a few cycles later through sec_arm/sec_go
+        # and the PulseSynchronizer -- by which time the live pointer is already
+        # N+1, so word N lands at N+1 and the whole sector arrives shifted by one
+        # word.  Latching it here keeps address and data together across the
+        # crossing.  The testbench drives sec_waddr directly, so no simulation
+        # can catch this; the card found it on the first real sector read.
+        sec_ptr_q = Signal(9)
+        self.sync += If(self.cdvd_sec_data.re, sec_ptr_q.eq(sec_ptr))
         sec_waddr_iop = Signal(9)
         sec_wdata_iop = Signal(32)
-        self.specials += MultiReg(sec_ptr, sec_waddr_iop, "iop")
+        self.specials += MultiReg(sec_ptr_q, sec_waddr_iop, "iop")
         self.specials += MultiReg(self.cdvd_sec_data.storage, sec_wdata_iop, "iop")
         sec_arm, sec_go = Signal(), Signal()
         self.sync += [sec_arm.eq(self.cdvd_sec_data.re), sec_go.eq(sec_arm)]

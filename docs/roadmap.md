@@ -97,8 +97,8 @@ in minutes where reasoning did not.
   (`tools/ps2iop/discserve.py`) and the CSRs are wired; it has not yet run on
   the card.
 
-Getting stage `0E` to pass cost four RTL fixes in the RAM arbiter and the DMA
-handshakes, three of which would pass a test that checked only whether the
+Getting stage `0E` to pass cost three RTL fixes in the RAM arbiter and the DMA
+handshakes, two of which would pass a test that checked only whether the
 transfer completed — see *What the CDVD read path found* in
 [iop-subsystem.md](iop-subsystem.md).
 

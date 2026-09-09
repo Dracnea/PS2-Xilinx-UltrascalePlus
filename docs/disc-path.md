@@ -149,6 +149,40 @@ touching anything above it.
 
 The IOP cannot tell the two apart, so the first can ship and be replaced.
 
+## The sector port, and the bug only the card could find (2026-09-09)
+
+The CDVD asks for one sector at a time: `iop_cdvd_sec_req` goes high with the
+wanted LBA in `iop_cdvd_sec_lba`, the host writes 512 words to
+`iop_cdvd_sec_data`, then pulses `iop_cdvd_sec_done`. The write pointer is kept
+in the gateware so a sector costs 512 CSR writes rather than 1024.
+
+That pointer is where the first real sector read went wrong, and the shape of
+the mistake is worth keeping. `sec_ptr` increments on the CSR write strobe, but
+the write pulse only reaches the IOP clock domain a few cycles later, through
+`sec_arm`/`sec_go` and a `PulseSynchronizer`. Crossing the *live* pointer meant
+that by the time the pulse arrived it already read N+1, so word N was written at
+index N+1 and the whole sector landed shifted by one word. The card read the
+real disc and put this in IOP RAM:
+
+```
+00050000: 00000000   <- never written
+00050004: 30444301   <- word 0 of sector 16
+00050008: 00013130   <- word 1
+0005000c: 59414c50      "PLAY"
+00050010: 54415453      "STAT"
+```
+
+The data was right, the alignment was not. The fix is to latch the pointer at
+the moment of the write and cross *that*, so address and data travel together.
+
+The general point: **the testbench cannot find this class of bug.** It drives
+`sec_waddr`/`sec_wdata`/`sec_we` directly, with the alignment correct by
+construction, because modelling the CSR path and its clock-domain crossings in
+the IOP bench would mean modelling LiteX. Everything between a CSR and the IOP's
+clock domain is therefore only ever tested on the card, which is an argument for
+the hardware test checking *contents* — this bug passes any check that only asks
+whether a sector arrived.
+
 ## Order
 
 1. DMA channel 3, verified by the OTC channel and a loopback that needs no disc.
