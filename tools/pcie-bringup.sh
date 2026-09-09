@@ -80,8 +80,19 @@ dmesg | grep -i litepcie | tail -25
 
 echo
 echo "== identifier / CSR =="
+# Build it if it is missing rather than skipping the check.  The identifier read
+# is the one step that confirms the host is talking to the bitstream you think is
+# on the card, so quietly skipping it is the wrong default -- and it is a
+# thirty-second native build with no cross toolchain involved.  Built as the
+# invoking user so the objects are not left root-owned.
+if [[ ! -x $SW/user/litepcie_util ]]; then
+    echo "litepcie_util not built; building it"
+    if ! runuser -u "$USER_NAME" -- make -C "$SW/user" >/dev/null 2>&1; then
+        echo "  build failed; run: make -C $SW/user"
+    fi
+fi
 if [[ -x $SW/user/litepcie_util ]]; then
     "$SW/user/litepcie_util" info 2>&1 | head -40
 else
-    echo "litepcie_util not built (make -C $SW/user); skipping the identifier read"
+    echo "litepcie_util still not available; skipping the identifier read"
 fi

@@ -112,12 +112,19 @@ class LinkCheck:
 class Dev(LinkCheck):
     def __init__(self, path, csr_csv):
         self.fd = os.open(path, os.O_RDWR)
-        self.regs = {}
+        # csr.csv gives the address AND how many 32-bit words each register
+        # occupies.  The count used to be dropped, so any CSR wider than 32 bits
+        # was only half written: the HBM probe's 33-bit address kept whatever its
+        # low word held, every access went to the same place, and the card looked
+        # like a memory ignoring its address lines.
+        self.regs  = {}
+        self.words = {}
         with open(csr_csv) as f:
             for line in f:
                 parts = line.strip().split(",")
                 if parts and parts[0] == "csr_register":
-                    self.regs[parts[1]] = int(parts[2], 0)
+                    self.regs[parts[1]]  = int(parts[2], 0)
+                    self.words[parts[1]] = int(parts[3], 0) if len(parts) > 3 and parts[3] else 1
 
     def readl(self, addr):
         buf = struct.pack("IIB3x", addr, 0, 0)
@@ -132,8 +139,20 @@ class Dev(LinkCheck):
             sys.exit(f"csr.csv has no register {name}; is it the csr.csv of the loaded bitstream?")
         return self.regs[name]
 
-    def rd(self, name):  return self.readl(self.reg(name))
-    def wr(self, name, v): self.writel(self.reg(name), v)
+    # LiteX lays a multi-word CSR out most-significant word first (csr_ordering
+    # "big"), and a CSRStorage latches when its LAST word is written, so the
+    # words go low address to high.
+    def rd(self, name):
+        base, n = self.reg(name), self.words.get(name, 1)
+        v = 0
+        for i in range(n):
+            v = (v << 32) | self.readl(base + 4*i)
+        return v
+
+    def wr(self, name, v):
+        base, n = self.reg(name), self.words.get(name, 1)
+        for i in range(n):
+            self.writel(base + 4*i, (v >> (32 * (n - 1 - i))) & 0xFFFFFFFF)
 
 
 class UartDev(LinkCheck):
@@ -173,12 +192,19 @@ class UartDev(LinkCheck):
                      "--bind-port", str(tcp_port)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                 time.sleep(3)
-        self.regs = {}
+        # csr.csv gives the address AND how many 32-bit words each register
+        # occupies.  The count used to be dropped, so any CSR wider than 32 bits
+        # was only half written: the HBM probe's 33-bit address kept whatever its
+        # low word held, every access went to the same place, and the card looked
+        # like a memory ignoring its address lines.
+        self.regs  = {}
+        self.words = {}
         with open(csr_csv) as f:
             for line in f:
                 parts = line.strip().split(",")
                 if parts and parts[0] == "csr_register":
-                    self.regs[parts[1]] = int(parts[2], 0)
+                    self.regs[parts[1]]  = int(parts[2], 0)
+                    self.words[parts[1]] = int(parts[3], 0) if len(parts) > 3 and parts[3] else 1
 
     def reg(self, name):
         if name not in self.regs:

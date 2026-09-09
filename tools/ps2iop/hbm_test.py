@@ -89,7 +89,10 @@ def main():
         0x0_8000_0000,              # 2 GiB, stack 0
         STACK - BEAT,               # last beat of stack 0
         STACK,                      # first beat of stack 1 -- needs bit 32
-        STACK + 0x1_0000_0000,      # 5 GiB
+        STACK + GIB,                # 5 GiB.  Not STACK + 0x1_0000_0000, which is
+                                    # 8 GiB: one past the end of the device and
+                                    # outside 33 bits, so it wraps to 0 and
+                                    # silently corrupts the address-0 case.
         8 * GIB - BEAT,             # last beat of the device
     ]
     pattern = {addr: [rng.getrandbits(32) for _ in range(8)] for addr in addrs}
