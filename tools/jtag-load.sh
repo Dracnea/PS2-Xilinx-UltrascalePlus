@@ -60,6 +60,25 @@ out=$("$VIV" -mode batch -notrace -nolog -nojournal -source "$TCL" 2>&1); rc=$?
 rm -f "$TCL"
 echo "$out" | grep -E 'device:|End of startup status|ERROR' | head -6
 if [[ $rc -eq 0 ]] && echo "$out" | grep -q 'End of startup status: HIGH'; then
-    echo "loaded $BIT"; exit 0
+    # Record which image is now on the card, so pcie-bringup.sh can insert the
+    # driver that was generated with it rather than guessing.  A driver built
+    # for another design puts every CSR at the wrong address, and the failure is
+    # silent: the ioctls all succeed and none of them reach the hardware.
+    # `build/<image>/gateware/*.bit` and `bitstreams/<image>.bit` both name it.
+    img=""
+    case $BIT in
+        */build/*/gateware/*) img=${BIT#*/build/}; img=${img%%/*} ;;
+        */bitstreams/*)       img=$(basename "$BIT" .bit) ;;
+    esac
+    root=$(cd "$(dirname "$0")/.." && pwd)
+    if [[ -n $img && -d $root/build/$img ]]; then
+        echo "$img" > "$root/build/.last-loaded"
+        echo "loaded $BIT (image $img)"
+    else
+        echo "loaded $BIT"
+        echo "note: could not tell which build directory this is; name the image" >&2
+        echo "      to pcie-bringup.sh yourself, or it will guess wrong." >&2
+    fi
+    exit 0
 fi
 echo "load failed (rc=$rc)" >&2; exit 1

@@ -23,7 +23,21 @@ if [[ $EUID -ne 0 ]]; then echo "must run as root: sudo $0" >&2; exit 1; fi
 # sudo leaves HOME as root's, so find the invoking user's checkout instead.
 USER_NAME=${SUDO_USER:-$(id -un)}
 USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
-IMAGE=${1:-c1100_ps2_diag}
+# Default to whatever tools/jtag-load.sh last put on the card, not to a name
+# fixed in this script.  A stale default is worse than no default: the driver
+# loads, every ioctl succeeds, and each one writes to an address that belongs to
+# a different design -- which is silent, and cost a day to find once already.
+if [[ $# -ge 1 ]]; then
+    IMAGE=$1
+elif [[ -r build/.last-loaded ]]; then
+    IMAGE=$(< build/.last-loaded)
+    echo "image: $IMAGE (from build/.last-loaded)"
+else
+    echo "no image named and build/.last-loaded is missing" >&2
+    echo "name the image that is on the card, e.g. sudo $0 c1100_ps2_iop" >&2
+    echo "available: $(cd build 2>/dev/null && ls -d */ 2>/dev/null | tr -d / | tr '\n' ' ')" >&2
+    exit 1
+fi
 SW=${LITEPCIE_SW:-$PWD/build/$IMAGE/software}
 
 if [[ ! -f $SW/kernel/litepcie.ko ]]; then
@@ -92,7 +106,31 @@ if [[ ! -x $SW/user/litepcie_util ]]; then
     fi
 fi
 if [[ -x $SW/user/litepcie_util ]]; then
-    "$SW/user/litepcie_util" info 2>&1 | head -40
+    info=$("$SW/user/litepcie_util" info 2>&1)
+    echo "$info" | head -40
+
+    # Verify rather than display.  The identifier lives at a different address in
+    # every design, so reading the expected string back is what proves the driver
+    # and the gateware agree -- and reading anything else is the one cheap signal
+    # that they do not.  Printing it unchecked is how a mismatch goes unnoticed:
+    # the garbage scrolls past among thirty other lines.
+    want=$(awk -F, '$1=="constant" && $2=="config_identifier" {print $3}' "$PWD/build/$IMAGE/csr.csv" 2>/dev/null)
+    echo
+    if [[ -z $want ]]; then
+        echo "WARNING: no config_identifier in build/$IMAGE/csr.csv; cannot verify the match"
+    elif echo "$info" | grep -qF "$want"; then
+        echo "identifier matches build/$IMAGE: '$want'"
+    else
+        echo "FAIL: the card does not report the identifier of build/$IMAGE" >&2
+        echo "  expected: '$want'" >&2
+        echo "  the driver just loaded was generated with build/$IMAGE, so if the" >&2
+        echo "  bitstream on the card is a different design then every CSR the" >&2
+        echo "  driver touches is at the wrong address and nothing will work." >&2
+        echo "  Name the image that is actually on the card and run this again." >&2
+        exit 1
+    fi
 else
-    echo "litepcie_util still not available; skipping the identifier read"
+    echo "litepcie_util still not available; skipping the identifier read" >&2
+    echo "that check is what catches a driver built for a different design; do not skip it" >&2
+    exit 1
 fi
