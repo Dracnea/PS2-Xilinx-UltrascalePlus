@@ -75,6 +75,7 @@ def main():
     if "probe_stat" not in dev.regs:
         sys.exit("this bitstream has no HBM probe; build boards/c1100_hbm_test.py")
 
+    dev.check_link()          # or every number below is 0xFFFFFFFF wearing a disguise
     init = dev.rd("hbm_init_done") & 1
     print(f"1. hbm_init_done = {init}  {'(both stacks up)' if init else '(NOT INITIALISED)'}")
     if not init:

@@ -1,0 +1,1 @@
+-debug "typical" -L "mem" "tb_mem" -s "memsim" 

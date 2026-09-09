@@ -154,6 +154,41 @@ both are cheap enough that being wrong by 2x changes nothing.
 > *Verify by: instrumenting the existing card-to-host video path for underruns
 > at its real frame rate once something other than a test pattern feeds it.*
 
+### Both memories now exist, and the URAM figure is measured
+
+`rtl/gs/gs_lmem.vhd` and `rtl/ee/ee_ram.vhd`, checked together in
+`sim/mem/run_sim.sh` and fitted out of context with `fit/fit_mem.tcl`
+(xcu55n, 2026-09-09):
+
+| block | URAM | BRAM | LUTs | registers |
+|---|---:|---:|---:|---:|
+| `gs_lmem` — 4 MB, 256-bit dual port | **128 (20 %)** | 0 | ~0 | 270 |
+| `ee_ram` — the 32 KB cache; the 32 MB is in HBM | 0 | 8 | 981 | 1226 |
+
+So the 128-URAM figure this budget rests on is now synthesis's number rather
+than arithmetic. The EE's cache costs 8 block RAMs and essentially no fabric.
+
+The simulation runs the EE's cache against a behavioural HBM with a real
+120 ns latency, because a zero-latency model would let a cache that hides
+nothing pass: **a miss takes 156 ns and a hit 16 ns**, and the bench fails if a
+hit is not faster than a miss, or if the hit and miss counts are not what the
+access pattern implies.
+
+Three lessons from fitting these, all of them about inference rather than logic,
+and all recorded in the files themselves:
+
+* A **3D array is not a memory**. `gs_lmem` was first written as banks-of-rows;
+  synthesis warned about "3D-RAM ... 33554432 registers" and then ground for
+  eleven minutes building flip-flops. A flat 2D array infers UltraRAM at once.
+* A memory read **combinationally** cannot be block RAM. Reading the cache's
+  data array in the same cycle as the tag compare put all 32 KB in distributed
+  RAM. Reading tag and data speculatively on the request edge and comparing the
+  cycle after is both the fix and how a cache actually works.
+* **One read statement and one write statement.** With the write-hit and the
+  line-fill writing the array from two places, synthesis reported "Infeasible
+  attribute ram_style = block" and spent 14208 LUTs on it. Collapsing them into
+  a single assignment fed by the state machine took it to 8 BRAMs and 981 LUTs.
+
 ### Why 6 GiB, and what falls outside it
 
 6 GiB is chosen so that the overwhelming majority of titles are **entirely

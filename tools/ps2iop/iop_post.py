@@ -75,7 +75,41 @@ POST_PASS = 0xAA
 POST_FAIL = 0xEE
 
 
-class Dev:
+class LinkCheck:
+    """Shared by both transports: refuse to report results read off a dead link.
+
+    A C1100 whose PCIe link is down -- the normal state right after a JTAG load,
+    until the host rescans -- does not raise an error.  Every read returns
+    0xFFFFFFFF, and that is a *plausible-looking* value: masked to one bit it
+    reads as a flag set, and taken as a two-bit AXI response it reads as DECERR.
+    The HBM probe duly reported `hbm_init_done = 1 (both stacks up)` off a dead
+    link, which is worse than reporting nothing at all.
+
+    ctrl_scratch is a plain read/write register with no side effects, so writing
+    a value and reading it back settles it: only a card that is really there can
+    return what was just written.
+    """
+    def check_link(self, fatal=True):
+        """Check the card is answering; exits with advice if it is not."""
+        if "ctrl_scratch" not in self.regs:
+            return None
+        saved = self.rd("ctrl_scratch")
+        self.wr("ctrl_scratch", 0xC0FFEE5A)
+        got = self.rd("ctrl_scratch")
+        self.wr("ctrl_scratch", 0x12345678 if saved == 0xFFFFFFFF else saved)
+        if got != 0xC0FFEE5A:
+            if fatal:
+                sys.exit(
+                    f"the card is not answering: wrote 0xC0FFEE5A to ctrl_scratch, read back 0x{got:08X}.\n"
+                    + ("every register reads 0xFFFFFFFF, which is a PCIe link that is down -- "
+                       "usually a JTAG load since the last rescan.\n  fix: sudo tools/pcie-bringup.sh <image>"
+                       if got == 0xFFFFFFFF else
+                       "this csr.csv may not match the bitstream on the card."))
+            return False
+        return True
+
+
+class Dev(LinkCheck):
     def __init__(self, path, csr_csv):
         self.fd = os.open(path, os.O_RDWR)
         self.regs = {}
@@ -102,7 +136,7 @@ class Dev:
     def wr(self, name, v): self.writel(self.reg(name), v)
 
 
-class UartDev:
+class UartDev(LinkCheck):
     """The same register interface over the card's UARTbone, via litex_server.
 
     Starts a litex_server on the tty unless one is already bound to the port,
@@ -153,7 +187,6 @@ class UartDev:
 
     def rd(self, name):    return self.reg(name).read()
     def wr(self, name, v): self.reg(name).write(v & 0xFFFFFFFF)
-
     def close(self):
         try:
             self.wb.close()
@@ -164,10 +197,19 @@ class UartDev:
 
 
 def open_dev(args, csr):
-    """Whichever transport the arguments ask for."""
+    """Whichever transport the arguments ask for, checked to be answering.
+
+    The link check is here rather than in each tool so that no tool can print a
+    confident number that is really 0xFFFFFFFF.  Pass --no-link-check to skip it
+    when deliberately poking at a card in an odd state.
+    """
     if getattr(args, "uart", None):
-        return UartDev(csr, port=args.uart, tcp_port=getattr(args, "port", 1234))
-    return Dev(args.dev, csr)
+        dev = UartDev(csr, port=args.uart, tcp_port=getattr(args, "port", 1234))
+    else:
+        dev = Dev(args.dev, csr)
+    if not getattr(args, "no_link_check", False):
+        dev.check_link()
+    return dev
 
 
 def read_image(path):
@@ -433,6 +475,8 @@ def main():
                     help="drive the card over UARTbone through litex_server instead of PCIe")
     ap.add_argument("--port", type=int, default=1234, help="litex_server TCP port for --uart")
     ap.add_argument("--csr", default="csr.csv")
+    ap.add_argument("--no-link-check", action="store_true",
+                    help="skip the ctrl_scratch round trip that proves the card is answering")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
     p = sub.add_parser("load");  p.add_argument("rom"); p.add_argument("--addr", type=lambda x: int(x, 0), default=0)
