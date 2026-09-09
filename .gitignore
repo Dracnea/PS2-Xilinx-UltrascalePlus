@@ -47,3 +47,6 @@ bios/
 
 # LiteScope writes its config next to wherever the build was started
 /zanalyzer_*.csv
+
+# Vivado-generated HBM IP (18 MB); regenerate with ip/hbm/gen_hbm.tcl
+/ip/hbm/hbm_0/

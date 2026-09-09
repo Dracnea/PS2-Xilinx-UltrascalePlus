@@ -195,6 +195,44 @@ through 0D together take 20 ms. This is worth knowing before sizing any timeout
 that polls CDVD, and before reading anything into how long the real BIOS spends
 waiting on the drive.
 
+## The sector port is already MiSTer's disk interface (reviewed 2026-09-09)
+
+Worth stating plainly, because it means the end-user goal costs an adapter
+rather than a redesign. MiSTer's `hps_io.sv` feeds CD-sized media to a core
+with exactly the protocol this project arrived at independently: the core
+raises a request with an LBA, the host writes a block into a buffer, the host
+acknowledges. Side by side:
+
+| this project | MiSTer `hps_io.sv` |
+|---|---|
+| `sec_req` | `sd_rd[n]` |
+| `sec_lba` | `sd_lba[n]` (32-bit) |
+| `sec_waddr` / `sec_wdata` / `sec_we` | `sd_buff_addr` / `sd_buff_dout` / `sd_buff_wr` |
+| `sec_done` | `sd_ack` |
+| `iop_cdvd_disc.present`, disc type | `img_mounted`, `img_size` |
+
+That is not a coincidence so much as both arriving at the only sensible shape,
+but the consequence is real: a PS2 core sitting behind `hps_io` gets its disc
+from **Main_MiSTeX's existing file handling**, which is the menu a user already
+knows, with no new host software to write. The one mismatch is block size — a
+PS2 sector is 2048 bytes against MiSTer's 512-byte default (`BLKSZ`, with
+`sd_blk_cnt` for multi-block requests) — so an adapter maps one CDVD sector to
+four MiSTer blocks, or sets the block size if the core's `hps_io` allows it.
+
+The prior work this plugs into lives in the FPGA-Retro repository and is
+further along than it might appear: `hps_pcie` puts MiSTer's 49-bit `HPS_BUS`
+behind LitePCIe CSRs and is verified in simulation against an *unmodified*
+`hps_io.sv`; `c1100_hps_test.bit` is a built bitstream Main can talk to; and
+`Main_MiSTeX` has an x86-64 PCIe backend that builds. See that repository's
+`docs/host-gui-compatibility.md`.
+
+**What this changes here, now:** nothing needs rewriting, but the sector port
+should not drift away from that shape. Keeping `sec_*` a request/LBA/block/ack
+protocol -- rather than, say, letting the CDVD read HBM directly with no
+interface in between -- is what keeps both futures open: a host serving sectors
+over PCIe today, HBM serving them tomorrow, and `hps_io` serving them when the
+PS2 becomes a core someone picks from a menu.
+
 ## Order
 
 1. DMA channel 3, verified by the OTC channel and a loopback that needs no disc.

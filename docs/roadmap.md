@@ -14,7 +14,7 @@ them.
 A PS2 is three processors and their peripherals. Counting blocks that need
 separate design and separate verification:
 
-### The IOP — 8 done, 3 partial, 2 stubbed
+### The IOP — 10 done, 2 partial, 1 stubbed
 
 | block | state |
 |---|---|
@@ -27,8 +27,8 @@ separate design and separate verification:
 | POST register | **works** |
 | SPU2 | *partial* — two PS1 SPU cores with 512 KB of work RAM each, but the PS1 register layout rather than the SPU2's, and no DMA |
 | SIO2 | *partial* — command queue and a digital pad on port 0; no memory card, no multitap, no DMA |
-| CDVD | *partial* — the register block answers the boot-time status commands; no disc, no sector path |
-| **IOP DMAC** | **stub** — reads back what is written, moves nothing |
+| CDVD | **works** for reading — status commands, disc presence, and the N-command sector read (0x06/0x07/0x08) delivering to DMA channel 3, verified on the C1100 against a real disc. No seek timing, no audio, no writes |
+| **IOP DMAC** | **works** — 13 channels, OTC and channel 3 carry data, the rest accept their registers. SyncMode 1/2 and chain mode not yet |
 | **SIF** (the link to the EE) | **works** — `rtl/iop/iop_sif.vhd`, with the host playing the EE; the IOP kernel boots to BOOTEND through it |
 | SSBUS2 config | **stub**, and that is probably fine forever |
 
@@ -50,7 +50,16 @@ PCIe transport **works**; the video path from card to host **works** (verified
 at 60 fps with a test pattern). Still needed: a disc-image server, a real
 controller path, and an audio path.
 
-**Totals: 8 blocks working, 3 partial, 2 stubbed, 16 not started.**
+**Totals: 10 blocks working, 2 partial, 1 stubbed, 16 not started.**
+
+The shape of that total is the thing to keep in view. The IOP is nearly
+finished, and the IOP is the *small* processor — it is a PS1 CPU whose job on a
+PS2 is to run the drive, the pads and the sound chip. The sixteen that have not
+started are the Emotion Engine and the Graphics Synthesizer: the processor that
+runs the game and the one that draws it, including an R5900 with a 128-bit SIMD
+unit, two vector units, and a rasteriser. They are also individually much larger
+than anything built so far. Being close to done with the IOP is not being close
+to done with a PS2.
 
 ## The milestones, in order
 

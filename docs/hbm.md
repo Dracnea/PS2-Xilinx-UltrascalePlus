@@ -99,10 +99,60 @@ the size of the game stops mattering:
 | base | size | region |
 |---|---:|---|
 | `0x0_0000_0000` | 6 GiB | **disc sector cache**, 6144 chunks of 1 MiB |
-| `0x1_8000_0000` | 32 MiB | EE main memory, for when there is an EE |
+| `0x1_8000_0000` | 32 MiB | EE main memory |
 | `0x1_8200_0000` | 4 MiB | **IOP BIOS ROM** |
 | `0x1_8240_0000` | 2 MiB | IOP RAM (optional) |
-| `0x1_8260_0000` | ~1.96 GiB | free: working buffers, headroom |
+| `0x1_8260_0000` | 64 MiB | PCRTC -> host video ring |
+| `0x1_8660_0000` | 4 MiB | SPU2 -> host audio ring |
+| `0x1_86A0_0000` | ~1.90 GiB | free: working buffers, headroom |
+
+Committed: **6.10 GiB of 8 GiB**, leaving 1.90 GiB. Note that the 4 GiB stack
+boundary (`0x1_0000_0000`) falls *inside* the disc cache, so the cache spans both
+stacks while everything else sits in stack 1. That is a deliberate choice —
+sector traffic is bulk and latency-tolerant, so it is the region that can best
+afford whatever the inter-stack switch costs, and it keeps the EE's main memory
+on a single stack. It also means the AXI ports must be configured for 33-bit
+addressing: the IP's 32-bit default reaches one stack only, and a design that
+silently wrapped would look perfect until an image grew past 4 GiB.
+`ip/hbm/gen_hbm.tcl` sets 33 bits and `tools/ps2iop/hbm_test.py` checks it.
+
+### The GS's local memory, and what actually forces HBM
+
+Reviewed 2026-09-09, because "what does the GS need?" is the natural next
+question and the answer is not the obvious one. Held on-die, at this project's
+measured 4 MB = 128 URAM:
+
+| held in UltraRAM | URAM | C1100 (640) | FK33 (320) |
+|---|---:|---:|---:|
+| GS local memory (4 MB) | 128 | 20 % | 40 % |
+| IOP BIOS ROM (4 MB) | 128 | 20 % | 40 % |
+| IOP RAM (2 MB) | 64 | 10 % | 20 % |
+| EE scratchpad (16 KB) | <1 | — | — |
+| **EE main memory (32 MB)** | **1024** | **160 %** | **320 %** |
+
+The GS's 4 MB stays in UltraRAM: the bandwidth argument above is unchanged, and
+at 20 % of the C1100 it is affordable. Nothing about the GS needs an HBM
+allocation — a real PS2 keeps textures *in* that 4 MB and streams them there
+over the GIF, so there is no second texture pool to budget for.
+
+The line that matters is the last one. **The EE's 32 MB of main memory is 1024
+URAM — more UltraRAM than either card physically has**, 1.6x the C1100's entire
+supply and 3.2x the FK33's. So HBM is not an optimisation for the EE the way it
+is for the BIOS ROM; it is the precondition for an EE existing at all on these
+parts. Every one of the twelve EE blocks is downstream of the memory working.
+
+What the review did add to the map is the two host-facing rings. The video path
+from card to host already works at 60 fps with a test pattern, and when a real
+PCRTC feeds it the frames have to be staged somewhere: 64 MiB is roughly twelve
+buffers at the PS2's largest output (1280x1024x4 = 5.24 MiB), which is far more
+queue than 60 fps needs and costs 1 % of the device. Audio is the same shape and
+much smaller. Both are guesses at the right depth rather than measurements, and
+both are cheap enough that being wrong by 2x changes nothing.
+
+> **NOTE (unverified):** the ring depths above are sized by arithmetic, not by
+> measurement, and no PCRTC or SPU2 output path exists yet to measure.
+> *Verify by: instrumenting the existing card-to-host video path for underruns
+> at its real frame rate once something other than a test pattern feeds it.*
 
 ### Why 6 GiB, and what falls outside it
 
