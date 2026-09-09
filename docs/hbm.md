@@ -5,6 +5,28 @@ touched. It is the obvious answer to the UltraRAM ceiling in
 [cards.md](cards.md), but only for some of the things that could go in it, and
 the difference matters enough to write down before anything is built.
 
+## Verified on the card (2026-09-09)
+
+The HBM works, and all 8 GB of it is reachable through a single AXI port. On the
+C1100 with `bitstreams/c1100_hbm_test.bit` and `tools/ps2iop/hbm_test.py`:
+
+```
+1. hbm_init_done = 1  (both stacks up)
+   0x0_00000000 ok   0x0_80000000 ok   0x0_FFFFFFE0 ok      (stack 0)
+   0x1_00000000 ok   0x1_40000000 ok   0x1_FFFFFFE0 ok      (stack 1)
+4. aliasing: distinct, so no address bit is being lost
+PASS
+```
+
+The stack-1 addresses are the ones that matter. The HBM IP defaults to 32-bit
+AXI addressing, which reaches 4 GB -- one stack -- and a design that silently
+wrapped would look perfect until a disc image grew past 4 GiB.
+`ip/hbm/gen_hbm.tcl` sets 33 bits, and the aliasing check is there because a
+dropped high address bit shows up as two addresses sharing a value rather than
+as an error.
+
+Everything below this line was written before that run and is unchanged by it.
+
 ## What the hardware offers
 
 | | |
