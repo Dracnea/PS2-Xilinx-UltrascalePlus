@@ -96,6 +96,7 @@ class HBMProbe(LiteXModule, AutoCSR):
             CSRField("done", size=1, description="set when a beat completes, cleared by the next"),
             CSRField("resp", size=2, description="AXI response of the last beat; 0 is OK"),
             CSRField("lane", size=4, description="current write-lane pointer"),
+            CSRField("state", size=4, description="FSM state: 0 IDLE, then AW/W/B/AR/R/FIN"),
         ])
         self.rdata = CSRStatus(32, description="read port: lane selected by rlane")
         self.rlane = CSRStorage(3, description="which 32-bit lane of the last read beat rdata shows")
@@ -157,6 +158,18 @@ class HBMProbe(LiteXModule, AutoCSR):
                    NextState("FIN")))
         fsm.act("FIN", fin.i.eq(1), NextState("IDLE"))
         self.comb += busy.eq(~fsm.ongoing("IDLE"))
+        # Which state, not just "not idle".  A stuck AXI master is always busy;
+        # the only useful question is which handshake it is waiting on.
+        # Migen's FSM has no `.state` until it is finalised, so the encoding is
+        # built here from ongoing() -- which also means the numbers are ours and
+        # stay stable if the FSM ever gains a state.
+        pst = Signal(4)
+        self.comb += [
+            If(fsm.ongoing("AW"), pst.eq(1)).Elif(fsm.ongoing("W"), pst.eq(2))
+            .Elif(fsm.ongoing("B"), pst.eq(3)).Elif(fsm.ongoing("AR"), pst.eq(4))
+            .Elif(fsm.ongoing("R"), pst.eq(5)).Elif(fsm.ongoing("FIN"), pst.eq(6)),
+        ]
+        self.specials += MultiReg(pst, self.stat.fields.state, "sys")
 
 
 class HBMDiscSource(LiteXModule, AutoCSR):
@@ -189,6 +202,7 @@ class HBMDiscSource(LiteXModule, AutoCSR):
             CSRField("busy",   size=1),
             CSRField("served", size=16, description="sectors served from HBM since reset"),
             CSRField("resp",   size=2,  description="AXI response of the last burst; 0 is OK"),
+            CSRField("state",  size=4,  description="FSM state: 0 IDLE, AR, R, EMIT, DRAIN, DONE, WAIT"),
         ])
 
         # from the CDVD (already in sys), and the fill path back to it
@@ -288,6 +302,14 @@ class HBMDiscSource(LiteXModule, AutoCSR):
         # exactly one sector.
         fsm.act("WAIT", If(~self.req, NextState("IDLE")))
         self.comb += self.stat.fields.busy.eq(~fsm.ongoing("IDLE"))
+        self.comb += [
+            If(fsm.ongoing("AR"),      self.stat.fields.state.eq(1))
+            .Elif(fsm.ongoing("R"),     self.stat.fields.state.eq(2))
+            .Elif(fsm.ongoing("EMIT"),  self.stat.fields.state.eq(3))
+            .Elif(fsm.ongoing("DRAIN"), self.stat.fields.state.eq(4))
+            .Elif(fsm.ongoing("DONE"),  self.stat.fields.state.eq(5))
+            .Elif(fsm.ongoing("WAIT"),  self.stat.fields.state.eq(6)),
+        ]
 
 
 class HBMDMAWriter(LiteXModule, AutoCSR):
@@ -325,8 +347,11 @@ class HBMDMAWriter(LiteXModule, AutoCSR):
             CSRField("busy", size=1),
             CSRField("done", size=1, description="set when `length` bytes have been written"),
             CSRField("resp", size=2, description="AXI response of the last burst; 0 is OK"),
+            CSRField("state", size=4, description="FSM state: 0 IDLE, 1 AW, 2 W, 3 B"),
+            CSRField("stalled", size=1, description="in W with no packed beat: waiting on the host, not on HBM"),
         ])
         self.written = CSRStatus(32, description="bytes written so far; the honest progress indicator")
+        self.bursts  = CSRStatus(32, description="AW handshakes HBM accepted; 0 means HBM never answered")
 
         port = axi.AXIInterface(data_width=256, address_width=33, id_width=6)
         self.submodules.axi_cdc = axi.AXIClockDomainCrossing(port, axi_port, "sys", "axi")
@@ -337,6 +362,7 @@ class HBMDMAWriter(LiteXModule, AutoCSR):
         resp    = Signal(2)
         done    = Signal()
         beat    = Signal(max=burst + 1)
+        bursts  = Signal(32)
 
         # --- pack `packing` source words into one 256-bit beat ---------------
         acc   = Signal(256)
@@ -386,20 +412,31 @@ class HBMDMAWriter(LiteXModule, AutoCSR):
                 NextState("AW"),
             ),
         )
+        # Abort is latched rather than acted on where it lands.  AXI says that
+        # once an AW is accepted, every W beat of that burst and its B response
+        # must follow; jumping to IDLE from the middle of a burst leaves the
+        # slave waiting for beats that never come and wedges the port.  So abort
+        # stops the engine only where stopping is legal: before the next address
+        # goes out.
+        aborting = Signal()
+        self.sync += If(self.ctrl.fields.abort, aborting.eq(1)).Elif(fsm.ongoing("IDLE"), aborting.eq(0))
+
         fsm.act("AW",
-            If(self.ctrl.fields.abort, NextState("IDLE")).
+            If(aborting, NextState("IDLE")).
             Elif(remain == 0,
                 NextValue(done, 1),
                 NextState("IDLE"),
             ).Else(
                 port.aw.valid.eq(1),
-                If(port.aw.ready, NextValue(beat, 0), NextState("W")),
+                If(port.aw.ready,
+                   NextValue(beat, 0),
+                   NextValue(bursts, bursts + 1),
+                   NextState("W")),
             ),
         )
         fsm.act("W",
             port.w.valid.eq(full),
             port.w.last.eq(beat == burst - 1),
-            If(self.ctrl.fields.abort, NextState("IDLE")),
             If(taken,
                 NextValue(written, written + 32),
                 # remain is a byte count and saturates at 0 rather than wrapping,
@@ -416,4 +453,11 @@ class HBMDMAWriter(LiteXModule, AutoCSR):
                 NextState("AW"),
             ),
         )
-        self.comb += self.stat.fields.busy.eq(~fsm.ongoing("IDLE"))
+        self.comb += [
+            self.stat.fields.busy.eq(~fsm.ongoing("IDLE")),
+            If(fsm.ongoing("AW"), self.stat.fields.state.eq(1))
+            .Elif(fsm.ongoing("W"), self.stat.fields.state.eq(2))
+            .Elif(fsm.ongoing("B"), self.stat.fields.state.eq(3)),
+            self.stat.fields.stalled.eq(fsm.ongoing("W") & ~full),
+            self.bursts.status.eq(bursts),
+        ]
