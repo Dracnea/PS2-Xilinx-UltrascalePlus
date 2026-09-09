@@ -309,6 +309,44 @@ what checks the 33-bit HBM addressing.
 writes through the probe at about ten CSR round trips per 32-byte beat, which is
 fine for proving the memory and hopeless for a game.
 
+### The IOP reads the disc out of HBM — 2026-09-09
+
+With the image staged, `iop_hbm_disc_enable` hands the CDVD its sectors from
+HBM and no host program runs at all. Boot-test stage `0E` passes five times
+consecutively with `discserve.py` absent, and the disc source reports
+`resp=0` with its `served` counter advancing one per run.
+
+The control that makes that evidence is moving `iop_hbm_disc_base` so LBA 16
+lands on the SYSTEM.CNF sector instead of the volume descriptor. Stage `0E`
+then fails, and IOP RAM at `0x50000` holds
+
+```
+BOOT2 = cdrom0:\SLUS_212.40;1\r\nVER = 2.0...
+```
+
+which is worth more than the passing run. It shows the read really goes to HBM
+rather than to a buffer left full by the previous test, that the base register
+steers it, and that **the address path works past 4 GiB** — that sector is at
+byte 4,638,955,520, needing bit 32 of the 33-bit address. The IOP has read the
+far-end file this project kept warning about, through `CDVDMAN`'s own path.
+
+Sector 16 alone would not have shown any of that: it begins with a fixed
+ISO9660 signature, so "we saw CD001" is satisfied by a stale buffer, a wrong
+base, or a lucky guess.
+
+**A sector is four AXI bursts, not one.** The HBM controller's
+`AXI_xx_ARLEN`/`AWLEN` are `[3:0]`, so a burst is at most 16 beats (PG276).
+The disc source asked for the whole 2048-byte sector as one 64-beat burst,
+and nothing rejected it: `ARLEN` truncated to 4 bits, HBM returned 16 beats,
+and the master waited forever for the seventeenth with `resp=0`, because the
+sixteen it got were fine. `iop_hbm_disc_stat` showed `state=R` on 1,872
+consecutive samples, which is what localised it.
+
+The other two masters were fine by accident rather than by design: the probe
+reads single beats, and the DMA writer happened to use bursts of exactly 16.
+Every AXI master on this device must keep `AxLEN <= 15`, and it is worth
+checking that before adding a third.
+
 ### Four faults, each hiding the next
 
 Worth writing down, because the first three all presented as *"the HBM DMA

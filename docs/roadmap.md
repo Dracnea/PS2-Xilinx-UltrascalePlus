@@ -104,14 +104,14 @@ in minutes where reasoning did not.
   for sector 16 of the Star Wars Battlefront II disc, `discserve.py` answers over
   PCIe, and the 2048 bytes land in IOP RAM byte-identical to the disc:
   `CD001 PLAYSTATION ... 2_01`.
-- **The disc in HBM** — *staging works, 2026-09-09*. The whole 4.34 GiB image
-  goes into the card's HBM by DMA in 6.3 s, and the filesystem walks correctly
-  out of HBM alone: volume descriptor, root directory, `SYSTEM.CNF` at LBA
-  2,265,115 and a valid ELF behind it. What is **not** yet done is the IOP
-  reading through it — `iop_hbm_disc_enable` hands the CDVD its sectors from HBM
-  instead of from the host, and that path has not been run since the image
-  landed. That is the next thing to check, and it is a bring-up rather than a
-  build. [hbm.md](hbm.md), [disc-path.md](disc-path.md).
+- **The disc in HBM** — *works on the card, 2026-09-09*. The whole 4.34 GiB
+  image goes into HBM by DMA in 6.3 s, and **the IOP then reads it with no host
+  program running at all**: stage `0E` passes five times consecutively with
+  `discserve.py` absent. Moving `iop_hbm_disc_base` so LBA 16 lands on the
+  SYSTEM.CNF sector makes `0E` fail and puts `BOOT2 = cdrom0:\SLUS_212.40;1`
+  in IOP RAM instead — which is the result worth having, because it shows the
+  read goes to HBM at the address selected and that the address path works past
+  4 GiB. [hbm.md](hbm.md), [disc-path.md](disc-path.md).
 
 Checked on the card with its negative controls, which is the part that makes it
 evidence rather than a green light:
