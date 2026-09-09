@@ -2,7 +2,7 @@
 """Serve disc sectors to the card, from an image, a block device or a drive.
 
     tools/ps2iop/discserve.py <source> [--csr bitstreams/c1100_ps2_diag.csr.csv]
-                              [--seconds 30] [--once]
+                              [--seconds 30] [--once] [--quiet]
 
 The CDVD block asks for one sector at a time -- `iop_cdvd_sec_req` goes high
 with the wanted LBA in `iop_cdvd_sec_lba` -- and this answers by writing the
@@ -64,14 +64,17 @@ def main():
     ap.add_argument("--dev", default="/dev/litepcie0")
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--once", action="store_true", help="serve a single sector and stop")
+    ap.add_argument("--quiet", action="store_true",
+                    help="only the summary line: for repeat runs where per-sector output is noise")
     a = ap.parse_args()
 
     dev = iop_post.Dev(a.dev, a.csr)
     if "iop_cdvd_sec_req" not in dev.regs:
         sys.exit("this bitstream has no CDVD sector source; rebuild with it")
     disc = DiscSource(a.source)
-    print(f"serving {disc.path} ({disc.kind}, {disc.sectors} sectors) for {a.seconds:g} s")
-    n = serve(dev, disc, a.seconds, a.once)
+    if not a.quiet:
+        print(f"serving {disc.path} ({disc.kind}, {disc.sectors} sectors) for {a.seconds:g} s")
+    n = serve(dev, disc, a.seconds, a.once, verbose=not a.quiet)
     print(f"{n} sectors served; {disc.reads} source reads, {disc.cache_hits} cache hits")
 
 

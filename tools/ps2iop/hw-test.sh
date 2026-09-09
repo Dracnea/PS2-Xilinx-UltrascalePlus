@@ -16,7 +16,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 REPO=$PWD
 CSR=bitstreams/c1100_ps2_iop.csr.csv
-ROM=overlay/cores/PS2/sim/boot_test.hex
+ROM=sim/boot_test.hex
 LOG=build/ps2_hw/$(date +%Y%m%d-%H%M%S).log
 
 if [[ $EUID -ne 0 ]]; then echo "run with sudo (root is needed for the PCIe rescan and the driver)" >&2; exit 1; fi
@@ -68,12 +68,44 @@ run_as_user $POST reset hold
 run_as_user $POST load "$ROM"
 run_as_user $POST status
 
-step "4. boot_test.s, pad0 = 0x5A3C (what the testbench drives): expect POST 01..0A then AA, PASS"
+# Stage 0E reads a sector, so a disc has to be present and something has to
+# answer the sector requests.  DISC may be an ISO, a block device or a drive --
+# discserve.py does not care which (docs/disc-path.md).
+DISC=${DISC:-"discs/Star Wars - Battlefront II (USA) (v2.01).iso"}
+
+step "4. boot_test.s, pad0 = 0x5A3C (what the testbench drives), no disc: expect POST 01..0D then EE at 0E"
 run_as_user $POST run "$ROM" --timeout 10 --pad0 0x5A3C
-step "5. boot_test.s again with pad0 = 0xFFFF (nothing pressed): stage 09 must now report EE, proving the pad CSR reaches SIO2"
+
+if [[ -e $DISC ]]; then
+    step "5. the same run with $DISC in the drive: expect POST 01..0E then AA, PASS"
+    run_as_user $POST cdvd disc on
+    run_as_user tools/ps2iop/discserve.py "$DISC" --csr "$CSR" --seconds 30 &
+    SERVER=$!
+    sleep 0.5
+    run_as_user $POST run "$ROM" --timeout 20 --pad0 0x5A3C
+    step "5b. what the IOP actually asked the drive for"
+    run_as_user $POST cdvd log
+    kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null
+else
+    step "5. SKIPPED: no disc at $DISC -- stage 0E cannot pass without one"
+fi
+
+step "6. pad0 = 0xFFFF (nothing pressed): stage 09 must now report EE, proving the pad CSR reaches SIO2"
+run_as_user $POST cdvd disc off
 run_as_user $POST run "$ROM" --timeout 10 --pad0 0xFFFF
-step "6. repeat the passing run 5x for stability (each must PASS)"
-for i in 1 2 3 4 5; do run_as_user $POST run "$ROM" --timeout 10 --pad0 0x5A3C | tail -1; done
-step "7. final status"
+
+if [[ -e $DISC ]]; then
+    step "7. repeat the passing run 5x for stability (each must PASS)"
+    run_as_user $POST cdvd disc on
+    for i in 1 2 3 4 5; do
+        run_as_user tools/ps2iop/discserve.py "$DISC" --csr "$CSR" --seconds 25 --quiet &
+        SERVER=$!
+        sleep 0.3
+        run_as_user $POST run "$ROM" --timeout 20 --pad0 0x5A3C | tail -1
+        kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null
+    done
+fi
+
+step "8. final status"
 run_as_user $POST status
 echo; echo "== done $(date -Is); log: $LOG"
