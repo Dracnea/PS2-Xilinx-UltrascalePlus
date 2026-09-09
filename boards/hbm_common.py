@@ -377,17 +377,30 @@ class HBMDMAWriter(LiteXModule, AutoCSR):
         # cycle and the engine settles at two words per three cycles -- two
         # thirds of line rate, 1.3 GB/s instead of 2.  Adding `| taken` closes
         # the gap for a single OR gate.
-        self.comb += dma_source.ready.eq(~full | taken)
+        # The packer must not carry state across transfers, and must not collect
+        # anything while the engine is idle.  Both were true before, and the
+        # result was that a beat left packed by one run became the *first* beat
+        # of the next: every byte correct and the whole image 32 bytes late.
+        # The data being right is what makes this kind of fault easy to pass --
+        # it reads as a working transfer until something checks alignment.
+        armed = Signal()
+        flush = Signal()
+        self.comb += dma_source.ready.eq(armed & (~full | taken))
         self.sync += [
-            If(taken, full.eq(0)),
-            If(dma_source.valid & dma_source.ready,
-                Case(half, {i: acc[data_width*i:data_width*(i+1)].eq(dma_source.data)
-                            for i in range(packing)}),
-                If(half == packing - 1,
-                    half.eq(0),
-                    full.eq(1),
-                ).Else(
-                    half.eq(half + 1),
+            If(flush,
+                full.eq(0),
+                half.eq(0),
+            ).Else(
+                If(taken, full.eq(0)),
+                If(dma_source.valid & dma_source.ready,
+                    Case(half, {i: acc[data_width*i:data_width*(i+1)].eq(dma_source.data)
+                                for i in range(packing)}),
+                    If(half == packing - 1,
+                        half.eq(0),
+                        full.eq(1),
+                    ).Else(
+                        half.eq(half + 1),
+                    ),
                 ),
             ),
         ]
@@ -403,8 +416,10 @@ class HBMDMAWriter(LiteXModule, AutoCSR):
 
         fsm = FSM(reset_state="IDLE")
         self.submodules += fsm
+        self.comb += armed.eq(~fsm.ongoing("IDLE"))
         fsm.act("IDLE",
             If(self.ctrl.fields.start,
+                flush.eq(1),
                 NextValue(addr, self.base.storage),
                 NextValue(remain, self.length.storage),
                 NextValue(written, 0),
