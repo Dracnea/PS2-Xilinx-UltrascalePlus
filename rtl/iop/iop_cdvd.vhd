@@ -6,7 +6,11 @@
 -- it is unverified against a drive.  Byte registers, offsets from 0x1F402000:
 --   0x04  N command (R/W)      writing runs the command; here every N command
 --                              completes at once, read commands with error 0x12
---                              (no disc), and raises I_STAT bit 0 and INTC bit 2
+--                              (no disc), and raises I_STAT bit 0 and INTC bit 2.
+--                              The N commands this BIOS uses are 0x00-0x09 and
+--                              0x0C; 0x06, 0x07 and 0x08 are the sector reads
+--                              (eleven parameters: LBA, count, retry, spindle,
+--                              mode). Measured from CDVDMAN, not guessed.
 --   0x05  N ready (R)          0x4A: data-empty | mecha-init | drive-ready
 --         N parameter (W)      stored (up to 16 bytes)
 --   0x06  error (R)            last error, cleared by the read
@@ -46,11 +50,33 @@ entity iop_cdvd is
       bus_read      : in  std_logic;
       bus_write     : in  std_logic;
       bus_dataRead  : out std_logic_vector(31 downto 0) := (others => '0');
-      irq           : out std_logic := '0'
+      irq           : out std_logic := '0';
+      -- Tell the driver a disc is in the tray.  With no disc it never gets as
+      -- far as asking to read one, and what it asks for is the thing that
+      -- needs measuring.
+      disc_present  : in  std_logic := '0';
+      disc_type     : in  std_logic_vector(7 downto 0) := x"14";   -- 0x14 = PS2 DVD
+      -- Command log for the host: every N and S command with its parameters,
+      -- eight words per entry.  CDVDMAN issues every N command through one
+      -- dispatcher with the opcode in a register (ROM .text+0x2fc4), so the
+      -- opcodes cannot be read out of the BIOS statically -- they have to be
+      -- watched.  This is how.
+      log_addr      : in  unsigned(7 downto 0) := (others => '0');
+      log_data      : out std_logic_vector(31 downto 0) := (others => '0');
+      log_count     : out unsigned(15 downto 0) := (others => '0')
    );
 end entity;
 
 architecture arch of iop_cdvd is
+   -- N command parameters, written a byte at a time to 0x1F402005
+   type t_nparam is array (0 to 15) of std_logic_vector(7 downto 0);
+   signal nparam   : t_nparam := (others => (others => '0'));
+   signal nparam_n : unsigned(4 downto 0) := (others => '0');
+   -- the log: 32 entries of 8 words
+   type t_log is array (0 to 255) of std_logic_vector(31 downto 0);
+   signal logmem   : t_log := (others => (others => '0'));
+   signal log_wp   : unsigned(7 downto 0) := (others => '0');
+   signal log_n    : unsigned(15 downto 0) := (others => '0');
 
    signal ncmd      : std_logic_vector(7 downto 0) := (others => '0');
    signal err       : std_logic_vector(7 downto 0) := (others => '0');
@@ -120,8 +146,12 @@ begin
          waddr := to_integer(bus_addr(5 downto 2)) * 4 + wlane;
          if (sres_pos < sres_n) then sready := x"00"; else sready := x"40"; end if;
 
+         log_data <= logmem(to_integer(log_addr));
+         log_count <= log_n;
+
          if (reset = '1') then
             ncmd <= (others => '0'); err <= (others => '0'); istat <= (others => '0');
+            nparam_n <= (others => '0'); log_wp <= (others => '0'); log_n <= (others => '0');
             scmd <= (others => '0'); sparam_n <= (others => '0');
             sres_n <= (others => '0'); sres_pos <= (others => '0'); ncmd_pend <= (others => '0');
          else
@@ -150,7 +180,13 @@ begin
                      else
                         bus_dataRead <= (others => '0');
                      end if;
-                  when others => bus_dataRead <= (others => '0');   -- 0x0A, 0x0B, 0x0F, 0x13, 0x15: all zero
+                  -- 0x0A drive status and 0x0F disc type answer according to
+                  -- disc_present.  > NOTE (unverified): the status byte here is
+                  -- a plausible "ready, spinning" rather than a measured one;
+                  -- PCSX2 is the only reference and no drive was consulted.
+                  when 16#0A# => bus_dataRead <= x"00" & (x"02" and (7 downto 0 => disc_present)) & x"0000";
+                  when 16#0F# => bus_dataRead <= (disc_type and (7 downto 0 => disc_present)) & x"000000";
+                  when others => bus_dataRead <= (others => '0');   -- 0x0B, 0x13, 0x15: all zero
                end case;
             end if;
 
@@ -160,12 +196,41 @@ begin
                   when 16#04# =>
                      ncmd <= din;
                      ncmd_pend <= to_unsigned(16, 5);
-                     case (din) is
-                        when x"06" | x"08" | x"0A" | x"0C" | x"0E" => err <= x"12";   -- read commands: no disc
-                        when others => null;
-                     end case;
+                     -- log it: header, then the parameters as they were given
+                     logmem(to_integer(log_wp)) <= '0' & "0000000" & din & x"00" & std_logic_vector(resize(nparam_n, 8));
+                     for w in 0 to 3 loop
+                        logmem(to_integer(log_wp) + 1 + w) <=
+                           nparam(w*4+3) & nparam(w*4+2) & nparam(w*4+1) & nparam(w*4+0);
+                     end loop;
+                     log_wp   <= log_wp + 8;
+                     log_n    <= log_n + 1;
+                     nparam_n <= (others => '0');
+                     if (disc_present = '0') then
+                        -- The sector-read commands, derived from this BIOS
+                        -- rather than guessed: CDVDMAN issues every N command
+                        -- through one dispatcher (.text+0x2ee8, opcode in a0,
+                        -- parameter buffer in a1, count in a2), and exactly
+                        -- three call sites pass eleven parameters -- LBA(4),
+                        -- sector count(4), retry, spindle, mode -- with
+                        -- opcodes 0x06, 0x07 and 0x08. An earlier guess here
+                        -- read 0x06|0x08|0x0A|0x0C|0x0E, which had two
+                        -- commands that are not reads and missed one that is.
+                        case (din) is
+                           when x"06" | x"07" | x"08" => err <= x"12";   -- no disc
+                           when others => null;
+                        end case;
+                     end if;
+                  when 16#05# =>
+                     if (nparam_n < 16) then
+                        nparam(to_integer(nparam_n)) <= din;
+                        nparam_n <= nparam_n + 1;
+                     end if;
                   when 16#08# => istat <= istat and not din;
                   when 16#16# =>
+                     logmem(to_integer(log_wp)) <= '1' & "0000000" & din & x"00" & std_logic_vector(resize(sparam_n, 8));
+                     logmem(to_integer(log_wp) + 1) <= sparam(3) & sparam(2) & sparam(1) & sparam(0);
+                     log_wp   <= log_wp + 8;
+                     log_n    <= log_n + 1;
                      scmd     <= din;
                      sres_n   <= to_unsigned(s_count(din, sparam(0)), 5);
                      sres_pos <= (others => '0');

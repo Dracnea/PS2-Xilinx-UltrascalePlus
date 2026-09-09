@@ -86,13 +86,32 @@ It needs the N command read path: a read command takes **LBA in parameter bytes
 mode byte (2048 for the DVD case). Completion sets the data-ready status and
 raises `I_STAT` bit 0 and INTC bit 2.
 
-> **NOTE (unverified):** the numeric N command opcodes are not recorded here.
-> `ps2tek` documents the register map but not the command set, PCSX2 is the
-> only executable reference, and `CDVDMAN` takes its opcodes in a register from
-> its callers rather than as immediates, so they cannot be read out of the ROM
-> statically. *Verify by: watching writes to 0x1F402004 on the LiteScope while
-> the booted kernel issues a real read — the instrument for that already exists
-> and the answer will be this BIOS's own, which is the one that matters.*
+**The opcodes are now measured, from this BIOS.** `CDVDMAN` issues every N
+command through a single dispatcher at `.text+0x2ee8`, whose prologue parks
+`$a0` as the opcode, `$a1` as the parameter buffer and `$a2` as the parameter
+count. Its thirteen call sites give the command set directly:
+
+| opcode | parameters | |
+|---|---:|---|
+| `0x00`-`0x05` | few, or passed in a register | NOP, reset, standby, stop, pause, seek |
+| **`0x06`, `0x07`, `0x08`** | **11** | **the sector reads**: LBA(4), sector count(4), retry, spindle, mode |
+| `0x09` | 1 | two call sites |
+| `0x0C` | 7 | |
+
+Eleven parameters is the signature: it is exactly the read layout PCSX2
+documents. An earlier guess in `iop_cdvd.vhd` had the read set as
+`0x06|0x08|0x0A|0x0C|0x0E` — two commands that are not reads, and one real one
+missing. It now matches the BIOS.
+
+**Watching the hardware was tried first and did not answer it**, which is worth
+recording. With a disc reported present, the booted kernel issued thirteen
+commands and every one was an S command: `0x40` / `0x41`×n / `0x43`, three
+times over — the MechaCon NVM config read, fetching language, timezone and
+screen settings. Not one N command. After `BOOTEND` the IOP idles waiting for
+the Emotion Engine, and on a real console it is the EE that asks for files, so
+no disc read is ever initiated with no EE present. The command log
+(`iop_post.py cdvd log`) is what established that, and it stays useful for
+watching a read once something asks for one.
 
 ### 3. A sector source behind it
 

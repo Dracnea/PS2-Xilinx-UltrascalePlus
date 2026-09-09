@@ -11,6 +11,7 @@ watch the POST register.
     iop_post.py ... dump FILE [--addr A] [--length N]      # dump IOP RAM to a file, 2 MB by default
     iop_post.py ... verify ROM.bin [--samples N]           # read the ROM back and compare with the file
     iop_post.py ... sif [show|ee-init|set NAME VALUE]      # the EE's half of the SIF mailbox
+    iop_post.py ... cdvd [log|disc on|disc off]           # what the BIOS asked the drive for
 
 `run` writes `iop_pad0` before releasing reset. The CSR resets to 0xFFFF (nothing
 pressed) but boot_test.s stage 09 expects the pad to answer 0x5A3C, which is what
@@ -277,6 +278,46 @@ SIF_MSCOM, SIF_MSFLAG_SET, SIF_MSFLAG_CLR, SIF_SMFLAG_CLR, SIF_CTRL, SIF_BD6 = r
 SIF_STAT_SIFINIT = 0x00010000     # the bit SIFMAN spins on, set by the EE
 
 
+# The CDVD command log. CDVDMAN issues every N command through one dispatcher
+# with the opcode in a register (0220A ROM, CDVDMAN .text+0x2fc4), so the
+# opcodes cannot be read out of the BIOS statically. The hardware records what
+# it was actually asked for instead.
+CDVD_LOG_WORDS = 8
+
+
+def cdvd_log(dev, limit=32):
+    n = dev.rd("iop_cdvd_log_count")
+    print(f"CDVD command log: {n} commands since reset")
+    if n == 0:
+        print("   (nothing yet -- the driver only talks to a drive it believes has a disc:"
+              "\n    try `cdvd disc on` before releasing reset)")
+        return
+    shown = min(n, limit)
+    first = n - shown if n > limit else 0
+    for e in range(first, n):
+        base = (e % 32) * CDVD_LOG_WORDS
+        words = []
+        for w in range(5):
+            dev.wr("iop_cdvd_log_addr", base + w)
+            words.append(dev.rd("iop_cdvd_log_data"))
+        hdr = words[0]
+        kind = "S" if (hdr >> 31) & 1 else "N"
+        op   = (hdr >> 16) & 0xFF
+        npar = hdr & 0xFF
+        par  = b"".join(struct.pack("<I", words[1 + i]) for i in range(4))[:max(npar, 0)]
+        line = f"   #{e:3d}  {kind} command 0x{op:02X}  {npar:2d} params"
+        if par:
+            line += "  " + " ".join(f"{b:02x}" for b in par)
+        # a read command's parameters are LBA then sector count, per PCSX2
+        if kind == "N" and npar >= 8:
+            lba = int.from_bytes(par[0:4], "little")
+            cnt = int.from_bytes(par[4:8], "little")
+            line += f"\n         -> looks like a read: LBA {lba} ({lba*2048} bytes in), {cnt} sectors"
+            if npar >= 11:
+                line += f", mode byte 0x{par[10]:02x}"
+        print(line)
+
+
 def sif_write(dev, sel, value):
     """One write to the SIF as the Emotion Engine would make it."""
     dev.wr("iop_sif_data", value)
@@ -389,6 +430,9 @@ def main():
     p = sub.add_parser("peek");  p.add_argument("addr", type=lambda x: int(x, 0))
     p.add_argument("--words", type=int, default=8)
     p = sub.add_parser("verify"); p.add_argument("rom"); p.add_argument("--samples", type=int, default=64)
+    p = sub.add_parser("cdvd")
+    p.add_argument("action", nargs="?", default="log", choices=["log", "disc"])
+    p.add_argument("state", nargs="?", choices=["on", "off"])
     p = sub.add_parser("sif")
     p.add_argument("action", nargs="?", default="show", choices=["show", "ee-init", "set"])
     p.add_argument("name", nargs="?", choices=["mscom", "msflag-set", "msflag-clear", "smflag-clear", "ctrl", "bd6"])
@@ -413,6 +457,18 @@ def main():
     elif a.cmd == "peek":
         for i, w in enumerate(peek(dev, a.addr, a.words)):
             print(f"  {a.addr + 4 * i:08x}: {w:08x}")
+    elif a.cmd == "cdvd":
+        if "iop_cdvd_log_count" not in dev.regs:
+            sys.exit("this bitstream has no CDVD command log; rebuild with it")
+        if a.action == "disc":
+            v = dev.rd("iop_cdvd_disc")
+            v = (v | 1) if a.state == "on" else (v & ~1)
+            if not (v >> 8) & 0xFF:
+                v |= 0x14 << 8                      # default disc type: PS2 DVD
+            dev.wr("iop_cdvd_disc", v)
+            print(f"disc {'present' if v & 1 else 'absent'}, type 0x{(v >> 8) & 0xFF:02X}")
+        else:
+            cdvd_log(dev)
     elif a.cmd == "sif":
         if "iop_sif_msflag" not in dev.regs:
             sys.exit("this bitstream has no SIF host port; it predates rtl/iop/iop_sif.vhd")

@@ -52,6 +52,13 @@ entity iop_top is
       peek_addr  : in  std_logic_vector(24 downto 0) := (others => '0');
       peek_data  : out std_logic_vector(31 downto 0) := (others => '0');
       peek_valid : out std_logic := '0';
+      -- CDVD: tell the driver a disc is present, and read back the log of
+      -- every N and S command it issues (see iop_cdvd.vhd).
+      cdvd_disc_present : in  std_logic := '0';
+      cdvd_disc_type    : in  std_logic_vector(7 downto 0) := x"14";
+      cdvd_log_addr     : in  unsigned(7 downto 0) := (others => '0');
+      cdvd_log_data     : out std_logic_vector(31 downto 0);
+      cdvd_log_count    : out unsigned(15 downto 0);
       -- SIF host side: the Emotion Engine's half of the mailbox at 0x1D000000.
       -- There is no EE, so the host plays it; see iop_sif.vhd.  sif_host_sel
       -- picks what a write does: 0 MSCOM, 1 MSFLAG set, 2 MSFLAG clear,
@@ -820,7 +827,12 @@ begin
       bus_read      => bus_cdvd_read,
       bus_write     => bus_cdvd_write,
       bus_dataRead  => bus_cdvd_dataRead,
-      irq           => irq_cdvd
+      irq           => irq_cdvd,
+      disc_present  => cdvd_disc_present,
+      disc_type     => cdvd_disc_type,
+      log_addr      => cdvd_log_addr,
+      log_data      => cdvd_log_data,
+      log_count     => cdvd_log_count
    );
 
    -- SIO2 with a digital pad on port 0 (see iop_sio2.vhd)

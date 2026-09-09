@@ -259,6 +259,13 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.sif_msflag = CSRStatus(32,  description="SIF MSFLAG: the EE sets, the IOP clears. The BIOS waits here for bit 16")
         self.sif_smflag = CSRStatus(32,  description="SIF SMFLAG: the IOP sets, the EE clears")
         self.sif_regctrl = CSRStatus(32, description="SIF CTRL as the IOP last wrote it")
+        self.cdvd_disc  = CSRStorage(fields=[
+            CSRField("present", size=1, offset=0, description="1 tells the driver a disc is in the tray"),
+            CSRField("type",    size=8, offset=8, reset=0x14, description="disc type byte (0x14 = PS2 DVD)"),
+        ])
+        self.cdvd_log_addr  = CSRStorage(8,  description="word to read from the CDVD command log (8 words per entry)")
+        self.cdvd_log_data  = CSRStatus(32,  description="that word: entry+0 is kind<<31 | opcode<<16 | nparams, +1..+4 the parameter bytes")
+        self.cdvd_log_count = CSRStatus(16,  description="commands logged since reset")
 
         # --- sys -> iop -------------------------------------------------------
         reset_iop = Signal()
@@ -313,6 +320,20 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.specials += MultiReg(peek_data_iop, self.peek_data.status, "sys")
         self.sync += If(peek_done_sync.o, self.peek_count.status.eq(self.peek_count.status + 1))
         self.peek_iop = (peek_req_sync.o, peek_addr_iop, peek_data_iop, peek_valid_iop)
+
+        # --- CDVD: disc presence and the command log ---------------------------
+        cdvd_present_iop = Signal()
+        cdvd_type_iop    = Signal(8)
+        cdvd_logaddr_iop = Signal(8)
+        cdvd_logdata_iop = Signal(32)
+        cdvd_logcnt_iop  = Signal(16)
+        self.specials += MultiReg(self.cdvd_disc.fields.present, cdvd_present_iop, "iop")
+        self.specials += MultiReg(self.cdvd_disc.fields.type, cdvd_type_iop, "iop")
+        self.specials += MultiReg(self.cdvd_log_addr.storage, cdvd_logaddr_iop, "iop")
+        self.specials += MultiReg(cdvd_logdata_iop, self.cdvd_log_data.status, "sys")
+        self.specials += MultiReg(cdvd_logcnt_iop, self.cdvd_log_count.status, "sys")
+        self.cdvd_iop = (cdvd_present_iop, cdvd_type_iop, cdvd_logaddr_iop,
+                         cdvd_logdata_iop, cdvd_logcnt_iop)
 
         # --- SIF host side: the host is the EE ---------------------------------
         # Same shape as the peek port: the value settles through a MultiReg and
@@ -401,6 +422,11 @@ class IOPBringup(LiteXModule, AutoCSR):
             i_rom_wr    = rom_wr,
             i_rom_addr  = rom_ptr,
             i_rom_data  = rom_word,
+            i_cdvd_disc_present = self.cdvd_iop[0],
+            i_cdvd_disc_type    = self.cdvd_iop[1],
+            i_cdvd_log_addr     = self.cdvd_iop[2],
+            o_cdvd_log_data     = self.cdvd_iop[3],
+            o_cdvd_log_count    = self.cdvd_iop[4],
             i_sif_host_sel   = self.sif_iop[1],
             i_sif_host_data  = self.sif_iop[2],
             i_sif_host_we    = self.sif_iop[0],
