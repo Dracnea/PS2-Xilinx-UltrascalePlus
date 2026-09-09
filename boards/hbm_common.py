@@ -288,3 +288,128 @@ class HBMDiscSource(LiteXModule, AutoCSR):
         # exactly one sector.
         fsm.act("WAIT", If(~self.req, NextState("IDLE")))
         self.comb += self.stat.fields.busy.eq(~fsm.ongoing("IDLE"))
+
+
+class HBMDMAWriter(LiteXModule, AutoCSR):
+    """Write a stream straight into HBM, at PCIe speed.
+
+    The staging problem in one line: the HBM probe moves a 32-byte beat per ten
+    CSR round trips, so a 4 GiB disc image would take most of a day.  This takes
+    LitePCIe's host-to-card DMA stream and puts it in HBM with no CSR in the
+    path at all, which is the difference between "stage a few sectors to prove
+    the wiring" and "load a game".
+
+    Rate: the DMA stream is `data_width` bits at the sys clock -- 128 bits at
+    125 MHz is 2 GB/s -- against 8 GB/s on the 256-bit HBM port, so PCIe and the
+    sys clock are the limit and HBM is not.  A 4.35 GiB image should land in
+    roughly two seconds.  That number is arithmetic until the card confirms it.
+
+    Two 128-bit words are packed into each 256-bit beat and written in bursts of
+    `burst` beats, so one address phase covers 512 bytes rather than 32.  The
+    engine runs in the sys domain and reaches HBM through
+    AXIClockDomainCrossing, for the same reason the disc source does: a library
+    crossing rather than a hand-written one on a path that carries data.
+    """
+    def __init__(self, axi_port, dma_source, data_width=128, burst=16):
+        assert 256 % data_width == 0 and data_width <= 256
+        packing = 256 // data_width          # source words per HBM beat
+
+        self.base   = CSRStorage(33, reset=HBM_DISC_BASE,
+                                 description="HBM byte address to start writing at")
+        self.length = CSRStorage(32, description="bytes to write; the transfer ends when this many have landed")
+        self.ctrl   = CSRStorage(fields=[
+            CSRField("start", size=1, pulse=True, description="arm the engine; the host then runs the DMA"),
+            CSRField("abort", size=1, pulse=True, description="give up on a transfer that is not completing"),
+        ])
+        self.stat   = CSRStatus(fields=[
+            CSRField("busy", size=1),
+            CSRField("done", size=1, description="set when `length` bytes have been written"),
+            CSRField("resp", size=2, description="AXI response of the last burst; 0 is OK"),
+        ])
+        self.written = CSRStatus(32, description="bytes written so far; the honest progress indicator")
+
+        port = axi.AXIInterface(data_width=256, address_width=33, id_width=6)
+        self.submodules.axi_cdc = axi.AXIClockDomainCrossing(port, axi_port, "sys", "axi")
+
+        addr    = Signal(33)
+        remain  = Signal(32)
+        written = Signal(32)
+        resp    = Signal(2)
+        done    = Signal()
+        beat    = Signal(max=burst + 1)
+
+        # --- pack `packing` source words into one 256-bit beat ---------------
+        acc   = Signal(256)
+        half  = Signal(max=packing)
+        full  = Signal()
+        taken = Signal()
+        self.comb += taken.eq(port.w.valid & port.w.ready)
+        # Accept a source word whenever the accumulator has room, including the
+        # cycle the packed beat is being taken -- otherwise the stream stalls one
+        # cycle in every pair and the engine runs at half rate for no reason.
+        self.comb += dma_source.ready.eq(~full | taken)
+        self.sync += [
+            If(taken, full.eq(0)),
+            If(dma_source.valid & dma_source.ready,
+                Case(half, {i: acc[data_width*i:data_width*(i+1)].eq(dma_source.data)
+                            for i in range(packing)}),
+                If(half == packing - 1,
+                    half.eq(0),
+                    full.eq(1),
+                ).Else(
+                    half.eq(half + 1),
+                ),
+            ),
+        ]
+
+        self.comb += [
+            port.aw.addr.eq(addr), port.aw.len.eq(burst - 1), port.aw.size.eq(5),
+            port.aw.burst.eq(1), port.aw.id.eq(0),
+            port.w.data.eq(acc), port.w.strb.eq(2**32 - 1),
+            self.stat.fields.resp.eq(resp),
+            self.stat.fields.done.eq(done),
+            self.written.status.eq(written),
+        ]
+
+        fsm = FSM(reset_state="IDLE")
+        self.submodules += fsm
+        fsm.act("IDLE",
+            If(self.ctrl.fields.start,
+                NextValue(addr, self.base.storage),
+                NextValue(remain, self.length.storage),
+                NextValue(written, 0),
+                NextValue(done, 0),
+                NextState("AW"),
+            ),
+        )
+        fsm.act("AW",
+            If(self.ctrl.fields.abort, NextState("IDLE")).
+            Elif(remain == 0,
+                NextValue(done, 1),
+                NextState("IDLE"),
+            ).Else(
+                port.aw.valid.eq(1),
+                If(port.aw.ready, NextValue(beat, 0), NextState("W")),
+            ),
+        )
+        fsm.act("W",
+            port.w.valid.eq(full),
+            port.w.last.eq(beat == burst - 1),
+            If(self.ctrl.fields.abort, NextState("IDLE")),
+            If(taken,
+                NextValue(written, written + 32),
+                # remain is a byte count and saturates at 0 rather than wrapping,
+                # so a length that is not a whole number of bursts still ends.
+                If(remain > 32, NextValue(remain, remain - 32)).Else(NextValue(remain, 0)),
+                If(beat == burst - 1, NextState("B")).Else(NextValue(beat, beat + 1)),
+            ),
+        )
+        fsm.act("B",
+            port.b.ready.eq(1),
+            If(port.b.valid,
+                NextValue(resp, port.b.resp),
+                NextValue(addr, addr + burst * 32),
+                NextState("AW"),
+            ),
+        )
+        self.comb += self.stat.fields.busy.eq(~fsm.ongoing("IDLE"))

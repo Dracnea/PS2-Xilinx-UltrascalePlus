@@ -45,7 +45,7 @@ from litepcie.phy.usppciephy import USPHBMPCIEPHY
 from litepcie.software import generate_litepcie_software
 
 import xilinx_c1100
-from hbm_common import HBM, HBMProbe, HBMDiscSource
+from hbm_common import HBM, HBMProbe, HBMDiscSource, HBMDMAWriter
 
 REPO_ROOT = normpath(join(dirname(abspath(__file__)), ".."))    # this repository
 
@@ -599,6 +599,13 @@ class PS2IOPSoC(SoCMini):
         self.add_pcie(phy=self.pcie_phy, ndmas=1,
                       with_dma_buffering = True, dma_buffering_depth=1024,
                       with_dma_loopback  = False)
+
+        # Channel 2: the host-to-card DMA stream, straight into HBM.  This is
+        # what makes staging a disc a couple of seconds rather than a day; the
+        # probe on channel 0 stays for proving the memory and for a handful of
+        # sectors.
+        self.hbm_dma = HBMDMAWriter(self.hbm.axi[2], self.pcie_dma0.source,
+                                    data_width=self.pcie_phy.data_width)
 
         # IOP clocks and the IOP.
         self.iop_clocks = _IOPClocks(platform, self.crg.clk100, self.crg.rst)
