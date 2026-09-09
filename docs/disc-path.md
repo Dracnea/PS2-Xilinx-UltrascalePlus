@@ -174,6 +174,8 @@ real disc and put this in IOP RAM:
 
 The data was right, the alignment was not. The fix is to latch the pointer at
 the moment of the write and cross *that*, so address and data travel together.
+With that in place the card reads sector 16 of a real disc and IOP RAM at
+0x50000 holds `CD001 PLAYSTATION ... 2_01`, byte-identical to the image.
 
 The general point: **the testbench cannot find this class of bug.** It drives
 `sec_waddr`/`sec_wdata`/`sec_we` directly, with the alignment correct by
@@ -182,6 +184,16 @@ the IOP bench would mean modelling LiteX. Everything between a CSR and the IOP's
 clock domain is therefore only ever tested on the card, which is an argument for
 the hardware test checking *contents* — this bug passes any check that only asks
 whether a sector arrived.
+
+## Measured on the card
+
+A poll of a CDVD register costs about **9.3 us** of IOP time -- the boot test's
+0E wait loop runs 131072 iterations and takes 1.22 s when no sector ever
+arrives, against the ~25 ms that instruction count would suggest at 36.864 MHz.
+So roughly 340 cycles per peripheral read. Everything else is fast: stages 01
+through 0D together take 20 ms. This is worth knowing before sizing any timeout
+that polls CDVD, and before reading anything into how long the real BIOS spends
+waiting on the drive.
 
 ## Order
 
