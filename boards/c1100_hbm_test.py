@@ -74,6 +74,17 @@ class _HBM(USPHBM2):
             self.hbm_params[f"o_DRAM_{i:1d}_STAT_CATTRIP"] = cattrip[i]
         self.comb += cattrip_pad.eq(cattrip != 0)
 
+        # 3. The AXI reset.  The stock wrapper drives every AXI_xx_ARESET_N from
+        #    ResetSignal("apb"), but those ports are clocked by the AXI clock, so
+        #    the reset's recovery check runs from the 100 MHz APB domain into the
+        #    250 MHz AXI one and fails -- WNS -1.077 ns across 10 endpoints on
+        #    the first build here.  A reset must be released synchronously to the
+        #    clock that uses it, so each port takes the AXI domain's own reset.
+        #    LiteX's create_clkout already puts an AsyncResetSynchronizer on that
+        #    domain, so this is the correctly synchronised one.
+        for i in range(32):
+            self.hbm_params[f"i_AXI_{i:02d}_ARESET_N"] = ~ResetSignal("axi")
+
     def add_sources(self, platform):
         platform.add_ip(self.xci)
 
@@ -256,18 +267,21 @@ class HBMTestSoC(SoCMini):
         # whole 8 GB reachable through it.
         self.probe = HBMProbe(self.hbm.axi[0])
 
+        # Everything that crosses between these domains does so through a
+        # MultiReg or a PulseSynchronizer, so the data paths are false by
+        # construction.  They share one MMCM and are not truly asynchronous,
+        # which is why each crossing still has to be written as a crossing --
+        # the constraint records the intent, it does not create it.
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_axi.clk)
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_apb.clk)
+        platform.add_false_path_constraints(self.crg.cd_apb.clk, self.crg.cd_axi.clk)
+        platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.clk100)
 
-        # The HBM IP brings a debug hub whose clock Vivado does not connect on
-        # its own, and implementation stops with "dbg_hub/clk has 1 unconnected
-        # channels".  Corundum hits the same thing on the same IP and pins it to
-        # the HBM APB clock (fpga/mqnic/Alveo/fpga_25g/hbm.xdc), which is the
-        # right clock precisely because the hub then shares a domain with the
-        # block it is monitoring.  This has to run after synthesis, so it is a
-        # pre-placement command rather than an XDC line.
-        platform.toolchain.pre_placement_commands.append(
-            "connect_debug_port dbg_hub/clk [get_nets apb_clk]")
+        # Connect the HBM debug hub's clock before opt_design, which is the step
+        # that fails without it.  The Tcl is in a file because LiteX runs
+        # str.format() over inline commands and Tcl is made of braces.
+        platform.toolchain.pre_optimize_commands.append(
+            "source " + join(dirname(abspath(__file__)), "hbm_dbghub.tcl"))
 
 
 def build(nlanes=4, speed="gen3", do_build=False, build_dir="build/c1100_hbm_test"):
