@@ -188,8 +188,12 @@ class HBMDiscSource(LiteXModule, AutoCSR):
     the hand-written one on this exact path is what shifted a sector by a word
     on the first hardware run (docs/disc-path.md).
 
-    A 2048-byte sector is 64 beats of 256 bits, which is one AXI burst; each
-    beat becomes eight 32-bit writes into the CDVD's sector buffer.
+    A 2048-byte sector is 64 beats of 256 bits, which is *four* AXI bursts of
+    sixteen: the HBM controller's AXI_xx_ARLEN and AWLEN are [3:0], so a burst
+    is at most 16 beats (PG276).  Asking for 64 does not fail -- ARLEN is
+    truncated to 4 bits, HBM returns 16 beats and the master waits forever for
+    the seventeenth.  Each beat becomes eight 32-bit writes into the CDVD's
+    sector buffer.
     """
     def __init__(self, axi_port, sector_bytes=2048, throttle=8):
         beats = sector_bytes // 32
@@ -229,9 +233,13 @@ class HBMDiscSource(LiteXModule, AutoCSR):
 
         fsm = FSM(reset_state="IDLE")
         self.submodules += fsm
+        # One burst is 16 beats; `beat` counts beats delivered so far, and AR is
+        # only ever entered on a multiple of 16, so it doubles as the offset of
+        # the next burst.  That keeps one counter instead of two.
+        AXBURST = 16
         self.comb += [
-            port.ar.addr.eq(self.base.storage + (self.lba * sector_bytes)),
-            port.ar.len.eq(beats - 1),
+            port.ar.addr.eq(self.base.storage + (self.lba * sector_bytes) + (beat * 32)),
+            port.ar.len.eq(AXBURST - 1),
             port.ar.size.eq(5),          # 32 bytes per beat
             port.ar.burst.eq(1),         # INCR
             port.ar.id.eq(0),
@@ -279,7 +287,11 @@ class HBMDiscSource(LiteXModule, AutoCSR):
                 NextValue(word, word + 1),
                 If(emit == 7,
                     NextValue(emit, 0),
-                    If(beat == beats, NextState("DRAIN")).Else(NextState("R")),
+                    # Whole sector done, else the end of a 16-beat burst (so go
+                    # ask for the next one), else the next beat of this burst.
+                    If(beat == beats, NextState("DRAIN")
+                    ).Elif(beat[:4] == 0, NextState("AR")
+                    ).Else(NextState("R")),
                 ).Else(
                     NextValue(emit, emit + 1),
                 ),

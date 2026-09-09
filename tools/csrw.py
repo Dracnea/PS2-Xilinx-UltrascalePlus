@@ -48,8 +48,15 @@ def main():
     if a.cmd == "read":
         print(" ".join(f"{readl(fd, addr + 4*i):08x}" for i in range(n)))
     else:
-        writel(fd, addr, a.value)
-        print(f"{a.name} <= 0x{a.value:x}")
+        # Write every subregister, most significant first, which is the order
+        # LiteX assigns them.  Writing only the first word silently sets the
+        # high bits of a wide register and leaves the low ones alone -- so
+        # `write iop_hbm_disc_base 0x100000` on a 33-bit register put 0 in the
+        # one bit that exists above 32 and never touched the address at all.
+        # A control that quietly does nothing is worse than no control.
+        for i in range(n):
+            writel(fd, addr + 4*i, (a.value >> (32 * (n - 1 - i))) & 0xFFFFFFFF)
+        print(f"{a.name} <= 0x{a.value:x}" + (f" ({n} words)" if n > 1 else ""))
 
 if __name__ == "__main__":
     main()
