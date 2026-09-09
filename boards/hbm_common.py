@@ -345,8 +345,12 @@ class HBMDMAWriter(LiteXModule, AutoCSR):
         taken = Signal()
         self.comb += taken.eq(port.w.valid & port.w.ready)
         # Accept a source word whenever the accumulator has room, including the
-        # cycle the packed beat is being taken -- otherwise the stream stalls one
-        # cycle in every pair and the engine runs at half rate for no reason.
+        # cycle the packed beat is being taken.  With `ready = ~full` alone the
+        # pattern is accept, accept, stall: `full` is only cleared at the end of
+        # the cycle the beat is taken, so the source sees backpressure for that
+        # cycle and the engine settles at two words per three cycles -- two
+        # thirds of line rate, 1.3 GB/s instead of 2.  Adding `| taken` closes
+        # the gap for a single OR gate.
         self.comb += dma_source.ready.eq(~full | taken)
         self.sync += [
             If(taken, full.eq(0)),
