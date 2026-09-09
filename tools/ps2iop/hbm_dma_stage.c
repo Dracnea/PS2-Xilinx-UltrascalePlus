@@ -34,6 +34,10 @@
 #error "this bitstream has no HBM DMA writer; rebuild boards/c1100_ps2_iop.py"
 #endif
 
+// Matches dma_buffering_depth in boards/c1100_ps2_iop.py, which is also the
+// gateware's reset value for this register (32'h400).
+#define DMA_READER_BUFFERING_DEPTH 1024
+
 static volatile int keep_running = 1;
 static void on_int(int s) { (void)s; keep_running = 0; }
 
@@ -42,6 +46,20 @@ static int64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// The writer reports which AXI phase it is sitting in.  "busy" alone cannot
+// tell AW from W from B, and those three fail for entirely different reasons,
+// which is the whole point of the instrumented build.
+static const char *dma_state_name(uint32_t stat)
+{
+    switch ((stat >> CSR_HBM_DMA_STAT_STATE_OFFSET) & 0xf) {
+    case 0:  return "IDLE";
+    case 1:  return "AW";
+    case 2:  return "W";
+    case 3:  return "B";
+    default: return "?";
+    }
 }
 
 // A LiteX CSR wider than 32 bits is several words, most significant first, and
@@ -104,72 +122,169 @@ int main(int argc, char **argv)
     if (fseeko(f, offset, SEEK_SET)) { perror("seek"); return 1; }
 
     struct litepcie_dma_ctrl dma = { .use_reader = 1 };
-    if (litepcie_dma_init(&dma, device, 0)) return 1;
+    // Zero-copy: the mmap'd ring rotates one buffer at a time, so every buffer
+    // is filled once and sent once.  The copy-through path hands the driver the
+    // whole user buffer on each call and restarts from its beginning, so any
+    // round where write() accepts less than all of it re-sends stale bytes --
+    // invisible at 1 MiB, corruption at disc sizes.
+    if (litepcie_dma_init(&dma, device, 1)) return 1;
     int fd = dma.fds.fd;
+
+    // Restore the DMA Reader buffering depth, which litepcie_dma_init() has
+    // just silently zeroed.
+    //
+    // The driver writes its loopback-enable flag to a fixed offset 0x40 from the
+    // DMA base (PCIE_DMA_LOOPBACK_ENABLE_OFFSET in its config.h).  That offset
+    // only holds the loopback CSR in a design built with `with_dma_loopback`.
+    // This design sets it False, so no loopback register exists and
+    // `buffering_reader_fifo_control` occupies base+0x40 instead -- and
+    // litepcie_dma_init() calls litepcie_dma_set_loopback(fd, 0) every time.
+    //
+    // A depth of zero is not merely a smaller buffer: the buffering FIFO accepts
+    // a word only while `level < depth`, so zero means it never accepts one, the
+    // DMA Reader's output stream is backpressured forever and no data reaches
+    // HBM.  Descriptors still retire and the table still drains, because
+    // retirement follows the PCIe completions rather than the data being
+    // consumed -- which is what makes the failure look like a stuck HBM writer.
+#ifdef CSR_PCIE_DMA0_BUFFERING_READER_FIFO_CONTROL_ADDR
+    litepcie_writel(fd, CSR_PCIE_DMA0_BUFFERING_READER_FIFO_CONTROL_ADDR,
+                    DMA_READER_BUFFERING_DEPTH);
+    uint32_t bufctl = litepcie_readl(fd, CSR_PCIE_DMA0_BUFFERING_READER_FIFO_CONTROL_ADDR);
+    if ((bufctl & 0xffffff) != DMA_READER_BUFFERING_DEPTH) {
+        fprintf(stderr, "FAIL: reader buffering depth reads %u, wanted %u\n",
+                bufctl & 0xffffff, DMA_READER_BUFFERING_DEPTH);
+        return 1;
+    }
+#endif
 
     printf("staging %.2f MiB of %s at HBM 0x%09llx\n",
            total / 1048576.0, image, (unsigned long long)base);
 
-    write_csr64(fd, CSR_HBM_DMA_BASE_ADDR, CSR_HBM_DMA_BASE_SIZE, base);
-    litepcie_writel(fd, CSR_HBM_DMA_LENGTH_ADDR, (uint32_t)total);
-    litepcie_writel(fd, CSR_HBM_DMA_CTRL_ADDR, 1);        // start
-
-    dma.reader_enable = 1;
     signal(SIGINT, on_int);
 
     uint64_t sent = 0;
-    int64_t  t0 = now_ms(), last = t0;
-    int      eof = 0;
+    int      eof  = 0;
+    int64_t  t0, last;
+
+    // Stage in ring-sized chunks, with the reader stopped while the ring is
+    // filled.
+    //
+    // The DMA Reader runs its descriptor table in loop mode: once enabled it
+    // streams the ring continuously and never waits for software.  reader_sw_count
+    // is advisory bookkeeping, not a gate -- hw_count outruns it -- so no
+    // fill-ahead loop can be relied on to win that race, and losing it puts real
+    // disc data at the wrong offsets rather than producing anything that looks
+    // like damage.
+    //
+    // So do not race.  Stopping the reader resets the data FIFO, the converter
+    // and the buffering FIFO (each is held in reset by ~enable), and the packer
+    // is flushed by `start`, so nothing survives a chunk boundary.  Fill the
+    // whole ring, arm the writer for exactly those bytes, then let it run: the
+    // reader walks descriptors 0..N-1 in order over data that is already in
+    // place, which is ordered by construction rather than by timing.
+    const uint64_t CHUNK = (uint64_t)DMA_BUFFER_COUNT * DMA_BUFFER_SIZE;
+    struct litepcie_ioctl_mmap_dma_update upd;
+    int64_t hw = 0, sw = 0;
+
+    t0 = now_ms(); last = t0;
 
     while (keep_running && sent < total) {
-        litepcie_dma_process(&dma);
-        while (sent < total) {
-            char *buf = litepcie_dma_next_write_buffer(&dma);
-            if (!buf) break;
-            size_t chunk = DMA_BUFFER_SIZE;
-            if (total - sent < chunk) chunk = total - sent;
-            size_t got = eof ? 0 : fread(buf, 1, chunk, f);
-            if (got < chunk) {
-                // Pad rather than stop: the engine was told `total` bytes and
-                // will not finish a burst it never receives.
-                memset(buf + got, 0, DMA_BUFFER_SIZE - got);
-                eof = 1;
-            }
-            if (chunk < DMA_BUFFER_SIZE) memset(buf + chunk, 0, DMA_BUFFER_SIZE - chunk);
-            sent += chunk;
+        uint64_t chunk = total - sent;
+        if (chunk > CHUNK) chunk = CHUNK;
+        int64_t nbuf = (chunk + DMA_BUFFER_SIZE - 1) / DMA_BUFFER_SIZE;
+
+        // Reader off: every downstream FIFO is flushed and the counts reset.
+        litepcie_dma_reader(fd, 0, &hw, &sw);
+
+        for (int64_t i = 0; i < nbuf; i++) {
+            char  *buf   = dma.buf_wr + i * DMA_BUFFER_SIZE;
+            size_t want  = DMA_BUFFER_SIZE;
+            if (chunk - i * DMA_BUFFER_SIZE < want) want = chunk - i * DMA_BUFFER_SIZE;
+            size_t got   = eof ? 0 : fread(buf, 1, want, f);
+            if (got < want) { eof = 1; memset(buf + got, 0, DMA_BUFFER_SIZE - got); }
+            else if (want < DMA_BUFFER_SIZE) memset(buf + want, 0, DMA_BUFFER_SIZE - want);
         }
+
+        // Arm the writer for this chunk, at its own place in HBM.
+        write_csr64(fd, CSR_HBM_DMA_BASE_ADDR, CSR_HBM_DMA_BASE_SIZE, base + sent);
+        litepcie_writel(fd, CSR_HBM_DMA_LENGTH_ADDR, (uint32_t)chunk);
+        litepcie_writel(fd, CSR_HBM_DMA_CTRL_ADDR, 1);
+
+        // Go.  The ring already holds the data the descriptors point at.
+        litepcie_dma_reader(fd, 1, &hw, &sw);
+        upd.sw_count = nbuf;
+        checked_ioctl(fd, LITEPCIE_IOCTL_MMAP_DMA_READER_UPDATE, &upd);
+
+        int64_t deadline = now_ms() + 5000;
+        uint32_t st = 0, w = 0, wlast = 0xffffffff;
+        while (now_ms() < deadline) {
+            st = litepcie_readl(fd, CSR_HBM_DMA_STAT_ADDR);
+            if ((st >> CSR_HBM_DMA_STAT_DONE_OFFSET) & 1) break;
+            w = litepcie_readl(fd, CSR_HBM_DMA_WRITTEN_ADDR);
+            if (w != wlast) { wlast = w; deadline = now_ms() + 1000; }
+        }
+        if (!((st >> CSR_HBM_DMA_STAT_DONE_OFFSET) & 1)) {
+            litepcie_dma_reader(fd, 0, &hw, &sw);
+            fprintf(stderr, "\nFAIL: chunk at %llu stalled: %s written=%u of %llu\n",
+                    (unsigned long long)sent, dma_state_name(st),
+                    litepcie_readl(fd, CSR_HBM_DMA_WRITTEN_ADDR),
+                    (unsigned long long)chunk);
+            litepcie_dma_cleanup(&dma); fclose(f);
+            return 1;
+        }
+        sent += chunk;
+
         int64_t t = now_ms();
         if (verbose && t - last > 500) {
-            uint32_t w = litepcie_readl(fd, CSR_HBM_DMA_WRITTEN_ADDR);
-            printf("\r  %.0f%%  host %.0f MiB  card %.0f MiB  %.2f GB/s   ",
-                   100.0 * sent / total, sent / 1048576.0, w / 1048576.0,
-                   sent / ((t - t0) / 1000.0) / 1e9);
+            printf("\r  %.0f%%  %.0f MiB  %.2f GB/s   ", 100.0 * sent / total,
+                   sent / 1048576.0, sent / ((t - t0) / 1000.0) / 1e9);
             fflush(stdout);
             last = t;
         }
     }
-
-    // Let the ring drain into the card before reading the counter.
-    for (int i = 0; i < 200; i++) { litepcie_dma_process(&dma); usleep(1000); }
+    litepcie_dma_reader(fd, 0, &hw, &sw);
+    dma.reader_sw_count = sw; dma.reader_hw_count = hw;
     int64_t t1 = now_ms();
 
     uint32_t stat    = litepcie_readl(fd, CSR_HBM_DMA_STAT_ADDR);
     uint32_t written = litepcie_readl(fd, CSR_HBM_DMA_WRITTEN_ADDR);
+    uint32_t bursts  = litepcie_readl(fd, CSR_HBM_DMA_BURSTS_ADDR);
+    uint32_t stalled = (stat >> CSR_HBM_DMA_STAT_STALLED_OFFSET) & 1;
     double   secs    = (t1 - t0) / 1000.0;
 
     printf("\r%-72s\n", "");
     printf("host sent   %llu bytes in %.2f s  (%.2f GB/s)\n",
            (unsigned long long)sent, secs, sent / secs / 1e9);
-    printf("card wrote  %u bytes to HBM\n", written);
-    printf("busy=%u done=%u axi_resp=%u\n", stat & 1, (stat >> 1) & 1, (stat >> 2) & 3);
+    printf("card wrote  %llu bytes to HBM in %llu chunks (last chunk %u bytes)\n",
+           (unsigned long long)sent,
+           (unsigned long long)((total + CHUNK - 1) / CHUNK), written);
+    printf("dma reader  sw_count=%lld hw_count=%lld\n",
+           (long long)dma.reader_sw_count, (long long)dma.reader_hw_count);
+    printf("busy=%u done=%u axi_resp=%u state=%s bursts=%u stalled=%u\n",
+           stat & 1, (stat >> 1) & 1, (stat >> 2) & 3,
+           dma_state_name(stat), bursts, stalled);
+
+    // Say what those numbers mean while the failure is in front of the person
+    // reading them, rather than leaving it to be worked out from the source.
+    if ((stat & 1) && sent != total) {
+        if (!bursts)
+            printf("  -> stuck in %s with no burst accepted: HBM never answered an address.\n",
+                   dma_state_name(stat));
+        else if (stalled)
+            printf("  -> stuck in W after %u bursts: HBM answered, the host is not feeding beats.\n",
+                   bursts);
+        else
+            printf("  -> stuck in %s after %u bursts: the write channel or its B response is not completing.\n",
+                   dma_state_name(stat), bursts);
+    }
     (void)read_csr64;
 
     litepcie_dma_cleanup(&dma);
     fclose(f);
 
-    if (written != (uint32_t)total) {
-        fprintf(stderr, "FAIL: the card wrote %u of %llu bytes\n",
-                written, (unsigned long long)total);
+    if (sent != total) {
+        fprintf(stderr, "FAIL: the card wrote %llu of %llu bytes\n",
+                (unsigned long long)sent, (unsigned long long)total);
         return 1;
     }
     if (((stat >> 2) & 3) != 0) {
