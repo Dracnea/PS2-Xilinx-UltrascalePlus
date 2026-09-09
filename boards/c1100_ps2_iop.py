@@ -273,6 +273,17 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.sif_msflag = CSRStatus(32,  description="SIF MSFLAG: the EE sets, the IOP clears. The BIOS waits here for bit 16")
         self.sif_smflag = CSRStatus(32,  description="SIF SMFLAG: the IOP sets, the EE clears")
         self.sif_regctrl = CSRStatus(32, description="SIF CTRL as the IOP last wrote it")
+
+        # A window onto one DMA channel's registers.  SIF0 is channel 9 and
+        # SIF1 is channel 10; what the BIOS's SIFCMD programs there -- and
+        # whether it uses chain mode, which shows up as CHCR bit 10 and a TADR
+        # -- decides how much of the DMA controller the SIF path needs.  That
+        # is a question to read off the hardware, not to guess at.
+        self.dma_dbg_sel  = CSRStorage(4, description="which DMA channel the registers below show (9 = SIF0, 10 = SIF1)")
+        self.dma_dbg_madr = CSRStatus(32, description="MADR of the selected channel")
+        self.dma_dbg_bcr  = CSRStatus(32, description="BCR of the selected channel")
+        self.dma_dbg_chcr = CSRStatus(32, description="CHCR of the selected channel; bit 24 start/busy, bit 10 chain mode")
+        self.dma_dbg_tadr = CSRStatus(32, description="TADR of the selected channel, the chain-mode tag list")
         self.cdvd_disc  = CSRStorage(fields=[
             CSRField("present", size=1, offset=0, description="1 tells the driver a disc is in the tray"),
             CSRField("type",    size=8, offset=8, reset=0x14, description="disc type byte (0x14 = PS2 DVD)"),
@@ -452,6 +463,14 @@ class IOPBringup(LiteXModule, AutoCSR):
             self.specials += MultiReg(sif_out[n], csr.status, "sys")
         self.sif_iop = (sif_we_sync.o, sif_sel_iop, sif_data_iop, sif_out)
 
+        dma_dbg_sel_iop = Signal(4)
+        self.specials += MultiReg(self.dma_dbg_sel.storage, dma_dbg_sel_iop, "iop")
+        dma_dbg = {n: Signal(32, name="iop_dmadbg_" + n) for n in ("madr", "bcr", "chcr", "tadr")}
+        for n, csr in (("madr", self.dma_dbg_madr), ("bcr", self.dma_dbg_bcr),
+                       ("chcr", self.dma_dbg_chcr), ("tadr", self.dma_dbg_tadr)):
+            self.specials += MultiReg(dma_dbg[n], csr.status, "sys")
+        self.dma_dbg_iop = (dma_dbg_sel_iop, dma_dbg)
+
         # --- iop -> sys -------------------------------------------------------
         post_code = Signal(8)
         post_wr   = Signal()
@@ -538,6 +557,11 @@ class IOPBringup(LiteXModule, AutoCSR):
             o_sif_msflag     = self.sif_iop[3]["msflag"],
             o_sif_smflag     = self.sif_iop[3]["smflag"],
             o_sif_ctrl       = self.sif_iop[3]["ctrl"],
+            i_dma_dbg_sel    = self.dma_dbg_iop[0],
+            o_dma_dbg_madr   = self.dma_dbg_iop[1]["madr"],
+            o_dma_dbg_bcr    = self.dma_dbg_iop[1]["bcr"],
+            o_dma_dbg_chcr   = self.dma_dbg_iop[1]["chcr"],
+            o_dma_dbg_tadr   = self.dma_dbg_iop[1]["tadr"],
             i_peek_req       = self.peek_iop[0],
             i_peek_addr      = self.peek_iop[1],
             o_peek_data      = self.peek_iop[2],

@@ -191,6 +191,46 @@ PCSX2's software renderer frame for frame.
 DMA arbitration, timing between the three processors, and the real boot chain.
 Only here does "load a game ISO and play it" become the test.
 
+## Card identity and telemetry, for the host UI
+
+Added 2026-09-09. The repository exists to release on **several** UltraScale+
+cards, so the host has to be able to ask a card what it is and how it is doing
+rather than being told at build time. What the UI wants is roughly: which board
+and which die, a serial that distinguishes two of the same board in one
+machine, die temperature, and the core voltage — the last two so a user can see
+a card throttling or browning out instead of guessing why a game stutters.
+
+**This costs almost nothing in fabric, and that is worth stating plainly
+because it is the reason it can be left until the UI exists.** Everything here
+is a hard macro plus a register shim:
+
+* **SYSMON** (`SYSMONE4`) gives die temperature and the supply rails, including
+  VCCINT, as a hard block. The fabric cost is the CSR wrapper.
+* **DNA_PORT** (`DNA_PORTE2`) gives a 96-bit die identifier — a serial that is
+  unique per chip and needs no per-board provisioning.
+* **Board identity** is a constant the platform file already knows.
+
+Call it 300-800 LUTs and no URAM or block RAM. Against the C1100 that is under
+**0.1 %** of the part: today's whole IOP design, HBM controller and PCIe
+endpoint together use 36,572 LUTs of 871,680, which is 4.2 %.
+
+So this does not compete for the resource that is actually scarce. The
+constraint on this project is **UltraRAM**, not logic: 224 of the C1100's 640
+(35 %) are spent before the Graphics Synthesizer's 4 MB of local memory exists,
+and the same design is 224 of 320 (70 %) on an FK33 ([cards.md](cards.md)).
+Telemetry does not touch URAM at all.
+
+Two notes for when it is built:
+
+* The C1100 has a **second** source: its satellite controller reports card-level
+  voltage and temperature over I2C, which is what the vendor firmware uses to
+  control VCCINT. On-die SYSMON and the card controller do not necessarily
+  agree, and the UI should say which it is showing.
+* Keep it behind one interface with a per-platform implementation, the way
+  `discsource.py` treats an image, a block device and a drive as one thing. A
+  card that cannot report a rail should say so rather than report zero — a
+  plausible wrong number is worse than a missing one.
+
 ## Where the memory goes
 
 Full analysis in [hbm.md](hbm.md); the short version, because it changes the

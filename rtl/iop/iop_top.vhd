@@ -78,6 +78,13 @@ entity iop_top is
       sif_msflag    : out std_logic_vector(31 downto 0);
       sif_smflag    : out std_logic_vector(31 downto 0);
       sif_ctrl      : out std_logic_vector(31 downto 0);
+
+      -- one DMA channel's registers, selected by the host
+      dma_dbg_sel   : in  unsigned(3 downto 0) := (others => '0');
+      dma_dbg_madr  : out std_logic_vector(31 downto 0);
+      dma_dbg_bcr   : out std_logic_vector(31 downto 0);
+      dma_dbg_chcr  : out std_logic_vector(31 downto 0);
+      dma_dbg_tadr  : out std_logic_vector(31 downto 0);
       -- POST register (0x1F802070): what the boot code says about its progress
       post_code  : out std_logic_vector(7 downto 0) := (others => '0');
       post_wr    : out std_logic := '0';
@@ -843,7 +850,12 @@ begin
       irq            => irq_dma,
       dbg_channel    => open,
       dbg_words      => open,
-      dbg_running    => open
+      dbg_running    => open,
+      dbg_sel        => dma_dbg_sel,
+      dbg_madr       => dma_dbg_madr,
+      dbg_bcr        => dma_dbg_bcr,
+      dbg_chcr       => dma_dbg_chcr,
+      dbg_tadr       => dma_dbg_tadr
    );
    issb2 : entity work.iop_regstub generic map (ADDR_BITS => 7)  port map (clk1x, reset_int, bus_ssb2_addr, bus_ssb2_writeMask, bus_ssb2_dataWrite, bus_ssb2_read, bus_ssb2_write, bus_ssb2_dataRead);
 

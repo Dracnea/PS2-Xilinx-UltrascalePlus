@@ -96,7 +96,17 @@ entity iop_dma is
       -- diagnostics for the host: which channel last ran and how many words
       dbg_channel   : out unsigned(3 downto 0) := (others => '0');
       dbg_words     : out unsigned(23 downto 0) := (others => '0');
-      dbg_running   : out std_logic := '0'
+      dbg_running   : out std_logic := '0';
+
+      -- A window onto one channel's registers, so the host can see what the
+      -- BIOS programmed rather than infer it.  Whether SIFCMD arms SIF1 at
+      -- boot, and in normal or chain mode, is a question about CHCR and TADR
+      -- that nothing else here can answer.
+      dbg_sel       : in  unsigned(3 downto 0) := (others => '0');
+      dbg_madr      : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_bcr       : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_chcr      : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_tadr      : out std_logic_vector(31 downto 0) := (others => '0')
    );
 end entity;
 
@@ -153,6 +163,10 @@ begin
    irq         <= master_flag(dicr_en, dicr_fl, dicr_lo)
                or master_flag(dicr2_en, dicr2_fl, dicr2_lo);
    dbg_channel <= to_unsigned(ch, 4);
+   dbg_madr <= madr(to_integer(dbg_sel)) when dbg_sel <= 12 else (others => '0');
+   dbg_bcr  <= bcr (to_integer(dbg_sel)) when dbg_sel <= 12 else (others => '0');
+   dbg_chcr <= chcr(to_integer(dbg_sel)) when dbg_sel <= 12 else (others => '0');
+   dbg_tadr <= tadr(to_integer(dbg_sel)) when dbg_sel <= 12 else (others => '0');
    dbg_words   <= words;
    dbg_running <= '1' when state /= IDLE else '0';
    -- dev_ready means "this word is taken", not "I am listening". A word is
