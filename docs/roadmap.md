@@ -81,16 +81,26 @@ The lesson is worth keeping: the block that looks like the blocker and the
 block that is the blocker are not always the same, and a bus trace settles it
 in minutes where reasoning did not.
 
-### 2. The disc path — **the next block, and the one that needs your game disc**
+### 2. The disc path — **in simulation, awaiting the card**
 
-- **IOP DMAC, channel 3.** Sector data reaches IOP memory by DMA; `CDVDMAN`
-  programs `0x1F8010B0`/`B4`/`B8` and waits for the interrupt. The DMAC was not
-  what blocked the kernel boot, but it *is* what blocks the disc.
-- **CDVD sector path**: the N-command read, sector buffering, the completion
-  interrupt.
+- **IOP DMAC, channel 3** — *done in simulation, 2026-09-09*. Sector data
+  reaches IOP memory by DMA; `CDVDMAN` programs `0x1F8010B0`/`B4`/`B8` and waits
+  for the interrupt. The DMAC was not what blocked the kernel boot, but it *is*
+  what blocks the disc.
+- **CDVD sector path** — *done in simulation, 2026-09-09*: the N-command read
+  (opcodes 0x06/0x07/0x08, taken from `CDVDMAN` itself), sector buffering, the
+  completion interrupt on INTC bit 2. Boot-test stage `0E` reads LBA 16 and
+  checks the ISO9660 primary volume descriptor signature in IOP RAM.
 - **A sector source**: host-served over PCIe first, then the whole image in the
   card's HBM, which the IOP cannot tell apart. [hbm.md](hbm.md),
-  [disc-path.md](disc-path.md).
+  [disc-path.md](disc-path.md). The host half is written
+  (`tools/ps2iop/discserve.py`) and the CSRs are wired; it has not yet run on
+  the card.
+
+Getting stage `0E` to pass cost four RTL fixes in the RAM arbiter and the DMA
+handshakes, three of which would pass a test that checked only whether the
+transfer completed — see *What the CDVD read path found* in
+[iop-subsystem.md](iop-subsystem.md).
 
 The host side of this is **done and checked against a real disc**:
 `discsource.py` reads sectors from an image, a block device or an optical

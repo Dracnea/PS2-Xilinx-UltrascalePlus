@@ -18,17 +18,18 @@ subsystem is [docs/ps2-bios-boot.md](ps2-bios-boot.md).
 
 | file | what | origin |
 |---|---|---|
-| `iop_top.vhd` | the subsystem: CPU, memory mux, RAM/ROM, SSBUS config, INTC, timers 0-5, POST register, stubs; reset sequencing; the host's memory peek port | new |
+| `iop_top.vhd` | the subsystem: CPU, memory mux, RAM/ROM, SSBUS config, INTC, timers 0-5, POST register, stubs; reset sequencing; the host's memory peek port; **the RAM arbiter** (below) | new |
 | `iop_memorymux.vhd` | the IOP address map on the PSX memory mux's state machine; only the decode changed, `diff` against `PSX/upstream/rtl/memorymux.vhd` shows exactly what | PSX_MiSTer, modified |
 | `iop_ram.vhd` | 2 MB RAM + 4 MB ROM as 128-bit-row UltraRAM behind the PSX SDRAM-controller protocol, with the instruction-cache line fill | new |
+| — | **the RAM arbiter** lives in `iop_top`. The RAM port has three masters: the CPU's memory mux, the peek port, and the DMA controller. `iop_ram` samples a request only while its FSM is idle and answers with a single `ram_done` pulse, and the mux has no stall input, so two rules follow and both are load-bearing. The mux is shown `ram_done_mux` — its own completions only — or a DMA write looks to it like the answer to a request it never made. And a CPU request that arrives while the DMA holds the port is latched and replayed when the port frees, because otherwise `iop_ram` drops it and the mux waits for a completion that never comes. One entry is enough: the mux keeps a single access in flight | new |
 | — | **the peek port** lives in `iop_top`: while the CPU is held in reset the RAM port is switched from the memory mux to `peek_req`/`peek_addr`, so the host can read any word of RAM or ROM back for a post-mortem. No arbitration and no extra memory — the mux has no request in flight while the CPU is reset. Checked in `sim/tb_iop.sv` after the boot test passes | new |
 | `iop_intc.vhd` | I_STAT / I_MASK / I_CTRL, 32 sources, PS2SDK bit numbering | new |
 | `iop_timer32.vhd` | timers 3-5 (32-bit) at 0x1F801480, modelled on the PSX `timer.vhd` | new |
 | `iop_spu2.vhd` | two PSX SPU cores at 0x1F900000 / 0x1F900400 with the 32-bit bus split into the 16-bit halfword each register wants; IRQs to INTC bit 9. **PSX register layout**, not the SPU2's — see the file header | new (cores: PSX_MiSTer `spu.vhd`, `spu_ram.vhd`, `spu_gauss.vhd`) |
 | `iop_spuram.vhd` | 512 KB of SPU work RAM per core as 128-bit-row UltraRAM behind `spu_ram`'s SDRAM-style port | new |
 | `iop_sio2.vhd` | SIO2 at 0x1F808200: SEND1/2/3, FIFOs, CTRL, RECV1-3, I_STAT, INTC bit 17; a PS1-protocol digital pad answers on port 0 from the `pad0_buttons` port, everything else reads as absent | new |
-| `iop_cdvd.vhd` | CDVD at 0x1F402000: N/S command ports, status, error, I_STAT, INTC bit 2; answers the boot-time S commands with PCSX2's values and reports no disc | new |
-| `iop_dma.vhd` | the DMA controller: 13 channels in two banks, DPCR/DICR and their bank-2 twins, DMACEN, the interrupt on INTC bit 3. **Channel 6 (OTC) is complete** — it needs no peripheral, so it is the one channel that can prove the controller on its own. Channel 3 (CDVD) has its device handshake and moves nothing until the CDVD read path feeds it. Every other channel accepts its registers and reports completion, as the stub did | new (OTC word format and CHCR/DICR semantics from PSX_MiSTer `dma.vhd`) |
+| `iop_cdvd.vhd` | CDVD at 0x1F402000: N/S command ports, status, error, I_STAT, INTC bit 2; answers the boot-time S commands with PCSX2's values, reports disc presence from the host, logs every command for the host to read back, and **reads sectors**: N commands 0x06/0x07/0x08 take an LBA and a count, fetch each sector through the host sector port, and hand the words to DMA channel 3 | new |
+| `iop_dma.vhd` | the DMA controller: 13 channels in two banks, DPCR/DICR and their bank-2 twins, DMACEN, the interrupt on INTC bit 3. **Channels 6 (OTC) and 3 (CDVD) are complete** — OTC needs no peripheral, so it is the one channel that can prove the controller on its own, and channel 3 now carries real sector data from the CDVD block into RAM. `dev_ready` means "this word is taken", not "I am listening": it is asserted only when the RAM write for the word is granted, or the device outruns the DMA and the word count never reaches zero. Every other channel accepts its registers and reports completion, as the stub did | new (OTC word format and CHCR/DICR semantics from PSX_MiSTer `dma.vhd`) |
 | `iop_sif.vhd` | the SIF mailbox at 0x1D000000: MSCOM, SMCOM, MSFLAG, SMFLAG, CTRL, BD6. The flag registers are semaphores, not storage — the EE sets MSFLAG and the IOP's write clears it, and SMFLAG is the reverse — which is what a register stub could not imitate and what stopped the BIOS boot | new |
 | `iop_regstub.vhd` | a read-back register file standing in for a peripheral that does not exist yet | new |
 | (unmodified) `cpu.vhd`, `memctrl.vhd`, `timer.vhd`, `datacache.vhd`, `divider.vhd`, the RAM/FIFO wrappers | PSX_MiSTer, GPL-2.0, Robert Peip | via `cores/PSX/upstream` |
@@ -58,7 +59,12 @@ the BEV vector (the handler writes 5A), 07 SPU2 voice registers on both
 cores, 08 SPU2 transfer FIFO into work RAM (the bench checks the RAM row),
 09 SIO2 pad poll (FF 41 5A + the buttons the bench drives, RECV1, I_STAT,
 INTC bit 17), 0A CDVD (no disc, S command 03/00, N command 00, INTC bit 2),
-AA all passed, EE a check failed. It
+0B a halfword write through a register stub (the write mask), 0C the SIF
+mailbox handshake against the bench playing the EE, 0D DMA channel 6 (OTC)
+building its linked list backwards and the list checked word by word, 0E a
+CDVD sector read: N command 0x06 for LBA 16, delivered to RAM by DMA channel
+3, with the ISO9660 primary volume descriptor signature checked in RAM and
+INTC bit 2 raised. AA all passed, EE a check failed. It
 is assembled by `asm_r3000.py`, a two-pass MIPS I assembler with no
 dependencies, so the test needs no cross toolchain.
 
@@ -125,13 +131,45 @@ the RTL or recorded in the file it belongs to:
    like a failure; `iop_spuram` mirrors the checked row into a scalar signal
    under `synthesis translate_off` for the bench.
 
+## What the CDVD read path found (2026-09-09)
+
+Stage `0E` took four RTL fixes to pass, and three of them are the same bug in
+different clothes: a signal read or driven a cycle away from where it belonged.
+Recording them together because the family is worth recognising on sight.
+
+1. **`ram_done_mux` was computed and connected to nothing.** `iop_top` derived
+   the CPU's masked completion correctly and then passed the memory mux the raw
+   `ram_done`, so every DMA write completion reached the CPU as the answer to a
+   request it never made. The comment above the arbiter had described the
+   intended behaviour from the start; only the wire was missing. The symptom was
+   a CPU that stopped taking branches — `b halt` fell through — and marched off
+   the end of ROM executing zeros.
+2. **A CPU access during a DMA transfer was dropped.** `iop_ram` samples a
+   request only while its FSM is idle. With fix 1 in place the CPU no longer
+   saw a stray completion to unblock it, so the dropped access became a
+   permanent stall and the core raised its error flag. The arbiter now holds one
+   CPU request and replays it when the port frees.
+3. **`ram_req` was only ever cleared on reset.** A request left standing after
+   the last word kept the arbiter granting the DMA and re-writing that word.
+   OTC hid this completely: the repeated write put the same value back at the
+   same address, so the list still read back correctly.
+4. **`dev_ready` was asserted on state, not on a grant.** Channel 3 held it high
+   for the whole transfer rather than when a word was actually consumed, so the
+   CDVD advanced faster than the DMA took words and the count never reached
+   zero.
+
+The bench now traps on the first instruction fetch past the end of the loaded
+image and on an unexpected POST 00, dumping the fetch and data rings with the PC
+of each access alongside DMA and CDVD state. All four were found with it. Three
+of them pass any test that checks only whether a transfer *completed*, which is
+the argument for checking contents instead.
+
 ## Next
 
-A real BIOS now boots this subsystem on the C1100 and its kernel loads 21 of
-the 29 modules `IOPBTCONF` names, stopping after `SIFCMD` because the SIF has
-no Emotion Engine behind it and the DMA controller is a register stub
-([docs/ps2-bios-boot.md](ps2-bios-boot.md)). Those two are
-therefore the next real blocks, in that order.
+A real BIOS now boots this subsystem on the C1100 and reaches `BOOTEND` with
+28 modules loaded ([docs/ps2-bios-boot.md](ps2-bios-boot.md)). The SIF mailbox
+and the DMA controller, which were the two blockers, are both real blocks now;
+so is the CDVD read path, in simulation.
 
 (Done 2026-09-08: the write mask now reaches all four stub buses, so a
 halfword or byte store to a stub keeps the rest of the register. Boot-test
@@ -140,7 +178,8 @@ stage 0B checks it, and fails with POST EE if the mask is removed.)
 The order from here is in [docs/roadmap.md](roadmap.md).
 
 Still on the IOP: an SPU2 register decode in front of the two PSX cores
-(and 2 MB shared RAM), the IOP DMAC (SPU2, SIO2, CDVD and SIF all move their
-data by DMA on the real console), memory cards on SIO2, and the SIF. After
+(and 2 MB shared RAM), the remaining DMA channels and their sync modes (SPU2,
+SIO2 and the SIF all move their data by DMA on the real console; channels 3 and
+6 are done), memory cards on SIO2, and the SIF's chain mode. After
 that the study's step 2: the Graphics Synthesizer as a standalone unit fed
 over PCIe, the first block with no RTL to start from.
