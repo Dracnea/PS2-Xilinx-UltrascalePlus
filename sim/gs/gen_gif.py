@@ -42,6 +42,38 @@ AD_ADDRS = [0x00, 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0A,
             0x0B, 0x20, 0x55, 0x70]
 
 
+def depth_regs(rng):
+    """ZBUF and TEST for one primitive, and whether depth is in play.
+
+    The Z buffer is put on pages the drawing does not use about half the time
+    and on pages it does the rest, because a Z buffer overlapping the frame
+    buffer is not a silly case: it is the case that catches an implementation
+    doing its two writes in the wrong order, and both models have to agree that
+    depth is written first.
+
+    ZTE = 0 is left out.  The manual calls it prohibited and says it may cause a
+    malfunction, so there is no documented behaviour to agree on, and a
+    generator that emits it is asking two models to match on an invention.
+    """
+    ztst = rng.choice([0, 1, 2, 2, 3, 3])
+    zmsk = rng.choice([0, 0, 0, 1])
+    zpsm = rng.choice([0, 0, 0, 1])              # PSMZ32, occasionally PSMZ24
+    zbp  = rng.choice([0, 1, 2, 4, 4, 8])
+    return (zbp | (zpsm << 24) | (zmsk << 32),
+            (1 << 16) | (ztst << 17))
+
+
+def zval(rng):
+    """A vertex depth.
+
+    Drawn from a small set of nearby values rather than uniformly over 32 bits,
+    because a uniform Z makes GEQUAL and GREATER agree on essentially every
+    pixel and the depth test then passes without ever being exercised.
+    """
+    return rng.choice([0x0000, 0x2000, 0x4000, 0x8000, 0xC000, 0xFFFF,
+                       rng.randrange(1 << 24)])
+
+
 def blend_regs(rng):
     """ALPHA and COLCLAMP, and whether PRIM enables blending at all.
 
@@ -82,11 +114,13 @@ def gen(rng, ntags):
             sc  = (rng.randrange(0, 8), rng.randrange(40, 64),
                    rng.randrange(0, 4), rng.randrange(20, 32))
             abe, alpha, clamp = blend_regs(rng)
+            zbuf, ztest = depth_regs(rng)
             items = [(0x4C, fbp | (1 << 16) | (rng.choice([0, 0, 1]) << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x40 + 1, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x42, alpha), (0x46, clamp),
+                     (0x4E, zbuf), (0x47, ztest),
                      (0x01, rng.randrange(1 << 32)),
                      (0x00, 6 | (abe << 6))]
             regs = 0
@@ -96,8 +130,11 @@ def gen(rng, ntags):
             for a, d in items:
                 out.append((d & ((1 << 64) - 1)) | (a << 64))
             out.append(tag(1, 1, 0xEE, 2))
-            out.append(((x0 << 4) | (((y0 << 4)) << 16)) | (0x05 << 64))
-            out.append((((x0 + w) << 4) | ((((y0 + h) << 4)) << 16)) | (0x05 << 64))
+            # a sprite's depth is the second vertex's, so the first one's is
+            # deliberately different: if it were ever used the diff would say so
+            out.append(((x0 << 4) | (((y0 << 4)) << 16) | (zval(rng) << 32)) | (0x05 << 64))
+            out.append((((x0 + w) << 4) | ((((y0 + h) << 4)) << 16)
+                        | (zval(rng) << 32)) | (0x05 << 64))
         elif pick < 0.34:
             # a triangle, strip or fan, generated coherently.  Kept small on
             # purpose: a large one is thousands of pixels at one per clock plus
@@ -116,10 +153,12 @@ def gen(rng, ntags):
             # touches the block step at all, so the widths below are chosen to
             # straddle a block boundary more often than not.
             iip = rng.choice([0, 0, 1, 1])
+            zbuf, ztest = depth_regs(rng)
             items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (rng.choice([0, 0, 1]) << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x42, alpha), (0x46, clamp),
+                     (0x4E, zbuf), (0x47, ztest),
                      (0x01, rng.randrange(1 << 32)),
                      (0x00, prim | (iip << 3) | (abe << 6))]
             regs = 0
@@ -140,7 +179,7 @@ def gen(rng, ntags):
                 vy = (by + rng.randrange(0, 10)) * 16 + rng.randrange(0, 16)
                 if iip:
                     out.append(rng.randrange(1 << 32) | (0x01 << 64))
-                out.append((vx | (vy << 16)) | (0x05 << 64))
+                out.append((vx | (vy << 16) | (zval(rng) << 32)) | (0x05 << 64))
         elif pick < 0.46:
             # a host-to-local transfer of a small rectangle
             w = rng.randrange(1, 9)

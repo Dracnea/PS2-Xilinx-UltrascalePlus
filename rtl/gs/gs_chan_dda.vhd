@@ -46,7 +46,19 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
+-- The same unit carries depth.  Depth differs in three ways and in no others:
+-- it is 32 bits wide rather than 8, it is not clamped to a byte, and it runs
+-- half a grid step below its own plane -- so the accumulator is kept on a
+-- 2**-11 grid, twice as fine as the step, and that half-step is one unit.  The
+-- bias is the least-verified rule in this design and hw/ps2probe exists to
+-- settle it; it is confined to the two lines guarded by ZMODE so that a console
+-- disagreeing costs one edit.
 entity gs_chan_dda is
+   generic
+   (
+      CWIDTH : natural := 8;          -- 8 for a colour channel, 32 for depth
+      ZMODE  : boolean := false       -- carry the depth bias
+   );
    port
    (
       clk    : in  std_logic;
@@ -60,17 +72,20 @@ entity gs_chan_dda is
       sgn    : in  std_logic;
       dx10, dx20, dy10, dy20 : in signed(19 downto 0);
       x0, y0 : in  signed(17 downto 0);
-      c0, c1, c2 : in unsigned(7 downto 0);
+      c0, c1, c2 : in unsigned(CWIDTH - 1 downto 0);
       busy   : out std_logic := '0';
 
       -- Per scanline: seed the walk at the span's first pixel.
       sstart : in  std_logic;
       sx, sy : in  signed(12 downto 0);
+      -- ZMODE only: how many scanlines down from the primitive's first this
+      -- one is.  The y half of the bias accumulates and is exempt on the first.
+      sk     : in  unsigned(10 downto 0) := (others => '0');
       sbusy  : out std_logic := '0';
 
       -- Per pixel.
       adv    : in  std_logic;
-      val    : out unsigned(7 downto 0)
+      val    : out unsigned(CWIDTH - 1 downto 0)
    );
 end entity;
 
@@ -80,6 +95,15 @@ architecture arch of gs_chan_dda is
    signal state : state_t := S_IDLE;
 
    constant W : natural := 64;         -- the divider's width
+   -- Colour lives on the 2**-10 grid the step is truncated to.  Depth is kept
+   -- one bit finer so that its half-step bias is representable at all: snapping
+   -- a half-step onto the grid it is half of would round it straight back out
+   -- of existence, which is why it took purpose-built probes to see.
+   constant FRAC : natural := 10 + boolean'pos(ZMODE);
+   -- The clamp, as a value rather than an integer expression: a 32-bit depth
+   -- has a maximum of 4294967295, which does not fit VHDL's integer at all.
+   constant VMAX : signed(W - 1 downto 0)
+      := shift_left(to_signed(1, W), CWIDTH) - 1;
 
    -- The gradient can be enormous for a triangle whose det is tiny: a sliver
    -- covers no pixels, but it still runs through this arithmetic, so nothing
@@ -110,13 +134,13 @@ begin
    process (acc, lane, lane_i)
       variable t : signed(W - 1 downto 0);
    begin
-      t := shift_right(acc + lane(lane_i), 10);
+      t := shift_right(acc + lane(lane_i), FRAC);
       if t < 0 then
          val <= (others => '0');
-      elsif t > 255 then
+      elsif t > VMAX then
          val <= (others => '1');
       else
-         val <= unsigned(t(7 downto 0));
+         val <= unsigned(t(CWIDTH - 1 downto 0));
       end if;
    end process;
 
@@ -167,7 +191,10 @@ begin
                   end if;
 
                when S_GLOAD =>
-                  -- gradient = floor(16384 * nx / det)
+                  -- gradient = floor(16 * 1024 * nx / det), always on the
+                  -- 2**-10 grid: the truncation of the step is the measured
+                  -- behaviour and does not get finer just because depth's
+                  -- accumulator does.
                   num := shift_left(nx, 14);
                   dv_neg <= '1' when num < 0 else '0';
                   if num < 0 then dv_n <= unsigned(-num); else dv_n <= unsigned(num); end if;
@@ -229,12 +256,16 @@ begin
                   jq    <= nq;
                   jrem  <= nrem;
                   jcorr <= ncor;
+                  -- The lane offsets and the block step are computed on the
+                  -- 2**-10 grid and then scaled onto whatever grid the
+                  -- accumulator uses, so that depth's extra bit changes where
+                  -- the bias can live without changing what the DDA does.
                   if jcnt = 7 then
-                     step  <= nq + ncor;         -- j = 8: one whole block
+                     step  <= shift_left(nq + ncor, FRAC - 10);
                      busy  <= '0';
                      state <= S_READY;
                   else
-                     lane(jcnt + 1) <= nq + ncor;
+                     lane(jcnt + 1) <= shift_left(nq + ncor, FRAC - 10);
                      jcnt <= jcnt + 1;
                   end if;
 
@@ -259,7 +290,7 @@ begin
                             resize(signed('0' & c0) * detp, W)
                           + resize(nx * (shift_left(resize(sx, 20), 4) - resize(x0, 20)), W)
                           + resize(ny * (shift_left(resize(sy, 20), 4) - resize(y0, 20)), W),
-                          10);
+                          FRAC);
                   dv_neg <= '1' when num < 0 else '0';
                   if num < 0 then dv_n <= unsigned(-num); else dv_n <= unsigned(num); end if;
                   dv_d   <= unsigned(detp);
@@ -285,12 +316,28 @@ begin
 
                when S_SFIX =>
                   if dv_neg = '1' and dv_r /= 0 then
-                     acc <= -signed(dv_q) - 1;
+                     qq := -signed(dv_q) - 1;
                   elsif dv_neg = '1' then
-                     acc <= -signed(dv_q);
+                     qq := -signed(dv_q);
                   else
-                     acc <= signed(dv_q);
+                     qq := signed(dv_q);
                   end if;
+                  if ZMODE then
+                     -- One unit is half a step on this grid.  The x term is
+                     -- unconditional and does not follow the gradient's sign;
+                     -- the y term accumulates a unit per scanline, is exempt on
+                     -- the first, and does follow the sign -- which, with det
+                     -- made positive by the caller, is the sign of ny.
+                     qq := qq - 1;
+                     if sk /= 0 then
+                        if ny > 0 then
+                           qq := qq - signed(resize(sk, W));
+                        elsif ny < 0 then
+                           qq := qq + signed(resize(sk, W));
+                        end if;
+                     end if;
+                  end if;
+                  acc    <= qq;
                   lane_i <= 0;
                   sbusy  <= '0';
                   state  <= S_READY;

@@ -579,18 +579,94 @@ correct pixel followed by a repeat was visible directly.
   console's probes measured, so seeing the model produce it is a check that the
   rule was implemented and not merely described.
 
+## Depth — 2026-09-10
+
+The Z buffer, the depth test and interpolated depth, again in the reference and
+the RTL together.
+
+Two thirds of this is not in doubt. The manual specifies the test exactly —
+`ZTE`/`ZTST` with NEVER, ALWAYS, GEQUAL and GREATER, `ZMSK` masking the write,
+and the Z buffer having no width of its own because it is the frame buffer's —
+and it is worth honouring its corner cases rather than smoothing them:
+
+- **`ZTE = 0` is not a mode.** The manual calls it *prohibited, since it may
+  cause a malfunction*. There is no documented behaviour for two models to agree
+  on, so neither implements one and the generator does not emit it.
+- **The documented way to draw without a depth test** is `ZTE=1`, `ZTST=ALWAYS`,
+  `ZMSK=1`, which leaves the buffer "neither accessed nor updated". That
+  combination is detected and the buffer is not even addressed — not read and
+  discarded.
+- **A sprite's depth is an integer** from its second vertex and is never
+  interpolated, which is both what the manual says about Sprite and what the
+  console probes found.
+
+The test runs **before** the colour, and a pixel it rejects is never read, never
+blended and never written. Doing it afterwards would give the right picture
+almost always and the wrong one wherever `FBMSK` or the blender touches a pixel
+that should not have survived. For the same reason the Z write is a consequence
+of the *test* and not of the colour write: a pixel that passes updates Z even
+when the frame buffer write is entirely masked out, and the two masks are
+independent.
+
+### Depth rides the colour interpolator
+
+`gs_chan_dda` became generic. Depth differs from a colour channel in exactly
+three ways — 32 bits instead of 8, no clamp to a byte, and the bias — so it is
+the same unit with `CWIDTH => 32, ZMODE => true` rather than a second file to
+keep in step. The only structural change is the accumulator's grid: depth is
+carried on 2⁻¹¹, one bit finer than the 2⁻¹⁰ the *step* is truncated to, because
+its bias is half a step and snapping a half-step onto the grid it is half of
+would round it straight back out of existence. The step and lane offsets are
+still computed on 2⁻¹⁰ and scaled up, so the DDA does exactly what it did.
+
+### The bias is the one thing here that is not verified
+
+The rule implemented is the recorded one: depth lands half a grid step below its
+plane; along X the shortfall is present from the span's first pixel and ignores
+the gradient's sign; along Y it accumulates, follows the sign, and is exempt on
+the primitive's first scanline; a flat triangle is exact. That is a restatement
+of somebody else's measurements on an SCPH-30001, and **this project has never
+seen a console either confirm or contradict it.**
+
+It is therefore confined to one function in each implementation — `_zbias()` in
+`sim/gs/gs_ref.py`, two lines under `ZMODE` in `rtl/gs/gs_chan_dda.vhd` — so
+that a console disagreeing costs one edit rather than an investigation.
+
+`hw/ps2probe` now asks the question directly. `gsprobe.c` draws two flat
+triangles whose depth varies along one axis only, reads the Z buffer back
+through the Local→Host path, and prints it; `compare.py` builds the same
+primitives as a GIF stream, runs them through the reference, and diffs. The
+model's own answer for the y-gradient probe already shows the signature the
+probe is looking for — the first pixel of the first scanline reads `000fffff`
+where the plane says `00100000`, one below, which is the X half of the bias with
+nothing else on top of it. Whether silicon prints the same number is the point
+of the exercise.
+
+The probe also prints the count of rows equal to their `k+2` neighbour, because
+"silicon pairs rows two at a time" is an open question nobody has published an
+answer to, and a triangle with a pure Y gradient answers it without any analysis
+at all.
+
+### What it is checked against
+
+- A directed stream of three overlapping sprites at different depths plus a
+  Gouraud triangle interpolating depth through the same buffer: identical, and
+  the depth test rejects 522 of 2040 pixels — so the two models agree about
+  which pixels *lost*, not merely about drawing everything.
+- The same stream with the test disabled the documented way, also identical,
+  which is what proves the rejection above came from the test rather than from
+  both models failing to draw.
+- Twenty random GIF streams, whose sprites and triangles now carry vertex depth
+  and random `ZBUF`/`TEST` — including a Z buffer deliberately overlapping the
+  frame buffer about half the time, since that is the case that catches the two
+  writes being done in the wrong order.
+
 ### What the rasteriser does not do yet
 
-No Z test or Z buffer, no texture, no dither, and no 16-bit formats.
-
-Z is the same machinery as Gouraud with an extra wrinkle: the depth bias, which
-runs half a grid step short of the plane and carries differently along the two
-axes — present from the span's first pixel along X and sign-independent,
-accumulating and sign-following along Y with the primitive's first scanline
-exempt. `gs_chan_dda` is one channel of a plane interpolator and Z is another,
-so the unit generalises; what does not yet exist is the Z buffer itself, the
-`ZBUF` register, the depth test modes and the second address generator, and
-those are the actual work.
+No texture, no dither, and no 16-bit formats. PSMZ16 and PSMZ16S are not
+supported either — the depth path takes PSMZ32 and PSMZ24, which share the
+32-bit-per-pixel layout, and the 16-bit Z formats come with the 16-bit colour
+formats since they need the same addressing work.
 
 Dither is small but needs a 16-bit pixel format to act on, so the formats come
 first. Texture is the largest remaining block by a wide margin — `TEX0`, `TEX1`,

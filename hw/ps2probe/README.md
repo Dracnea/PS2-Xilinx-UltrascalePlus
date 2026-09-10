@@ -63,24 +63,45 @@ Manual describes rather than by pattern-matching someone's example:
 5. `BUSDIR` goes back to 0. Skipping this leaves the machine unable to accept a
    normal GIF packet, which presents as a hang rather than as an error.
 
-## What the first probe asks
+## What the probes ask
 
-`gsprobe.c` draws one Gouraud triangle whose three vertices are pure red, green
-and blue, so every channel carries a gradient of its own and a single readback
-answers all of them. It prints one row per line, which the host diffs against
-`sim/gs/gs_ref.py`.
+Three passes, and the host compares all of them in one command:
 
-The two questions worth asking first are the ones ARMSX2's captures leave open,
-because nobody has published an answer:
+```sh
+~/ps2dev/ps2client/bin/ps2client -h 192.168.99.2 execee host:gsprobe.elf | tee run.txt
+hw/ps2probe/compare.py run.txt
+```
 
-- **Row pairing.** Their probes found that silicon reads rows *k* and *k+2*
-  identically at every *k*, and no emulator models the vertical structure that
-  implies. A triangle with a pure Y gradient, read back in full, shows it
-  immediately.
-- **Texture coordinate block width.** The affine texture coordinate is
-  truncated and so may carry a block width of its own, but no capture has swept
-  it. The same width curve that established eight pixels for colour would settle
-  it.
+`compare.py` builds the same primitives as a GIF packet stream, runs them
+through `sim/gs/gs_ref.py`, and prints the pixels that differ with the delta.
+Keep it and `gsprobe.c` in step: they describe the same pictures twice, in C and
+in Python, and nothing forces them to agree — if the probe changes and the
+script does not, the diff is of two different pictures and will look like a
+discovery.
+
+**`PROBE gouraud`** — one triangle with pure red, green and blue vertices, so
+every channel carries its own gradient and one readback answers all four. This
+checks the blocked truncating DDA: eight-pixel blocks with the step snapped to
+2⁻¹⁰.
+
+**`ZPROBE ygrad` and `ZPROBE xgrad`** — flat triangles whose depth varies along
+one axis only, with `ZTST = ALWAYS` and `ZMSK = 0` so every pixel writes its
+interpolated depth and nothing is filtered out by the test itself. These are
+the important ones, because **the depth bias is the only rule in this project
+implemented from someone else's measurements and never checked against a
+console.** The model's answer for `ygrad` already shows what to look for: the
+first pixel of the first scanline reads `000fffff` where the plane says
+`00100000` — one below, the X half of the bias with nothing on top of it.
+
+`ygrad` also settles an open question. ARMSX2's captures found that silicon
+reads rows *k* and *k+2* identically at every *k*, nobody has published why, and
+no emulator models the vertical structure it would imply. A pure Y gradient
+shows it without any analysis, and `compare.py` prints the count.
+
+The remaining open question needs a probe that does not exist yet: **the affine
+texture coordinate is truncated and may carry a block width of its own**, but no
+capture has swept it. The same width curve that established eight pixels for
+colour would settle it, and there is no texture unit to drive it with.
 
 ## Status
 

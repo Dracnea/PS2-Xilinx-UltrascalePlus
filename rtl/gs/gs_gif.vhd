@@ -79,7 +79,7 @@ architecture arch of gs_gif is
    type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
                     S_DRAW, S_DRAWRD,
                     S_TRI_SET, S_TRI_WAIT, S_TRI_SCAN, S_TRI_STEP,
-                    S_TRI_SEED);
+                    S_TRI_SEED, S_ZRD);
    signal state : state_t := S_TAG;
 
    -- the tag in flight
@@ -118,6 +118,8 @@ architecture arch of gs_gif is
    -- shading takes the last vertex's colour, which is simply the current one.
    signal v0_c, v1_c, v2_c : std_logic_vector(31 downto 0) := (others => '0');
    signal vf_c             : std_logic_vector(31 downto 0) := (others => '0');
+   signal v0_z, v1_z, v2_z : std_logic_vector(31 downto 0) := (others => '0');
+   signal vf_z             : std_logic_vector(31 downto 0) := (others => '0');
    -- '1' while a triangle is being walked; sprites leave it clear
    signal tri_mode : std_logic := '0';
 
@@ -140,6 +142,7 @@ architecture arch of gs_gif is
    signal t_x, t_y : sv16_a := (others => (others => '0'));
    type sv32_a is array (0 to 2) of std_logic_vector(31 downto 0);
    signal t_c : sv32_a := (others => (others => '0'));
+   signal t_z : sv32_a := (others => (others => '0'));
    signal dr_x, dr_y : unsigned(10 downto 0) := (others => '0');
    signal dr_x0      : unsigned(10 downto 0) := (others => '0');
    signal dr_x1      : unsigned(10 downto 0) := (others => '0');
@@ -155,6 +158,18 @@ architecture arch of gs_gif is
    signal dr_clamp   : std_logic := '0';
    signal dr_empty   : std_logic := '0';
    signal dr_iip     : std_logic := '0';
+   -- The depth test, latched with the rest of the primitive.  dr_zon folds in
+   -- every reason the Z buffer might not be touched at all, so the draw path
+   -- asks one question rather than four.
+   signal dr_zon     : std_logic := '0';
+   signal dr_ztst    : std_logic_vector(1 downto 0) := "00";
+   signal dr_zmsk    : std_logic := '0';
+   signal dr_zbp     : unsigned(8 downto 0) := (others => '0');
+   signal dr_zmask   : std_logic_vector(31 downto 0) := (others => '0');
+   signal dr_z       : std_logic_vector(31 downto 0) := (others => '0');
+   signal dr_zdone   : std_logic := '0';    -- this pixel has passed its test
+   signal dr_zaddr   : unsigned(19 downto 0) := (others => '0');
+   signal dr_ytop    : unsigned(10 downto 0) := (others => '0');
    signal dr_ret     : state_t := S_TAG;
    signal dr_addr    : unsigned(19 downto 0) := (others => '0');
 
@@ -171,6 +186,18 @@ architecture arch of gs_gif is
    signal c_dx10, c_dx20, c_dy10, c_dy20 : signed(19 downto 0) := (others => '0');
    signal c_sx, c_sy : signed(12 downto 0) := (others => '0');
    signal c_val   : u8_a;
+   -- Depth rides the same unit, one instance wide, with ZMODE on.
+   signal z_start, z_sstart : std_logic := '0';
+   signal z_busy, z_sbusy   : std_logic;
+   signal z_val   : unsigned(31 downto 0);
+   signal src_z   : std_logic_vector(31 downto 0);
+   signal z_old   : std_logic_vector(31 downto 0);
+   signal z_pass  : std_logic;
+   -- '1' on the cycle the current pixel is finished with, however it ended:
+   -- written, masked away, or killed by the depth test.  One signal, so that
+   -- the interpolators step on exactly the edge the pixel position does and
+   -- there is a single place that decides a pixel is over.
+   signal px_step : std_logic;
    -- what the pixel back end actually writes: the interpolated colour while a
    -- Gouraud triangle is being walked, the latched flat colour otherwise
    signal src_rgba : std_logic_vector(31 downto 0);
@@ -256,6 +283,18 @@ architecture arch of gs_gif is
       return res;
    end function;
 
+   -- PSMZ24, like PSMCT24, is 24 bits inside a 32-bit word: the top byte is
+   -- not part of the value and must survive the write, which the byte enables
+   -- express directly rather than by reading the word back to preserve it.
+   function zbe(mask : std_logic_vector(31 downto 0)) return unsigned is
+   begin
+      if mask(31) = '1' then
+         return unsigned'(x"F");
+      else
+         return unsigned'(x"7");
+      end if;
+   end function;
+
    function pix_addr_page(pg : unsigned(8 downto 0); bw : unsigned(5 downto 0);
                           x, y : unsigned(10 downto 0)) return unsigned is
       variable page : unsigned(8 downto 0);
@@ -297,9 +336,49 @@ begin
                    adv => c_adv, val => c_val(n));
    end generate;
 
+   zdda : entity work.gs_chan_dda
+      generic map (CWIDTH => 32, ZMODE => true)
+      port map (clk => clk, reset => reset,
+                start => z_start, det => c_det, sgn => c_sgn,
+                dx10 => c_dx10, dx20 => c_dx20,
+                dy10 => c_dy10, dy20 => c_dy20,
+                x0 => t_x(0), y0 => t_y(0),
+                c0 => unsigned(t_z(0)), c1 => unsigned(t_z(1)),
+                c2 => unsigned(t_z(2)),
+                busy => z_busy,
+                sstart => z_sstart, sx => c_sx, sy => c_sy,
+                sk => dr_y - dr_ytop, sbusy => z_sbusy,
+                adv => c_adv, val => z_val);
+
    src_rgba <= (std_logic_vector(c_val(3)) & std_logic_vector(c_val(2))
                 & std_logic_vector(c_val(1)) & std_logic_vector(c_val(0)))
                when dr_iip = '1' and tri_mode = '1' else dr_rgba;
+
+   -- A triangle interpolates its depth; a sprite carries it as an integer from
+   -- its second vertex and never interpolates at all, which is both what the
+   -- manual says about Sprite and what the console probes found.
+   src_z <= std_logic_vector(z_val) when tri_mode = '1' else dr_z;
+
+   z_old <= std_logic_vector(shift_right(unsigned(rd_data),
+                             32 * to_integer(dr_zaddr(2 downto 0)))(31 downto 0));
+   z_pass <= '1' when dr_ztst = "10"
+                      and unsigned(src_z and dr_zmask) >= unsigned(z_old and dr_zmask)
+             else '1' when dr_ztst = "11"
+                      and unsigned(src_z and dr_zmask) >  unsigned(z_old and dr_zmask)
+             else '0';
+
+   -- The one decision that a pixel is over.  Three ways out: the fast colour
+   -- write, the read-modify-write coming back, and the depth test rejecting it
+   -- -- either outright, because ZTST is NEVER, or on the comparison.
+   px_step <= '1' when state = S_DRAW and dr_empty = '0' and dr_y <= dr_y1
+                       and ((dr_zon = '1' and dr_zdone = '0' and dr_ztst = "00")
+                            or ((dr_zon = '0' or dr_zdone = '1')
+                                and dr_fbmsk = x"00000000" and dr_abe = '0'))
+              else '1' when state = S_DRAWRD and rd_valid = '1'
+              else '1' when state = S_ZRD and rd_valid = '1' and z_pass = '0'
+              else '0';
+
+   c_adv <= px_step and tri_mode;
 
    -- The interpolators step on the same edge as the pixel address, which means
    -- combinationally on the cycle a pixel is committed rather than as a
@@ -311,11 +390,7 @@ begin
    -- places a span pixel commits is the price of putting the step on the right
    -- edge.  Stepping past the end of a span costs nothing, because the next
    -- scanline re-seeds the walk from its own first pixel.
-   c_adv <= '1' when dr_iip = '1' and tri_mode = '1'
-                     and ((state = S_DRAW and dr_empty = '0' and dr_y <= dr_y1
-                           and dr_fbmsk = x"00000000" and dr_abe = '0')
-                          or (state = S_DRAWRD and rd_valid = '1'))
-            else '0';
+
 
    -- Combinational, because valid/ready only means anything if both sides agree
    -- on which edge the transfer happened.  A registered ready lags the state it
@@ -326,7 +401,7 @@ begin
                 '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
                          or state = S_TRI_SET or state = S_TRI_WAIT
                          or state = S_TRI_SCAN or state = S_TRI_STEP
-                         or state = S_TRI_SEED
+                         or state = S_TRI_SEED or state = S_ZRD
                 else '1';
 
    dbg_reg     <= reg(to_integer(dbg_sel));
@@ -356,6 +431,69 @@ begin
       variable ka, kb                      : integer range 0 to 2;
       variable d10x, d20x, d10y, d20y      : signed(19 downto 0);
       variable vdet                        : signed(47 downto 0);
+      variable za                          : unsigned(19 downto 0);
+
+      -- Retiring a pixel: the same three lines whichever way the pixel ended,
+      -- so they live in one place and are reached from one condition.  px_step
+      -- decides *whether*, this decides *what*, and because px_step is
+      -- combinational the interpolators step on the very edge dr_x does --
+      -- which is the whole reason the two are not written as one.
+      procedure next_px is
+      begin
+         dr_zdone <= '0';
+         if dr_x = dr_x1 then
+            -- end of a scanline: a sprite goes back to the same left edge, a
+            -- triangle asks its edges for the next
+            if tri_mode = '1' then
+               e_step <= '1';
+               if dr_y >= dr_y1 then
+                  tri_mode <= '0';
+                  state    <= dr_ret;
+               else
+                  dr_y  <= dr_y + 1;
+                  state <= S_TRI_STEP;
+               end if;
+            else
+               dr_x  <= dr_x0;
+               dr_y  <= dr_y + 1;
+               state <= S_DRAW;
+            end if;
+         else
+            dr_x  <= dr_x + 1;
+            state <= S_DRAW;
+         end if;
+      end procedure;
+
+      -- Everything that decides whether the Z buffer is touched at all.  ZTE=0
+      -- is prohibited by the manual, so it is not a mode to model; the
+      -- documented way to draw without a depth test is ALWAYS with ZMSK set,
+      -- which the manual says leaves the buffer neither accessed nor updated --
+      -- so that combination clears dr_zon and the buffer is not even addressed.
+      -- The Z buffer has no width of its own: it is the frame buffer's.
+      procedure latch_z(ctxi : integer) is
+         variable zr : std_logic_vector(63 downto 0);
+         variable tr : std_logic_vector(63 downto 0);
+      begin
+         tr := reg(16#47# + ctxi);
+         zr := reg(16#4E# + ctxi);
+         dr_ztst <= tr(18 downto 17);
+         dr_zmsk <= zr(32);
+         dr_zbp  <= unsigned(zr(8 downto 0));
+         if zr(27 downto 24) = "0001" then
+            dr_zmask <= x"00FFFFFF";              -- PSMZ24
+         else
+            dr_zmask <= x"FFFFFFFF";              -- PSMZ32
+         end if;
+         if tr(16) = '0' then
+            dr_zon <= '0';
+         elsif tr(18 downto 17) = "01" and zr(32) = '1' then
+            dr_zon <= '0';
+         elsif zr(27 downto 24) = "0000" or zr(27 downto 24) = "0001" then
+            dr_zon <= '1';
+         else
+            dr_zon <= '0';
+         end if;
+      end procedure;
    begin
       if rising_edge(clk) then
          wr_en     <= '0';
@@ -483,13 +621,16 @@ begin
                                  or w_addr = 16#0C# or w_addr = 16#0D# then
                               v0_x <= v1_x;  v0_y <= v1_y;  v0_c <= v1_c;
                               v1_x <= v2_x;  v1_y <= v2_y;  v1_c <= v2_c;
+                              v0_z <= v1_z;  v1_z <= v2_z;
                               v2_x <= unsigned(w_data(15 downto 0));
                               v2_y <= unsigned(w_data(31 downto 16));
                               v2_c <= reg(1)(31 downto 0);
+                              v2_z <= w_data(63 downto 32);
                               if v_cnt = 0 then          -- the fan's anchor
                                  vf_x <= unsigned(w_data(15 downto 0));
                                  vf_y <= unsigned(w_data(31 downto 16));
                                  vf_c <= reg(1)(31 downto 0);
+                                 vf_z <= w_data(63 downto 32);
                               end if;
                               if v_cnt < 7 then
                                  v_cnt <= v_cnt + 1;
@@ -565,6 +706,11 @@ begin
                         dr_alpha <= reg(16#42# + ctxi)(7 downto 0);
                         dr_fix   <= unsigned(reg(16#42# + ctxi)(39 downto 32));
                         dr_clamp <= reg(16#46#)(0);
+                        latch_z(ctxi);
+                        -- a Sprite's depth is the second vertex's, carried as
+                        -- an integer: there is no DDA behind it at all
+                        dr_z     <= w_data(63 downto 32);
+                        dr_zdone <= '0';
                         dr_x0    <= to_unsigned(ax, 11);
                         dr_x     <= to_unsigned(ax, 11);
                         dr_x1    <= to_unsigned(bx, 11);
@@ -604,6 +750,15 @@ begin
                         t_y(2) <= to_signed(to_integer(unsigned(w_data(31 downto 16))) - ofy, 18);
                         t_c(2) <= reg(1)(31 downto 0);
                         dr_iip <= reg(0)(3);
+                        if reg(0)(2 downto 0) = "101" then
+                           t_z(0) <= vf_z;
+                        else
+                           t_z(0) <= v1_z;
+                        end if;
+                        t_z(1) <= v2_z;
+                        t_z(2) <= w_data(63 downto 32);
+                        latch_z(ctxi);
+                        dr_zdone <= '0';
                         dr_fbp   <= unsigned(reg(16#4C# + ctxi)(8 downto 0));
                         dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
                         -- PSMCT24 is 24 bits inside a 32-bit word, addressed
@@ -778,8 +933,20 @@ begin
                   -- A degenerate triangle has no plane; it also covers no
                   -- pixels, so the interpolators are simply left alone rather
                   -- than started on a division by zero.
-                  if dr_iip = '1' and vdet /= 0 then
-                     c_start <= '1';
+                  if vdet /= 0 then
+                     if dr_iip = '1' then
+                        c_start <= '1';
+                     end if;
+                     if dr_zon = '1' then
+                        z_start <= '1';
+                     end if;
+                  end if;
+                  -- the primitive's first scanline, which the depth bias's y
+                  -- term is exempt on
+                  if tya > tyb or tya < 0 then
+                     dr_ytop <= (others => '0');
+                  else
+                     dr_ytop <= to_unsigned(tya, 11);
                   end if;
 
                   tri_mode <= '1';
@@ -788,8 +955,10 @@ begin
                when S_TRI_WAIT =>
                   e_start <= '0';
                   c_start <= '0';
+                  z_start <= '0';
                   if e_start = '0' and e_busy = "000"
-                     and c_start = '0' and c_busy = "0000" then
+                     and c_start = '0' and c_busy = "0000"
+                     and z_start = '0' and z_busy = '0' then
                      if dr_empty = '1' then
                         tri_mode <= '0';
                         state    <= dr_ret;
@@ -809,7 +978,9 @@ begin
 
                when S_TRI_SEED =>
                   c_sstart <= '0';
-                  if c_sstart = '0' and c_sbusy = "0000" then
+                  z_sstart <= '0';
+                  if c_sstart = '0' and c_sbusy = "0000"
+                     and z_sstart = '0' and z_sbusy = '0' then
                      state <= S_DRAW;
                   end if;
 
@@ -843,15 +1014,16 @@ begin
                      dr_x  <= to_unsigned(lft, 11);
                      dr_x0 <= to_unsigned(lft, 11);
                      dr_x1 <= to_unsigned(rgt, 11);
-                     if dr_iip = '1' then
+                     if dr_iip = '1' or dr_zon = '1' then
                         -- Every span is seeded at its own first pixel, which is
                         -- also where the blocking starts: lane 0 of block 0 is
                         -- the leftmost pixel of this scanline, not of the
                         -- triangle and not of an aligned x.
-                        c_sx    <= to_signed(lft, 13);
-                        c_sy    <= signed(resize(dr_y, 13));
-                        c_sstart <= '1';
-                        state   <= S_TRI_SEED;
+                        c_sx <= to_signed(lft, 13);
+                        c_sy <= signed(resize(dr_y, 13));
+                        if dr_iip = '1' then c_sstart <= '1'; end if;
+                        if dr_zon = '1' then z_sstart <= '1'; end if;
+                        state <= S_TRI_SEED;
                      else
                         state <= S_DRAW;
                      end if;
@@ -860,6 +1032,33 @@ begin
                when S_DRAW =>
                   if dr_empty = '1' or dr_y > dr_y1 then
                      state <= dr_ret;
+                  elsif dr_zon = '1' and dr_zdone = '0' then
+                     -- The depth test comes first, and a pixel it rejects is
+                     -- never read, never blended and never written.  Doing it
+                     -- after the colour would still produce the right picture
+                     -- most of the time and the wrong one wherever FBMSK or the
+                     -- blender touches a pixel that should not have survived.
+                     za   := pix_addr_page(dr_zbp, dr_fbw, dr_x, dr_y);
+                     lane := to_integer(za(2 downto 0));
+                     dr_zaddr <= za;
+                     if dr_ztst = "00" then
+                        null;                 -- NEVER: px_step retires it
+                     elsif dr_ztst = "01" then
+                        -- ALWAYS passes without reading, but still writes.
+                        dr_zdone <= '1';
+                        if dr_zmsk = '0' then
+                           wr_en   <= '1';
+                           wr_addr <= std_logic_vector(za(19 downto 3));
+                           wr_data <= std_logic_vector(shift_left(
+                                         resize(unsigned(src_z), 256), 32 * lane));
+                           wr_be   <= std_logic_vector(shift_left(
+                                         resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
+                        end if;
+                     else
+                        rd_en   <= '1';
+                        rd_addr <= std_logic_vector(za(19 downto 3));
+                        state   <= S_ZRD;
+                     end if;
                   else
                      wa   := pix_addr_page(dr_fbp, dr_fbw, dr_x, dr_y);
                      lane := to_integer(wa(2 downto 0));
@@ -873,31 +1072,30 @@ begin
                         wr_be   <= std_logic_vector(shift_left(
                                       resize(unsigned'(x"F"), 32), 4 * lane));
                         pixels  <= pixels + 1;
-                        if dr_x = dr_x1 then
-                           -- end of a scanline: a sprite goes back to the same
-                           -- left edge, a triangle will ask its edges for the next
-                           if tri_mode = '1' then
-                              e_step <= '1';
-                              if dr_y >= dr_y1 then
-                                 tri_mode <= '0';
-                                 state    <= dr_ret;
-                              else
-                                 dr_y  <= dr_y + 1;
-                                 state <= S_TRI_STEP;
-                              end if;
-                           else
-                              dr_x <= dr_x0;
-                              dr_y <= dr_y + 1;
-                           end if;
-                        else
-                           dr_x <= dr_x + 1;
-                        end if;
                      else
                         rd_en   <= '1';
                         rd_addr <= std_logic_vector(wa(19 downto 3));
                         dr_addr <= wa;
                         state   <= S_DRAWRD;
                      end if;
+                  end if;
+
+               when S_ZRD =>
+                  if rd_valid = '1' then
+                     if z_pass = '1' then
+                        dr_zdone <= '1';
+                        if dr_zmsk = '0' then
+                           lane := to_integer(dr_zaddr(2 downto 0));
+                           wr_en   <= '1';
+                           wr_addr <= std_logic_vector(dr_zaddr(19 downto 3));
+                           wr_data <= std_logic_vector(shift_left(
+                                         resize(unsigned(src_z), 256), 32 * lane));
+                           wr_be   <= std_logic_vector(shift_left(
+                                         resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
+                        end if;
+                        state <= S_DRAW;
+                     end if;
+                     -- a failing pixel is retired by px_step, below
                   end if;
 
                when S_DRAWRD =>
@@ -922,25 +1120,7 @@ begin
                      wr_be   <= std_logic_vector(shift_left(
                                    resize(unsigned'(x"F"), 32), 4 * lane));
                      pixels  <= pixels + 1;
-                     if dr_x = dr_x1 then
-                        if tri_mode = '1' then
-                           e_step <= '1';
-                           if dr_y >= dr_y1 then
-                              tri_mode <= '0';
-                              state    <= dr_ret;
-                           else
-                              dr_y  <= dr_y + 1;
-                              state <= S_TRI_STEP;
-                           end if;
-                        else
-                           dr_x <= dr_x0;
-                           dr_y <= dr_y + 1;
-                           state <= S_DRAW;
-                        end if;
-                     else
-                        dr_x <= dr_x + 1;
-                        state <= S_DRAW;
-                     end if;
+                     state   <= S_DRAW;
                   end if;
 
                when S_PIXELS =>
@@ -971,6 +1151,13 @@ begin
                   end if;
 
             end case;
+
+            -- One place decides a pixel is finished with, so the position, the
+            -- interpolators and the depth handshake can never disagree about
+            -- which pixel is current.
+            if px_step = '1' then
+               next_px;
+            end if;
          end if;
       end if;
    end process;

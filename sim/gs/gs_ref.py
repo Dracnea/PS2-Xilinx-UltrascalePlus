@@ -59,6 +59,29 @@ def _floor(q):
 
 _GRID = 1024                        # the DDA's fractional grid, 2**-10
 _BLOCK = 8                          # pixels per DDA step
+_HALF = Fraction(1, 2 * _GRID)      # half a grid step: the depth bias
+
+
+def _zbias(k, dzdy):
+    """How far interpolated depth runs short of its own plane.
+
+    This is the least-verified rule in this file and the first thing to ask a
+    real console.  What the probes found is that depth -- and only depth, not
+    colour -- lands half a grid step below the plane, and that the two axes
+    carry the shortfall differently: along x it is there from the span's first
+    pixel and does not follow the gradient's sign, while along y it accumulates
+    one half-step per scanline, follows the sign of dz/dy, and is exempt on the
+    primitive's first scanline.  A flat triangle is exact in 896 of 896
+    readings, which is what puts the bias in the walk rather than in the seed.
+
+    Everything above is a fact about somebody else's measurements, restated.
+    hw/ps2probe exists to turn it into a fact about a console on this desk; if
+    it ever disagrees, this function is the only place that has to change.
+    """
+    b = -_HALF                              # the x term: always, always down
+    if k > 0 and dzdy != 0:
+        b -= _HALF * k * (1 if dzdy > 0 else -1)
+    return b
 
 
 def _grid(q):
@@ -90,8 +113,11 @@ class _Walk:
     """
     __slots__ = ("seed", "lane", "step")
 
-    def __init__(self, seed, dvdx):
-        self.seed = _grid(seed)
+    def __init__(self, seed, dvdx, bias=0):
+        # The bias is added *after* the snap, because it is half a grid step:
+        # snapping first would round it straight back out of existence, which
+        # is the whole reason it took purpose-built probes to see at all.
+        self.seed = _grid(seed) + bias
         self.lane = [_grid(dvdx * j) for j in range(_BLOCK)]
         self.step = _grid(dvdx * _BLOCK)
 
@@ -261,6 +287,69 @@ class GS:
             out |= v << (8 * n)
         return out | (comp(src, 3) << 24)            # alpha comes from the source
 
+    # -- the depth test ------------------------------------------------------
+    def zsetup(self, ctx):
+        """Everything the depth test needs, or None when it is not in play.
+
+        The manual is unambiguous about the corner cases and they are worth
+        honouring exactly.  ZTE = 0 is "prohibited since it may cause a
+        malfunction", so it is not a documented mode and nothing here pretends
+        to model one.  The *supported* way to draw without a depth test is ZTE=1
+        with ZTST=ALWAYS and ZMSK=1, which the manual says leaves the Z buffer
+        "neither accessed nor updated" -- so that combination returns None and
+        the buffer is not even addressed, rather than being read and discarded.
+
+        The Z buffer has no width of its own: the manual states it is the same
+        size as the frame buffer, so FBW is what addresses it.
+        """
+        test = self.reg[0x47 + ctx]
+        zbuf = self.reg[0x4E + ctx]
+        if bits(test, 16, 16) == 0:                 # ZTE: prohibited, so off
+            return None
+        ztst = bits(test, 18, 17)
+        zmsk = bits(zbuf, 32, 32)
+        if ztst == 1 and zmsk == 1:                 # ALWAYS + masked: no access
+            return None
+        zpsm = bits(zbuf, 27, 24)
+        if zpsm not in (0, 1):                      # PSMZ32 and PSMZ24 only
+            return None
+        return {"zbp":  bits(zbuf, 8, 0),
+                "fbw":  bits(self.reg[0x4C + ctx], 21, 16),
+                "ztst": ztst,
+                "zmsk": zmsk,
+                # PSMZ24 is 24 bits inside a 32-bit word, addressed exactly as
+                # PSMZ32 is; the top byte is not part of the value, so it is
+                # neither compared nor written.
+                "mask": 0x00FFFFFF if zpsm == 1 else 0xFFFFFFFF}
+
+    def zcheck(self, zs, x, y, z):
+        """The depth test at one pixel, and the Z write that goes with it.
+
+        Returns whether the pixel survives.  The Z buffer is updated here rather
+        than by the caller because a pixel that passes updates Z even when the
+        frame buffer write is entirely masked out -- the two masks are
+        independent, and treating the Z write as a consequence of the colour
+        write is a bug waiting for the first FBMSK that matters.
+        """
+        if zs is None:
+            return True
+        if zs["ztst"] == 0:                         # NEVER: nothing survives
+            return False
+        a = addr32p(zs["zbp"], zs["fbw"], x, y)
+        if a >= VM_WORDS:
+            return False
+        m = zs["mask"]
+        if zs["ztst"] == 1:                         # ALWAYS: no read needed
+            ok = True
+        else:
+            old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little") & m
+            ok = (z & m) >= old if zs["ztst"] == 2 else (z & m) > old
+        if ok and zs["zmsk"] == 0:
+            prev = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
+            v = (prev & ~m & 0xFFFFFFFF) | (z & m)
+            self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
+        return ok
+
     # -- primitives ---------------------------------------------------------
     def ctx(self):
         """0 or 1: which of the two register contexts this primitive uses."""
@@ -354,6 +443,15 @@ class GS:
         # the whole triangle and the per-scanline seed is the plane evaluated at
         # the span's first pixel; only the walk along x is blocked and snapped,
         # which is where the measurements put the departure from exactness.
+        # Depth.  A triangle interpolates it on the same blocked, grid-snapped
+        # DDA the colour channels use, with the bias above on top.
+        zs = self.zsetup(c)
+        zgrad = None
+        if zs is not None:
+            zgrad = _plane(P, [Fraction(v[2] & 0xFFFFFFFF) for v in (v0, v1, v2)])
+            if zgrad is None:
+                return
+
         iip = bits(self.reg[0x00], 3, 3)
         grad = None
         if iip:
@@ -378,6 +476,14 @@ class GS:
                 continue
             left  = max(_ceil(min(xs)), sx0)
             right = min(_ceil(max(xs)) - 1, sx1)
+            zwalk = None
+            if zs is not None:
+                dzdx, dzdy = zgrad
+                zseed = (Fraction(v0[2] & 0xFFFFFFFF)
+                         + dzdx * (Fraction(left) - P[0][0])
+                         + dzdy * (y - P[0][1]))
+                zwalk = _Walk(zseed, dzdx, _zbias(yy - ytop, dzdy))
+
             walk = None
             if iip:
                 walk = []
@@ -392,6 +498,11 @@ class GS:
                 a = addr32p(fbp, fbw, xx, yy)
                 if a >= VM_WORDS:
                     continue
+                if zwalk is not None:
+                    zv = _floor(zwalk.at(xx - left))
+                    zv = 0 if zv < 0 else min(zv, 0xFFFFFFFF)
+                    if not self.zcheck(zs, xx, yy, zv):
+                        continue
                 if iip:
                     src = 0
                     for n in range(4):
@@ -408,10 +519,13 @@ class GS:
     def draw_sprite(self, v0, v1):
         """A flat-coloured, axis-aligned rectangle in PSMCT32.
 
-        No Z test, no alpha blending, no texture and no dither: those are later
-        blocks, and drawing them wrong now would be worse than not drawing them.
-        The colour is the one attached to the *second* vertex, which is what the
-        manual specifies for a sprite.
+        The colour is the one attached to the *second* vertex, which is what
+        the manual specifies for a sprite -- and so is the depth, which a sprite
+        carries as a plain integer and never interpolates.  That agrees with
+        what the console probes found: sprites are the one primitive where
+        depth has no DDA behind it at all.
+
+        No texture and no dither: those are later blocks.
         """
         c = self.ctx()
         frame  = self.reg[0x4C + c]
@@ -445,10 +559,14 @@ class GS:
         x1, y1 = min(x1 - 1, sx1), min(y1 - 1, sy1)
 
         rgba = v1[3] & 0xFFFFFFFF
+        z    = v1[2] & 0xFFFFFFFF
+        zs   = self.zsetup(c)
         for y in range(y0, y1 + 1):
             for x in range(x0, x1 + 1):
                 a = addr32p(fbp, fbw, x, y)
                 if a >= VM_WORDS:
+                    continue
+                if not self.zcheck(zs, x, y, z):
                     continue
                 old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
                 px = self.blend(rgba, old, c)
