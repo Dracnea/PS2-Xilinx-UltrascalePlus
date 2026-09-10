@@ -443,14 +443,26 @@ With that fixed, **166,704 of `SLUS_212.40`'s 166,708 bytes read back
 byte-identical to the disc**, across about 82 sectors of sequential reads that
 CDVDMAN issues itself against LBA 2,265,116 onwards.
 
-> **NOTE (unverified): the last four bytes.** The final chunk is 2868 bytes =
-> 717 words, and SIF DMA moves quadwords, so 716 words go by DMA and the odd word
-> is left over. `_fio_read_arg` carries a `read_data` pointer precisely for such
-> head and tail fragments, and this harness discards that transfer, so the
-> arithmetic explains the shortfall exactly — but it was not confirmed by reading
-> the fragment struct and finding those four bytes in it.
-> *Verify by:* capturing the transfer aimed at the fragment struct on a short
-> final read and comparing its contents with the file's tail.
+**The last four bytes are in the read's fragment struct**, confirmed rather than
+inferred. A deliberately unaligned 20-byte read splits three ways:
+
+```
+-> 0x00ac0000  data buffer      4 words  7f454c46 01010100 00000000 00000000
+-> 0x00abc400  fragment struct 12 words  ...02000800...
+-> 0x00abc300  return value     1 word   14000000   = 20
+```
+
+The 16 aligned bytes go by DMA, the odd word rides in the struct
+`_fio_read_arg.read_data` points at, and the struct says where it belongs:
+word 1 is the byte count (4), word 3 is `0x00ac0010` — the data buffer plus 16 —
+and word 8 holds the bytes. A real EE copies them into place; this harness
+discards that transfer, which is the whole of the four-byte shortfall.
+166,704 by DMA plus 4 in the fragment is 166,708, the file's exact length.
+
+The return value also arrives properly (`0x14` = 20). The earlier "no return
+value" was this harness trusting the EE tag's `qwc`, which rounds a one-word
+transfer up to a quadword and left it waiting for three words that are never
+sent.
 
 Throughput was 4 KiB/s, which is the host draining the stream one 32-bit CSR
 read at a time over PCIe, not anything about the card.
