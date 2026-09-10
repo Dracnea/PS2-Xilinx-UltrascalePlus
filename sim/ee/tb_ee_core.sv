@@ -118,7 +118,7 @@ module tb_ee_core;
 
    // ---- run and report -----------------------------------------------------
    string  progfile;   // 'program' is a SystemVerilog keyword
-   integer steps, n, r, budget;
+   integer steps, n, r, budget, cycles;
    logic [63:0] regs [1:31];
 
    initial begin
@@ -144,6 +144,7 @@ module tb_ee_core;
       // access several more, so 200 cycles per instruction cannot be reached
       // by a core that is merely slow.
       budget = steps * 200 + 1000;
+      cycles = 0;
       while (n < steps && budget > 0) begin
          // Sample a short way past the edge, not on it: retire and retire_pc
          // are driven by the same edge that would be read here, and reading
@@ -153,6 +154,7 @@ module tb_ee_core;
          @(posedge clk);
          #0.1;
          budget = budget - 1;
+         cycles = cycles + 1;
          if (retire) begin
             // dbg_gpr is combinational from dbg_sel, so all 31 can be read
             // between edges; 31 x 0.1ns stays well inside a 10ns period.
@@ -168,6 +170,12 @@ module tb_ee_core;
       end
       if (budget <= 0)
          $display("# STALLED after %0d of %0d instructions", n, steps);
+      // Cycles per instruction, so a timing change that only bought its clock
+      // back by inserting stalls shows up as such.  Fmax alone is the wrong
+      // figure of merit for a pipeline; Fmax divided by CPI is the right one.
+      // The line starts with '#' so it stays out of the diffed trace.
+      $display("# cycles: %0d for %0d instructions (CPI %0d.%02d)",
+               cycles, n, cycles / n, (cycles * 100 / n) % 100);
       // The same region the reference dumps: a store to the wrong address is
       // invisible in the registers until something loads it back.
       for (n = 'h2000; n < 'h2400; n = n + 8)

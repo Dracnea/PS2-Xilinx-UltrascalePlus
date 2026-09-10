@@ -208,21 +208,24 @@ change to the datapath.
 | Combinational divide and multiply | 24.2 MHz | 10,314 | `gpr` → `hi`, 200 levels, 155 CARRY8 — the divider |
 | 32-cycle iterative divider | 126.2 MHz | 6,059 | `gpr` → `gpr`, unregistered DSP48E2 cascade — the multiplier |
 | Pipelined multiplier | 185.9 MHz | 6,043 | `instr` → `gpr`, 12 levels, 64% routing — decode, regfile and writeback in one cycle |
-| Five-stage pipeline | 212.0 MHz | 6,859 | `w_rd` → forwarding mux → 64-bit branch compare → `fetch_pc` adder |
-| …the same, floorplanned | **226.3 MHz** | 6,859 | as above |
+| Five-stage pipeline, one EX | 212.0 MHz | 6,859 | `w_rd` → forwarding mux → 64-bit branch compare → `fetch_pc` adder |
+| Execution split into A1/A2 | **242.8 MHz** | 7,081 | `m_rd` → forwarding mux → 64-bit ALU → result register |
 
-Target is 294.912 MHz. The core is 9.4x faster than the first measurement and
-needs 1.3x more.
+Target is 294.912 MHz. The core is 10x faster than the first measurement and
+needs 1.21x more.
 
-**The unconstrained number understates the core by about 7%.** Half the critical
-path was routing, which is the signature of a small module placed loose on a
-very large die: at 0.8% utilisation the placer has no reason to keep anything
-together, and the core pays wire delay it would never pay inside a real design.
-Confining it to two clock regions with a pblock (`fit/ee/fmax_pblock.tcl`) moved
-it from 212.0 to 226.3 MHz with no RTL change at all. Both numbers are kept
-above because the unconstrained one is the comparable series, but 226.3 MHz is
-the honest figure for the core as it stands, and future measurements should
-carry the floorplan.
+**A note on how much these numbers can be trusted.** The core occupies 0.8% of
+this device, and a module that small placed loose on a die this large can spread
+out and pay routing delay it would never pay inside a real design — half the
+critical path was routing, which is exactly that symptom. Confining it to two
+clock regions with a pblock (`fit/ee/fmax_pblock.tcl`) was worth +6.7% on the
+single-EX core (212.0 → 226.3 MHz) and **−4.2% on the A1/A2 core** (242.8 →
+232.5 MHz), with no RTL change either time. So the floorplan does not reliably
+help, and the first result should not have been read as "the unconstrained
+number understates by 7%" — one measurement in one direction is not a trend.
+What the pair actually establishes is that placement variance here is worth
+roughly ±5%, which is the resolution of every figure in this table. A change
+smaller than that has not been shown to do anything.
 
 ### Directed tests for the arithmetic units
 
@@ -355,15 +358,79 @@ The suite was checked against the unfixed core before being trusted: it fails
 there and passes on the fix. A test that does not catch the bug it was written
 for is worth nothing.
 
-### What the remaining 1.3x needs, and what it does not
+### Execution split into A1 and A2 — 2026-09-10
 
-Three changes were made to the pipelined core chasing the critical path, and
-they are worth recording because two of them **did not work**: moving the branch
-target and link address out of EX into ID, where they belong (213.1 MHz), and
-narrowing the program counter from 64 bits to the 32 the address bus actually
-has (212.0 MHz). Both are real improvements to the RTL — the 64-bit PC was
-doubling every PC adder in the design for nothing — and neither moved the clock
-by more than placement noise.
+`forwarding mux → 64-bit branch compare → do_flush → fetch PC adder` is three
+structures in series, and the section below records two attempts to shorten it
+that changed nothing. A chain like that is not shortened, it is cut. So
+execution is now two stages, as it is on the real R5900, whose integer pipeline
+is Q, R, **A1, A2**, S:
+
+- **A1** decides: forwarding, the ALU, the branch condition, the branch target,
+  the effective address, and the multi-cycle multiply and divide.
+- **A2** acts: the data port, and the branch redirect.
+
+That took the core from 212.0 to **242.8 MHz**, and the new critical path is
+`m_rd → forwarding mux → 64-bit ALU → result register`, which is the honest
+fundamental path of a single-cycle ALU with forwarding rather than an accident
+of where a computation was written.
+
+**It cost nothing in cycles.** Resolving the branch a stage later means one more
+instruction is killed on a taken branch, so the split ought to cost a cycle per
+taken branch — and measured, it does not: 430 cycles for 160 instructions on a
+branch-heavy program before and after, 393 on an ordinary one, and 603 for 200
+instructions on a synthetic program that is nothing but taken branches and has
+no memory operations at all. Identical in all three.
+
+The reason is worth knowing, because it says where the next IPC work is. The
+redirect cannot issue a fetch on the cycle it fires if a request is already in
+flight — and with one outstanding request the fetch unit is nearly always busy —
+so the new request goes out on the following edge either way. **The fetch unit,
+not the branch redirect, is what limits IPC**, and at CPI 2.4 to 3.0 it limits it
+by a lot. More outstanding requests and a deeper queue is a separate piece of
+work from anything to do with the clock, and the testbench now prints cycles and
+CPI on every run so that work can be measured rather than assumed. Fmax alone is
+the wrong figure of merit for a pipeline: a change that buys its clock back by
+inserting stalls is not an improvement, and only the pair of numbers shows it.
+
+#### The bug: a delay slot can be in three places
+
+Moving the redirect a stage later broke every branch-heavy seed, and the failure
+was that an instruction executed **twice**:
+
+```
+ref:  47 pc=0bc   48 pc=0c0   49 pc=0c4
+rtl:  47 pc=0bc   48 pc=0c0   49 pc=0c0   <- executed again
+```
+
+When the branch reaches A2, its delay slot can be in one of three places, and
+the first version told apart only two. It handled "already in A1" (flush, and
+kill what ID is holding) and "still in the fetch path" (defer the redirect until
+it arrives). It missed the third: **entering A1 on that very edge**. Treating
+that as "still in the fetch path" meant the deferred redirect fired on the next
+instruction to enter A1 — the one *after* the delay slot — so the redirect was
+applied an instruction too late.
+
+That is normally invisible, because the extra wrong-path instruction it lets
+through is thrown away anyway. It becomes visible when the branch target happens
+to be the next sequential address after the delay slot, which a short forward
+branch makes true: the late redirect then re-fetches an instruction already in
+the pipeline and runs it a second time. `gen_hazard.py` now emits that shape
+deliberately — taken branches at offsets 1 and 2, with and without a forwarded
+condition, plus a `JAL` to the address right after its own delay slot — and the
+suite was checked against the two-way version first: it fails there and passes
+on the fix.
+
+### What the first attempts at this needed, and what they did not
+
+Two changes were made to the pipelined core chasing the critical path before the
+split, and both are worth recording because **neither worked**: moving the
+branch target and link address out of EX into ID, where they belong
+(213.1 MHz), and narrowing the program counter from 64 bits to the 32 the
+address bus actually has (212.0 MHz). Both are real improvements to the RTL —
+the 64-bit PC was doubling every PC adder in the design for nothing — and
+neither moved the clock by more than the ±5% the measurement can resolve. They
+are kept because they are right, not because they helped.
 
 The reason is visible in the full path, which took reading cell by cell rather
 than trusting the summary line:
@@ -377,26 +444,33 @@ Three structures in series, and removing any one of them leaves the other two.
 The forwarding mux cannot move — it is what makes the pipeline correct. The
 branch comparison cannot move earlier, because it needs the forwarded operand.
 So the answer is not to shorten the chain but to **cut it with a register**,
-which means splitting EX into two stages.
+which means splitting EX into two stages — which is what the section above
+does, and it is the change that finally moved the number.
 
 That is also what the hardware being modelled does. The R5900's pipeline is
 Q, R, **A1, A2**, S — *two* execute stages, not one. A core with a single EX
-stage was never going to be cycle-accurate to it, so the split is required for
-accuracy on exactly the same schedule that timing wants it, which is the second
+stage was never going to be cycle-accurate to it, so the split was required for
+accuracy on exactly the same schedule that timing wanted it, which is the second
 time in this project that those two demands have pointed the same way.
 
 ### The delay slot and the redirect
 
-Branches resolve in EX. By then the delay slot is the queue head, so the common
-case is simple: the delay slot moves into EX on the same edge the branch leaves
-it, and everything behind it is flushed.
+The branch condition and target are decided in A1 and acted on in A2, so by the
+time the redirect fires the delay slot has moved on from the fetch queue and the
+question "where is it?" has three answers, all of which occur:
 
-The case that needs care is when the delay slot has *not* arrived — the fetch
-queue is empty because the reply is still in flight. Flushing then would discard
-the delay slot itself, which must execute. So the redirect is held in
-`redir_pend` and applied on the edge the delay slot finally enters EX. The
-`ilat=9` column of the matrix exists to make the queue run dry often enough that
-this path is taken constantly rather than occasionally.
+1. **Already in A1** — the normal case. It entered A1 on the edge the branch
+   left. Flush the queue and kill what ID is holding, since that is wrong-path.
+2. **Entering A1 on this very edge** — flush behind it, but let it through.
+   Treating this as case 3 is what caused the duplicate-execution bug above.
+3. **Still in the fetch path** — the queue ran dry and the reply is in flight.
+   Flushing now would discard the delay slot itself, so the redirect is held in
+   `redir_pend` and applied on the edge it finally enters A1.
+
+The `ilat=9` column of the matrix exists to make the queue run dry often enough
+that case 3 is taken constantly rather than occasionally. Case 2 needs no such
+help — it is the common case at `ilat=1`, which is why every branch-heavy seed
+failed at once when it was missing.
 
 ## What is not started
 
@@ -404,8 +478,11 @@ Hazards and pipelining — the core is still one instruction at a time. MMI, the
 FPU, the VUs. And the integer subset itself is not complete: no COP0, no
 exceptions, no unaligned loads or stores, no `LQ`/`SQ`.
 
-Timing is not closed either: 185.9 MHz against a 294.912 MHz target. The
-measured critical path is now decode-to-writeback rather than any arithmetic
-unit, so that gap closes with pipelining — which the R5900's six-stage
-dual-issue design requires for accuracy anyway. The section above says why this
-is a constraint rather than a wall.
+Timing is not closed: 242.8 MHz against a 294.912 MHz target, a factor of 1.21.
+The critical path is now `forwarding mux → 64-bit ALU → result register`, which
+is the fundamental path of a single-cycle ALU and closes by splitting the ALU
+itself across A1 and A2 rather than by moving anything else around.
+
+IPC is not closed either, and is the larger of the two problems: CPI sits
+between 2.4 and 3.0 because the fetch unit allows one outstanding request. That
+is independent of the clock and is measured on every run now.

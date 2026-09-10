@@ -5,9 +5,19 @@
 --
 --   IF   a two-entry fetch queue with one request outstanding
 --   ID   decode and register read
---   EX   ALU, branch resolution, and the multi-cycle multiply and divide
---   MEM  the data port
+--   A1   forwarding, the ALU, the branch condition, the effective address,
+--        and the multi-cycle multiply and divide
+--   A2   the data port, and the branch redirect
 --   WB   the register file, HI and LO
+--
+-- Execution is split across two stages, as it is on the real R5900, whose
+-- integer pipeline is Q, R, A1, A2, S.  Here the split is where the work
+-- genuinely did not fit in one cycle: A1 decides *whether* a branch is taken
+-- and *where* it goes, A2 acts on that decision.  Leaving both in one stage put
+-- the operand-forwarding mux, a 64-bit comparison and the fetch-PC adder in
+-- series -- three structures deep, and shortening any one of them left the
+-- other two.  A register through the middle is the only thing that cuts a chain
+-- like that, and it costs one more killed instruction on a taken branch.
 --
 -- The first version of this core was not pipelined -- one instruction at a
 -- time through a four-state machine -- because a hazard is easier to add to
@@ -36,7 +46,7 @@
 -- Two rules govern where architectural state is written, and both exist so the
 -- differential trace stays meaningful:
 --
---   * **Nothing commits before WB.**  HI and LO are computed in EX but carried
+--   * **Nothing commits before WB.**  HI and LO are computed in A1 but carried
 --     down the pipeline and written in WB with the register file, because the
 --     testbench samples all architectural state at each retire and an early
 --     write would make an instruction's result visible while an *older* one is
@@ -121,7 +131,7 @@ architecture arch of ee_core is
    signal q_ir  : q_ir_t := (others => (others => '0'));
    signal q_cnt : integer range 0 to 2 := 0;
 
-   -- ---- ID/EX --------------------------------------------------------------
+   -- ---- ID/A1 --------------------------------------------------------------
    signal d_valid   : std_logic := '0';
    signal d_pc      : unsigned(31 downto 0) := (others => '0');
    signal d_ir      : std_logic_vector(31 downto 0) := (others => '0');
@@ -130,14 +140,14 @@ architecture arch of ee_core is
    signal d_rt      : integer range 0 to 31 := 0;
    -- The branch target and the link address are computed in ID, not EX.  Both
    -- depend only on the PC and the instruction word, which ID already has, and
-   -- leaving them in EX put two chained 64-bit adders between the ID/EX latch
+   -- leaving them in A1 put two chained 64-bit adders between the ID/A1 latch
    -- and the fetch PC -- 11 of the 20 logic levels on the critical path, for
    -- arithmetic that had no reason to be there.  EX now only decides whether
    -- the branch is taken and, for JR and JALR, substitutes the register.
    signal d_tgt     : unsigned(31 downto 0) := (others => '0');
    signal d_link    : std_logic_vector(63 downto 0) := (others => '0');
 
-   -- ---- EX/MEM -------------------------------------------------------------
+   -- ---- A1/A2 -------------------------------------------------------------
    signal m_valid   : std_logic := '0';
    signal m_pc      : unsigned(31 downto 0) := (others => '0');
    signal m_we      : std_logic := '0';
@@ -147,13 +157,16 @@ architecture arch of ee_core is
    signal m_lo_we   : std_logic := '0';
    signal m_hi      : std_logic_vector(63 downto 0) := (others => '0');
    signal m_lo      : std_logic_vector(63 downto 0) := (others => '0');
+   -- the branch decision, made in A1 and acted on in A2
+   signal m_take    : std_logic := '0';
+   signal m_tgt     : unsigned(31 downto 0) := (others => '0');
    signal m_ismem   : std_logic := '0';
    signal m_isload  : std_logic := '0';
    signal m_width   : integer range 1 to 8 := 4;
    signal m_sign    : std_logic := '0';
    signal m_shift   : integer range 0 to 7 := 0;
 
-   -- ---- MEM/WB -------------------------------------------------------------
+   -- ---- A2/WB -------------------------------------------------------------
    signal w_valid   : std_logic := '0';
    signal w_pc      : unsigned(31 downto 0) := (others => '0');
    signal w_we      : std_logic := '0';
@@ -164,11 +177,11 @@ architecture arch of ee_core is
    signal w_hi      : std_logic_vector(63 downto 0) := (others => '0');
    signal w_lo      : std_logic_vector(63 downto 0) := (others => '0');
 
-   -- ---- the multi-cycle units, which live in EX ----------------------------
-   -- ex_cnt is the number of cycles the instruction in EX still needs.  It is
+   -- ---- the multi-cycle units, which live in A1 ----------------------------
+   -- ex_cnt is the number of cycles the instruction in A1 still needs.  It is
    -- 0 for a single-cycle instruction and for the first cycle of a multi-cycle
    -- one; 1 means "the result is on the wires now", which is the only value at
-   -- which EX is allowed to advance.
+   -- which A1 is allowed to advance.
    signal ex_cnt   : integer range 0 to 33 := 0;
 
    signal div_rem  : unsigned(32 downto 0) := (others => '0');
@@ -277,7 +290,8 @@ begin
       variable div_shift              : unsigned(32 downto 0);
 
       -- stage handshakes
-      variable mem_adv, ex_adv, id_adv : boolean;
+      variable a2_adv, a1_adv, id_adv  : boolean;
+      variable kill_id                 : boolean;
       variable load_use                : boolean;
 
       -- ID
@@ -318,6 +332,7 @@ begin
             d_valid    <= '0';
             m_valid    <= '0';
             m_ismem    <= '0';
+            m_take     <= '0';
             w_valid    <= '0';
             ex_cnt     <= 0;
             d_read     <= '0';
@@ -325,15 +340,15 @@ begin
          else
 
             -- ============================================================
-            -- MEM: can the instruction in the MEM latch leave this cycle?
+            -- A2: can the instruction in the A1/A2 latch leave this cycle?
             -- ============================================================
-            mem_adv := true;
+            a2_adv := true;
             if m_valid = '1' and m_ismem = '1' and d_ready = '0' then
-               mem_adv := false;
+               a2_adv := false;
             end if;
 
             -- ============================================================
-            -- EX: decode the instruction in the ID/EX latch and compute
+            -- A1: decode the instruction in the ID/A1 latch and compute
             -- ============================================================
             op   := to_integer(unsigned(d_ir(31 downto 26)));
             rs   := to_integer(unsigned(d_ir(25 downto 21)));
@@ -346,9 +361,10 @@ begin
 
             -- Operand forwarding.  ID already bypassed the instruction in WB
             -- as it read the register file, so what is left is the two closer
-            -- ones: MEM first as the older, then EX/MEM last so the youngest
-            -- writer wins.  A load in MEM has no value yet, which is what the
-            -- load-use interlock below exists to prevent needing.
+            -- ones: the A2/WB latch first as the older, then the A1/A2 latch
+            -- so the younger writer wins.  A load sitting in A2 has no value
+            -- yet, which is what the load-use interlock below exists to
+            -- prevent ever needing.
             a := d_a;
             b := d_b;
             if w_valid = '1' and w_we = '1' and w_rd /= 0 then
@@ -360,7 +376,7 @@ begin
                if m_rd = d_rt then b := m_val; end if;
             end if;
 
-            -- HI and LO are read in EX and written in WB, so they need the
+            -- HI and LO are read in A1 and written in WB, so they need the
             -- same two forwarding steps and the same priority.
             hi_f := hi;
             lo_f := lo;
@@ -574,7 +590,7 @@ begin
             if d_valid = '1' and is_muldiv(d_ir) and ex_cnt /= 1 then
                ex_busy := true;
             end if;
-            ex_adv := mem_adv and not ex_busy;
+            a1_adv := a2_adv and not ex_busy;
 
             -- ============================================================
             -- ID: decode, read the register file, check for a load-use stall
@@ -600,10 +616,10 @@ begin
                if w_rd = id_rt then id_b := w_val; end if;
             end if;
 
-            -- The one hazard forwarding cannot cover: a load in EX moves to
-            -- MEM as this instruction would move to EX, and its value does not
-            -- exist until MEM answers.  One bubble puts the load in WB instead,
-            -- where EX can forward from it.
+            -- The one hazard forwarding cannot cover: a load in A1 moves to
+            -- A2 as this instruction would move to A1, and its value does not
+            -- exist until the port answers.  One bubble puts the load in WB
+            -- instead, where A1 can forward from it.
             load_use := false;
             if d_valid = '1' and is_load(d_ir) and rt /= 0 and q_cnt > 0 then
                if (reads_rs(id_ir) and id_rs = rt) or
@@ -612,7 +628,7 @@ begin
                end if;
             end if;
 
-            id_adv := ex_adv and q_cnt > 0 and not load_use;
+            id_adv := a1_adv and q_cnt > 0 and not load_use;
 
             -- ============================================================
             -- WB: commit.  Everything architectural is written here.
@@ -628,9 +644,9 @@ begin
             end if;
 
             -- ============================================================
-            -- MEM -> WB
+            -- A2 -> WB
             -- ============================================================
-            if mem_adv then
+            if a2_adv then
                w_valid  <= m_valid;
                w_pc     <= m_pc;
                w_we     <= m_we;
@@ -680,10 +696,10 @@ begin
             end if;
 
             -- ============================================================
-            -- EX -> MEM
+            -- A1 -> A2
             -- ============================================================
-            if mem_adv then
-               if ex_adv then
+            if a2_adv then
+               if a1_adv then
                   m_valid  <= d_valid;
                   m_pc     <= d_pc;
                   m_we     <= ex_we;
@@ -694,6 +710,12 @@ begin
                   m_hi     <= ex_hi;
                   m_lo     <= ex_lo;
                   m_ismem  <= ex_ismem and d_valid;
+                  if ex_take and d_valid = '1' then
+                     m_take <= '1';
+                  else
+                     m_take <= '0';
+                  end if;
+                  m_tgt    <= tgt;
                   m_isload <= ex_isload;
                   m_width  <= ex_width;
                   m_sign   <= ex_sign;
@@ -717,13 +739,14 @@ begin
                   m_we    <= '0';
                   m_hi_we <= '0';
                   m_lo_we <= '0';
+                  m_take  <= '0';
                end if;
             end if;
 
             -- ============================================================
-            -- the multi-cycle units, stepped only when EX may make progress
+            -- the multi-cycle units, stepped only when A1 may make progress
             -- ============================================================
-            if mem_adv and d_valid = '1' and is_muldiv(d_ir) then
+            if a2_adv and d_valid = '1' and is_muldiv(d_ir) then
                if ex_cnt = 0 then
                   -- kick off
                   if fn = 24 or fn = 25 then
@@ -788,31 +811,54 @@ begin
             end if;
 
             -- ============================================================
-            -- ID -> EX, and the branch redirect
+            -- ID -> A1, and the branch redirect (acted on in A2)
             -- ============================================================
             do_flush := false;
+            kill_id  := false;
             new_pc   := (others => '0');
-            if ex_adv and d_valid = '1' and ex_take then
-               -- The delay slot is the queue head right now.  If it is moving
-               -- into EX on this edge it is safe to throw away everything
-               -- behind it; if it is not (the queue is empty because the fetch
-               -- has not come back yet) the redirect has to wait, or the flush
-               -- would discard the delay slot itself.
-               if id_adv then
+            if a2_adv and m_valid = '1' and m_take = '1' then
+               -- The branch is leaving A2.  Whatever is in A1 is its delay slot
+               -- and must run; everything behind that is wrong-path and dies --
+               -- including the instruction ID is holding, which is one more
+               -- than the old single-stage redirect had to kill.
+               -- The delay slot can be in one of three places when the
+               -- branch reaches A2, and all three have to be told apart.
+               if d_valid = '1' then
+                  -- Already in A1.  Whatever ID is holding is wrong-path.
                   do_flush := true;
-                  new_pc   := tgt;
+                  kill_id  := true;
+                  new_pc   := m_tgt;
+               elsif id_adv then
+                  -- Entering A1 on this very edge.  Flush everything behind it
+                  -- but let it through -- killing it here, or deferring as if
+                  -- it had not arrived, both go wrong.  Deferring is the
+                  -- subtler of the two: redir_pend would then fire on the
+                  -- *next* instruction to enter A1, which is the one after the
+                  -- delay slot, and the redirect would be applied an
+                  -- instruction too late.  When the branch target happens to be
+                  -- the next sequential address -- which a short forward branch
+                  -- often makes true -- that late redirect re-fetches an
+                  -- instruction already in the pipeline and executes it twice.
+                  do_flush := true;
+                  new_pc   := m_tgt;
                else
+                  -- Still in the fetch path: the queue ran dry and the reply is
+                  -- in flight.  Flushing now would discard the delay slot
+                  -- itself, so the redirect waits for it.
                   redir_pend <= '1';
-                  redir_tgt  <= tgt;
+                  redir_tgt  <= m_tgt;
                end if;
             elsif redir_pend = '1' and id_adv then
+               -- The delay slot has reached A1 at last.  It is the instruction
+               -- entering A1 on this edge, so it is *not* killed -- only the
+               -- queue behind it is.
                do_flush   := true;
                new_pc     := redir_tgt;
                redir_pend <= '0';
             end if;
 
-            if ex_adv then
-               if id_adv then
+            if a1_adv then
+               if id_adv and not kill_id then
                   d_valid <= '1';
                   d_pc    <= q_pc(0);
                   d_ir    <= id_ir;
@@ -826,18 +872,18 @@ begin
                   d_valid <= '0';
                end if;
             else
-               -- EX is held up, so capture the operands forwarding just
+               -- A1 is held up, so capture the operands forwarding just
                -- produced.  Forwarding is recomputed every cycle from whatever
-               -- is in MEM and WB, but only the value present on the cycle EX
+               -- is in A2 and WB, but only the value present on the cycle A1
                -- finally advances is the one that gets latched -- and by then
                -- the instruction that produced it may have retired and moved
                -- out of both stages.  The register file is no help either: ID
-               -- read it cycles ago and EX never reads it.  Writing the
-               -- forwarded value back into the ID/EX latch each stalled cycle
+               -- read it cycles ago and A1 never reads it.  Writing the
+               -- forwarded value back into the ID/A1 latch each stalled cycle
                -- is what makes a forwarded operand survive a stall of any
                -- length.
                --
-               -- Only older instructions can ever be in MEM or WB, so a
+               -- Only older instructions can ever be in A2 or WB, so a
                -- capture can only ever move an operand forward in time.
                d_a <= a;
                d_b <= b;

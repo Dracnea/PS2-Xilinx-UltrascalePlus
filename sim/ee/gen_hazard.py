@@ -142,6 +142,30 @@ def main():
     o += [ld(7, 20, 0), sw(7, 20, 0x40), sh(7, 20, 0x48),
           beq(7, 0, 2), addu(8, 7, 7), addu(9, 8, 8), addu(10, 9, 9)]
 
+    # ---- taken branches whose target is the sequential path ----------------
+    # A redirect applied one instruction too late is invisible in most
+    # programs: the wrong-path instruction it lets slip through is usually
+    # thrown away anyway.  It becomes visible when the branch target *is* the
+    # next sequential address after the delay slot, because then the late
+    # redirect re-fetches an instruction that is already in the pipeline and
+    # executes it a second time.  A short forward branch makes that true, so
+    # these emit offsets 1 and 2 with the branch always taken.
+    for off in (1, 2):
+        o += [addu(1, 21, 0), beq(1, 1, off)]      # always taken
+        o += [addu(2, 1, 1)]                       # delay slot
+        o += [addu(3, 2, 2)] * off                 # skipped when off > 0
+        o += [addu(4, 3, 3), addu(5, 4, 4)]
+    # the same with the condition forwarded from the instruction just before,
+    # so the branch resolves late as well as landing close
+    for off in (1, 2):
+        o += [ld(6, 20, 0), beq(6, 0, off)]
+        o += [addu(7, 6, 6)]
+        o += [addu(8, 7, 7)] * off
+        o += [addu(9, 8, 8)]
+    # and an unconditional jump to the address right after its own delay slot
+    here = len(o)
+    o += [jal(here + 3), addu(10, 21, 0), addu(11, 10, 10), addu(12, 11, 11)]
+
     # ---- JR through a register just computed -------------------------------
     here = len(o)
     o += [lui(2, 0), ori(2, 2, (here + 4) * 4), jr(2), addu(20 if False else 25, 21, 22)]
