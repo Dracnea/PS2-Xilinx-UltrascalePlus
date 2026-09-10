@@ -496,16 +496,101 @@ first things to ask of a real console if one becomes available:
 Sources: ARMSX2's `GSBlockWalk.h` and `GSDepthWalk.h` (GPL-3; read, not copied),
 and paraLLEl-GS for the independent confirmation of the sampling convention.
 
+## Gouraud, built to the measured rule — 2026-09-10
+
+`PRIM.IIP` now interpolates all four channels across a triangle, in the
+reference (`sim/gs/gs_ref.py`) and in the RTL (`rtl/gs/gs_chan_dda.vhd`)
+together, because a reference-only change has nothing to be diffed against.
+
+It implements the **blocked truncating DDA** the section above arrived at rather
+than the exact plane, and the arithmetic falls out more cleanly than expected.
+Working in window space with X and Y in 12.4, the plane through the three
+vertices has
+
+```
+det = dx10*dy20 - dx20*dy10
+nx  = (c1-c0)*dy20 - (c2-c0)*dy10
+ny  = (c2-c0)*dx10 - (c1-c0)*dx20
+```
+
+and, scaled so that every quantity is an integer count of 2⁻¹⁰,
+
+```
+gradient  = floor(16 * 1024 * nx / det)
+seed(x,y) = floor(1024 * (c0*det + nx*(16x - X0) + ny*(16y - Y0)) / det)
+```
+
+The sixteens are the 12.4 fraction cancelling — `det` carries it twice and `nx`
+once — and deriving them rather than fitting them is the only reason the model
+and the RTL agreed at the first attempt on everything except one timing bug.
+
+The eight lane offsets are **not** eight divisions. With
+`16384*nx = q*det + r` and `0 ≤ r < det`,
+
+```
+floor(j * 16384 * nx / det) = j*q + floor(j*r / det)
+```
+
+and because `r < det` that correction is at most `j-1`, so all eight lanes and
+the block step fall out of eight accumulate-and-subtract cycles behind the one
+division that is actually needed. Per triangle that is one division per channel;
+per scanline it is one more per channel for the seed, and the four channels have
+their own dividers so a scanline costs one division's worth of latency rather
+than four. **No per-pixel division at all** — which is the practical payoff of
+hardware's grid being coarse.
+
+### The seed is snapped too, and that is a choice
+
+Everything above lives on the 2⁻¹⁰ grid, the seed included. That is a modelling
+decision and not a measurement: the probes that established the grid used flat
+triangles to isolate the seed, and a flat triangle's seed is an integer, so
+nothing in the evidence distinguishes a snapped seed from an exact one. It is
+chosen because it puts the whole DDA on one grid — which is what the register
+holding it would be in silicon — and because it lets the RTL agree with the
+model bit for bit in integer arithmetic instead of chasing an exact rational
+through a divider. If a console ever contradicts it, this is the line to change.
+
+### The bug worth keeping
+
+The interpolators first stepped on a **registered** pulse, raised on the cycle a
+pixel was written. That lands the step on the edge that produces the *next*
+pixel's address, so the next pixel is written with the previous lane's value:
+every span repeated its first pixel and ran one behind for the rest of the
+scanline. What makes it worth recording is how it presented — a picture that is
+still a smooth gradient, still the right shape, still the right colours at the
+vertices, and shifted by one pixel. That reads as a half-pixel sampling
+convention, which is a thing this rasteriser has genuinely had wrong before, and
+the temptation was to go back and re-examine the fill rule. It was a pipeline
+mistake. The advance is now combinational, on the same edge as the address.
+
+It was found in two minutes rather than an afternoon only because the directed
+test compared a whole scanline against a hand-computed plane, so the first
+correct pixel followed by a repeat was visible directly.
+
+### What it is checked against
+
+- A directed Gouraud triangle with primary-coloured vertices, whole framebuffer
+  compared, 643 lines identical.
+- The random GIF streams, which now emit `IIP` on about half of their triangles
+  and rewrite `RGBAQ` ahead of every vertex when they do.
+- The model's own arithmetic against exactness: a gradient of ¼ is the identity
+  under 2⁻¹⁰ truncation and reproduces the exact plane, and every other gradient
+  diverges from it at pixel 9 — the second block. That signature is what the
+  console's probes measured, so seeing the model produce it is a check that the
+  rule was implemented and not merely described.
+
 ### What the rasteriser does not do yet
 
-No Gouraud interpolation — flat shading only, the colour of the last vertex. No
-Z test or Z buffer, no texture, no dither, and no 16-bit formats.
+No Z test or Z buffer, no texture, no dither, and no 16-bit formats.
 
-Gouraud and Z are the same problem twice: both need a value interpolated across
-the primitive, and the interpolation rule has to be established the way the fill
-rule was — from the hardware, not from a plausible-looking gradient. The edge
-unit generalises to carry them, since a colour or a Z steps along an edge
-exactly as x does.
+Z is the same machinery as Gouraud with an extra wrinkle: the depth bias, which
+runs half a grid step short of the plane and carries differently along the two
+axes — present from the span's first pixel along X and sign-independent,
+accumulating and sign-following along Y with the primitive's first scanline
+exempt. `gs_chan_dda` is one channel of a plane interpolator and Z is another,
+so the unit generalises; what does not yet exist is the Z buffer itself, the
+`ZBUF` register, the depth test modes and the second address generator, and
+those are the actual work.
 
 Dither is small but needs a 16-bit pixel format to act on, so the formats come
 first. Texture is the largest remaining block by a wide margin — `TEX0`, `TEX1`,

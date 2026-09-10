@@ -78,7 +78,8 @@ architecture arch of gs_gif is
 
    type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
                     S_DRAW, S_DRAWRD,
-                    S_TRI_SET, S_TRI_WAIT, S_TRI_SCAN, S_TRI_STEP);
+                    S_TRI_SET, S_TRI_WAIT, S_TRI_SCAN, S_TRI_STEP,
+                    S_TRI_SEED);
    signal state : state_t := S_TAG;
 
    -- the tag in flight
@@ -111,6 +112,12 @@ architecture arch of gs_gif is
    -- the anchor is captured on the first vertex after PRIM.
    signal v2_x, v2_y : unsigned(15 downto 0) := (others => '0');
    signal vf_x, vf_y : unsigned(15 downto 0) := (others => '0');
+   -- RGBAQ is written *before* the vertex it belongs to, so the colour in
+   -- flight at each vertex write is that vertex's own, and it shifts down
+   -- beside the coordinates.  Gouraud is the only thing that needs it; flat
+   -- shading takes the last vertex's colour, which is simply the current one.
+   signal v0_c, v1_c, v2_c : std_logic_vector(31 downto 0) := (others => '0');
+   signal vf_c             : std_logic_vector(31 downto 0) := (others => '0');
    -- '1' while a triangle is being walked; sprites leave it clear
    signal tri_mode : std_logic := '0';
 
@@ -131,6 +138,8 @@ architecture arch of gs_gif is
    signal e_x     : sv13_a;
    signal e_yst, e_yen : sv13_a := (others => (others => '0'));
    signal t_x, t_y : sv16_a := (others => (others => '0'));
+   type sv32_a is array (0 to 2) of std_logic_vector(31 downto 0);
+   signal t_c : sv32_a := (others => (others => '0'));
    signal dr_x, dr_y : unsigned(10 downto 0) := (others => '0');
    signal dr_x0      : unsigned(10 downto 0) := (others => '0');
    signal dr_x1      : unsigned(10 downto 0) := (others => '0');
@@ -145,8 +154,26 @@ architecture arch of gs_gif is
    signal dr_fix     : unsigned(7 downto 0) := (others => '0');
    signal dr_clamp   : std_logic := '0';
    signal dr_empty   : std_logic := '0';
+   signal dr_iip     : std_logic := '0';
    signal dr_ret     : state_t := S_TAG;
    signal dr_addr    : unsigned(19 downto 0) := (others => '0');
+
+   -- Gouraud.  Four gs_chan_dda, one per channel, so a scanline's four seed
+   -- divisions happen together rather than one after another: the divider is a
+   -- few hundred LUTs and a scanline costs sixty-four cycles of setup either
+   -- way, which is the difference between one of those and four.
+   type u8_a is array (0 to 3) of unsigned(7 downto 0);
+   signal c_start, c_sstart        : std_logic := '0';
+   signal c_adv                    : std_logic;
+   signal c_busy, c_sbusy          : std_logic_vector(3 downto 0);
+   signal c_det   : signed(47 downto 0) := (others => '0');
+   signal c_sgn   : std_logic := '0';
+   signal c_dx10, c_dx20, c_dy10, c_dy20 : signed(19 downto 0) := (others => '0');
+   signal c_sx, c_sy : signed(12 downto 0) := (others => '0');
+   signal c_val   : u8_a;
+   -- what the pixel back end actually writes: the interpolated colour while a
+   -- Gouraud triangle is being walked, the latched flat colour otherwise
+   signal src_rgba : std_logic_vector(31 downto 0);
 
    -- pixels waiting to be written, one per clock
    signal px_data  : std_logic_vector(127 downto 0) := (others => '0');
@@ -254,6 +281,42 @@ begin
                    x => e_x(k));
    end generate;
 
+   chans : for n in 0 to 3 generate
+      u : entity work.gs_chan_dda
+         port map (clk => clk, reset => reset,
+                   start => c_start, det => c_det, sgn => c_sgn,
+                   dx10 => c_dx10, dx20 => c_dx20,
+                   dy10 => c_dy10, dy20 => c_dy20,
+                   x0 => t_x(0), y0 => t_y(0),
+                   c0 => unsigned(t_c(0)(8 * n + 7 downto 8 * n)),
+                   c1 => unsigned(t_c(1)(8 * n + 7 downto 8 * n)),
+                   c2 => unsigned(t_c(2)(8 * n + 7 downto 8 * n)),
+                   busy => c_busy(n),
+                   sstart => c_sstart, sx => c_sx, sy => c_sy,
+                   sbusy => c_sbusy(n),
+                   adv => c_adv, val => c_val(n));
+   end generate;
+
+   src_rgba <= (std_logic_vector(c_val(3)) & std_logic_vector(c_val(2))
+                & std_logic_vector(c_val(1)) & std_logic_vector(c_val(0)))
+               when dr_iip = '1' and tri_mode = '1' else dr_rgba;
+
+   -- The interpolators step on the same edge as the pixel address, which means
+   -- combinationally on the cycle a pixel is committed rather than as a
+   -- registered pulse.  A registered one lands on the edge that produces the
+   -- *next* address, so the value the next pixel is written with is still the
+   -- previous lane's: every span then repeats its first pixel and runs one
+   -- behind for the rest of the scanline, a fault that looks like a half-pixel
+   -- sampling error rather than like a pipeline mistake.  Mirroring the two
+   -- places a span pixel commits is the price of putting the step on the right
+   -- edge.  Stepping past the end of a span costs nothing, because the next
+   -- scanline re-seeds the walk from its own first pixel.
+   c_adv <= '1' when dr_iip = '1' and tri_mode = '1'
+                     and ((state = S_DRAW and dr_empty = '0' and dr_y <= dr_y1
+                           and dr_fbmsk = x"00000000" and dr_abe = '0')
+                          or (state = S_DRAWRD and rd_valid = '1'))
+            else '0';
+
    -- Combinational, because valid/ready only means anything if both sides agree
    -- on which edge the transfer happened.  A registered ready lags the state it
    -- describes by a cycle, and the producer then advances on an edge where
@@ -263,6 +326,7 @@ begin
                 '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
                          or state = S_TRI_SET or state = S_TRI_WAIT
                          or state = S_TRI_SCAN or state = S_TRI_STEP
+                         or state = S_TRI_SEED
                 else '1';
 
    dbg_reg     <= reg(to_integer(dbg_sel));
@@ -290,6 +354,8 @@ begin
       variable ylo, yhi, tya, tyb          : integer range -65536 to 65535;
       variable lft, rgt                    : integer range -4096 to 4095;
       variable ka, kb                      : integer range 0 to 2;
+      variable d10x, d20x, d10y, d20y      : signed(19 downto 0);
+      variable vdet                        : signed(47 downto 0);
    begin
       if rising_edge(clk) then
          wr_en     <= '0';
@@ -415,13 +481,15 @@ begin
                               v_cnt <= (others => '0');   -- PRIM restarts it
                            elsif w_addr = 4 or w_addr = 5
                                  or w_addr = 16#0C# or w_addr = 16#0D# then
-                              v0_x <= v1_x;  v0_y <= v1_y;
-                              v1_x <= v2_x;  v1_y <= v2_y;
+                              v0_x <= v1_x;  v0_y <= v1_y;  v0_c <= v1_c;
+                              v1_x <= v2_x;  v1_y <= v2_y;  v1_c <= v2_c;
                               v2_x <= unsigned(w_data(15 downto 0));
                               v2_y <= unsigned(w_data(31 downto 16));
+                              v2_c <= reg(1)(31 downto 0);
                               if v_cnt = 0 then          -- the fan's anchor
                                  vf_x <= unsigned(w_data(15 downto 0));
                                  vf_y <= unsigned(w_data(31 downto 16));
+                                 vf_c <= reg(1)(31 downto 0);
                               end if;
                               if v_cnt < 7 then
                                  v_cnt <= v_cnt + 1;
@@ -523,14 +591,19 @@ begin
                         if reg(0)(2 downto 0) = "101" then
                            t_x(0) <= to_signed(to_integer(vf_x) - ofx, 18);
                            t_y(0) <= to_signed(to_integer(vf_y) - ofy, 18);
+                           t_c(0) <= vf_c;
                         else
                            t_x(0) <= to_signed(to_integer(v1_x) - ofx, 18);
                            t_y(0) <= to_signed(to_integer(v1_y) - ofy, 18);
+                           t_c(0) <= v1_c;
                         end if;
                         t_x(1) <= to_signed(to_integer(v2_x) - ofx, 18);
                         t_y(1) <= to_signed(to_integer(v2_y) - ofy, 18);
+                        t_c(1) <= v2_c;
                         t_x(2) <= to_signed(to_integer(unsigned(w_data(15 downto 0))) - ofx, 18);
                         t_y(2) <= to_signed(to_integer(unsigned(w_data(31 downto 16))) - ofy, 18);
+                        t_c(2) <= reg(1)(31 downto 0);
+                        dr_iip <= reg(0)(3);
                         dr_fbp   <= unsigned(reg(16#4C# + ctxi)(8 downto 0));
                         dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
                         -- PSMCT24 is 24 bits inside a 32-bit word, addressed
@@ -682,12 +755,41 @@ begin
                   end if;
                   e_ytop   <= to_signed(tya, 14);
                   e_start  <= '1';
+
+                  -- The plane the four colour channels share.  Its determinant
+                  -- is handed over already positive, with c_sgn saying whether
+                  -- it had to be negated, so each channel's divider only ever
+                  -- sees a positive denominator -- one floor fixup then covers
+                  -- both winding orders instead of two.
+                  d10x := resize(t_x(1), 20) - resize(t_x(0), 20);
+                  d20x := resize(t_x(2), 20) - resize(t_x(0), 20);
+                  d10y := resize(t_y(1), 20) - resize(t_y(0), 20);
+                  d20y := resize(t_y(2), 20) - resize(t_y(0), 20);
+                  vdet := resize(d10x * d20y, 48) - resize(d20x * d10y, 48);
+                  c_dx10 <= d10x;  c_dx20 <= d20x;
+                  c_dy10 <= d10y;  c_dy20 <= d20y;
+                  if vdet < 0 then
+                     c_det <= -vdet;
+                     c_sgn <= '1';
+                  else
+                     c_det <= vdet;
+                     c_sgn <= '0';
+                  end if;
+                  -- A degenerate triangle has no plane; it also covers no
+                  -- pixels, so the interpolators are simply left alone rather
+                  -- than started on a division by zero.
+                  if dr_iip = '1' and vdet /= 0 then
+                     c_start <= '1';
+                  end if;
+
                   tri_mode <= '1';
                   state    <= S_TRI_WAIT;
 
                when S_TRI_WAIT =>
                   e_start <= '0';
-                  if e_start = '0' and e_busy = "000" then
+                  c_start <= '0';
+                  if e_start = '0' and e_busy = "000"
+                     and c_start = '0' and c_busy = "0000" then
                      if dr_empty = '1' then
                         tri_mode <= '0';
                         state    <= dr_ret;
@@ -704,6 +806,12 @@ begin
                   -- first -- a shape that is still a triangle, and so the kind
                   -- of wrong that survives a look at the picture.
                   state <= S_TRI_SCAN;
+
+               when S_TRI_SEED =>
+                  c_sstart <= '0';
+                  if c_sstart = '0' and c_sbusy = "0000" then
+                     state <= S_DRAW;
+                  end if;
 
                when S_TRI_SCAN =>
                   -- Exactly two edges span any scanline, and the span runs
@@ -735,7 +843,18 @@ begin
                      dr_x  <= to_unsigned(lft, 11);
                      dr_x0 <= to_unsigned(lft, 11);
                      dr_x1 <= to_unsigned(rgt, 11);
-                     state <= S_DRAW;
+                     if dr_iip = '1' then
+                        -- Every span is seeded at its own first pixel, which is
+                        -- also where the blocking starts: lane 0 of block 0 is
+                        -- the leftmost pixel of this scanline, not of the
+                        -- triangle and not of an aligned x.
+                        c_sx    <= to_signed(lft, 13);
+                        c_sy    <= signed(resize(dr_y, 13));
+                        c_sstart <= '1';
+                        state   <= S_TRI_SEED;
+                     else
+                        state <= S_DRAW;
+                     end if;
                   end if;
 
                when S_DRAW =>
@@ -750,7 +869,7 @@ begin
                         wr_en   <= '1';
                         wr_addr <= std_logic_vector(wa(19 downto 3));
                         wr_data <= std_logic_vector(shift_left(
-                                      resize(unsigned(dr_rgba), 256), 32 * lane));
+                                      resize(unsigned(src_rgba), 256), 32 * lane));
                         wr_be   <= std_logic_vector(shift_left(
                                       resize(unsigned'(x"F"), 32), 4 * lane));
                         pixels  <= pixels + 1;
@@ -791,9 +910,9 @@ begin
                      -- destination is read to preserve the masked bits and the
                      -- source must go through untouched.
                      if dr_abe = '1' then
-                        blended := blend_px(dr_rgba, oldpx, dr_alpha, dr_fix, dr_clamp);
+                        blended := blend_px(src_rgba, oldpx, dr_alpha, dr_fix, dr_clamp);
                      else
-                        blended := dr_rgba;
+                        blended := src_rgba;
                      end if;
                      newpx := (oldpx and dr_fbmsk) or (blended and not dr_fbmsk);
                      wr_en   <= '1';

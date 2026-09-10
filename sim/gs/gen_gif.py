@@ -110,25 +110,36 @@ def gen(rng, ntags):
             sc  = (rng.randrange(0, 4), rng.randrange(40, 64),
                    rng.randrange(0, 4), rng.randrange(20, 32))
             abe, alpha, clamp = blend_regs(rng)
+            # Gouraud half the time.  It is worth forcing rather than leaving to
+            # a random PRIM because the interpolator is blocked in eights: a
+            # triangle narrower than eight pixels never leaves lane 0 and never
+            # touches the block step at all, so the widths below are chosen to
+            # straddle a block boundary more often than not.
+            iip = rng.choice([0, 0, 1, 1])
             items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (rng.choice([0, 0, 1]) << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x42, alpha), (0x46, clamp),
                      (0x01, rng.randrange(1 << 32)),
-                     (0x00, prim | (abe << 6))]
+                     (0x00, prim | (iip << 3) | (abe << 6))]
             regs = 0
             for i in range(len(items)):
                 regs |= 0xE << (4 * i)
             out.append(tag(1, 0, regs, len(items)))
             for a, d in items:
                 out.append((d & ((1 << 64) - 1)) | (a << 64))
+            # With Gouraud on, each vertex carries its own colour, so RGBAQ is
+            # rewritten ahead of every XYZ2 rather than once for the primitive.
+            per = 2 if iip else 1
             vr = 0
-            for i in range(nv):
+            for i in range(nv * per):
                 vr |= 0xE << (4 * i)
-            out.append(tag(1, 1, vr, nv))
+            out.append(tag(1, 1, vr, nv * per))
             for _ in range(nv):
                 vx = (bx + rng.randrange(0, 14)) * 16 + rng.randrange(0, 16)
                 vy = (by + rng.randrange(0, 10)) * 16 + rng.randrange(0, 16)
+                if iip:
+                    out.append(rng.randrange(1 << 32) | (0x01 << 64))
                 out.append((vx | (vy << 16)) | (0x05 << 64))
         elif pick < 0.46:
             # a host-to-local transfer of a small rectangle

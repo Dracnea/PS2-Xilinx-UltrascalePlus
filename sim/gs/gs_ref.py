@@ -30,6 +30,91 @@ def _ceil(q):
     return -((-q.numerator) // q.denominator)
 
 
+def _floor(q):
+    """floor for an exact rational, without going through float."""
+    return q.numerator // q.denominator
+
+
+# ---- the interpolator ------------------------------------------------------
+#
+# The GS does not evaluate an interpolated component per pixel, and it does not
+# evaluate it exactly.  Both facts were measured on a real console rather than
+# read out of a manual -- Sony's GS User's Manual documents the fill rule to the
+# letter and says nothing at all about interpolation precision -- and they are
+# the difference between agreeing with hardware and being systematically wrong:
+#
+#   * One DDA step spans EIGHT pixels.  A span is seeded at its first pixel;
+#     within a block of eight, each lane carries a fixed offset; and one step is
+#     added per block.  Eight is a measurement, from a width curve that peaks on
+#     powers of two and globally at eight.
+#   * Both the lane offsets and the block step land on a 2**-10 GRID.  A
+#     gradient of 1/4 is the identity under that truncation, which is what let
+#     the effect be isolated in the first place.
+#
+# So an "exact" interpolator -- the obvious thing to write, and what this file
+# nearly got -- would disagree with silicon on most gradients, in a way no
+# self-consistency test could ever find.  Snapping to a fixed grid is also the
+# cheaper thing to build: it is what a DDA does naturally, and it removes any
+# need for an exact division per component per pixel.
+
+_GRID = 1024                        # the DDA's fractional grid, 2**-10
+_BLOCK = 8                          # pixels per DDA step
+
+
+def _grid(q):
+    """Snap a rational onto the DDA's grid.
+
+    Hardware gets there with an arithmetic shift, so this is floor and not
+    truncation toward zero -- the two differ for negative gradients, which is
+    exactly where a plausible-looking model goes quietly wrong.
+    """
+    return Fraction(_floor(q * _GRID), _GRID)
+
+
+class _Walk:
+    """One interpolated component along one span.
+
+    Built once per scanline from the span's seed value and the component's
+    dv/dx, and then asked for the value at pixel i of the span.  The blocking is
+    relative to the span's first pixel, not to an absolute x, because that is
+    where the DDA is seeded.
+
+    The seed is snapped to the same grid as the offsets.  That is a modelling
+    choice rather than a measurement: the probes that established the grid used
+    flat triangles for the seed, and a flat triangle's seed is an integer, so
+    nothing in the evidence distinguishes a snapped seed from an exact one.  It
+    is chosen because it puts the entire DDA on one grid -- every quantity here
+    is then an integer count of 2**-10 -- which is what the register holding it
+    would be in hardware, and which lets the RTL agree with this model bit for
+    bit using integer arithmetic instead of chasing an exact rational.
+    """
+    __slots__ = ("seed", "lane", "step")
+
+    def __init__(self, seed, dvdx):
+        self.seed = _grid(seed)
+        self.lane = [_grid(dvdx * j) for j in range(_BLOCK)]
+        self.step = _grid(dvdx * _BLOCK)
+
+    def at(self, i):
+        b, j = divmod(i, _BLOCK)
+        return self.seed + self.step * b + self.lane[j]
+
+
+def _plane(P, vals):
+    """dv/dx and dv/dy for the plane through three (x, y) points carrying vals.
+
+    Returns None for a degenerate triangle, which has no plane and also covers
+    no pixels, so the caller never gets that far.
+    """
+    (x0, y0), (x1, y1), (x2, y2) = P
+    v0, v1, v2 = vals
+    det = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+    if det == 0:
+        return None
+    return (((v1 - v0) * (y2 - y0) - (v2 - v0) * (y1 - y0)) / det,
+            ((v2 - v0) * (x1 - x0) - (v1 - v0) * (x2 - x0)) / det)
+
+
 VM_WORDS   = 4 * 1024 * 1024 // 4     # 4 MB of local memory, in 32-bit words
 PAGE_WORDS = 8192 // 4                # a page is 8 KB
 BLOCK_WORDS = 256 // 4                # a block is 256 B
@@ -227,8 +312,12 @@ class GS:
         is still owed; this settles the convention, not every corner of it.
 
         Flat shading takes the colour of the *last* vertex, which is what the
-        manual specifies when IIP is 0.  Gouraud, Z, texture and alpha are all
-        later blocks.
+        manual specifies when IIP is 0.  With PRIM.IIP set the four channels are
+        each interpolated across the triangle by the blocked, grid-snapped DDA
+        described above -- not by evaluating the plane per pixel, which is both
+        what hardware does not do and what an obvious implementation would.
+
+        Z, texture and dither are still later blocks.
 
         """
         c = self.ctx()
@@ -261,6 +350,19 @@ class GS:
         ybot = min(_ceil(max(ys)) - 1, sy1)
         rgba = v2[3] & 0xFFFFFFFF
 
+        # Gouraud: one plane per channel.  The gradients are computed once for
+        # the whole triangle and the per-scanline seed is the plane evaluated at
+        # the span's first pixel; only the walk along x is blocked and snapped,
+        # which is where the measurements put the departure from exactness.
+        iip = bits(self.reg[0x00], 3, 3)
+        grad = None
+        if iip:
+            chan = [[(v[3] >> (8 * n)) & 0xFF for v in (v0, v1, v2)]
+                    for n in range(4)]
+            grad = [_plane(P, [Fraction(c) for c in ch]) for ch in chan]
+            if any(g is None for g in grad):
+                return                  # degenerate: no plane, and no coverage
+
         for yy in range(ytop, ybot + 1):
             y = Fraction(yy)
             # An edge spans this scanline on a half-open interval, so a vertex
@@ -276,12 +378,29 @@ class GS:
                 continue
             left  = max(_ceil(min(xs)), sx0)
             right = min(_ceil(max(xs)) - 1, sx1)
+            walk = None
+            if iip:
+                walk = []
+                for n in range(4):
+                    dvdx, dvdy = grad[n]
+                    base = Fraction(chan[n][0])
+                    seed = (base + dvdx * (Fraction(left) - P[0][0])
+                                 + dvdy * (y - P[0][1]))
+                    walk.append(_Walk(seed, dvdx))
+
             for xx in range(left, right + 1):
                 a = addr32p(fbp, fbw, xx, yy)
                 if a >= VM_WORDS:
                     continue
+                if iip:
+                    src = 0
+                    for n in range(4):
+                        q = _floor(walk[n].at(xx - left))
+                        src |= (0 if q < 0 else (255 if q > 255 else q)) << (8 * n)
+                else:
+                    src = rgba
                 old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
-                px = self.blend(rgba, old, c)
+                px = self.blend(src, old, c)
                 v = (old & fbmsk) | (px & ~fbmsk & 0xFFFFFFFF)
                 self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
                 self.pixels += 1
