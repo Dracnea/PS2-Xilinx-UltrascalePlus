@@ -118,7 +118,41 @@ checked, so it belongs in the diff.
 Both are the same shape as the EE work: the test was weaker than it looked, and
 what it did not reach stayed broken.
 
+## Step 4 begins: the sprite — 2026-09-10
+
+A sprite is the primitive to build first for the same reason the integer core
+came before the FPU: it is axis-aligned and flat-coloured, so there is no
+interpolation to get wrong before the addressing, the scissor, the register
+contexts and the write mask are known to be right. Two vertices, the colour
+from the second, the rectangle between them.
+
+`gs_gif.vhd` now carries a vertex queue, decides the primitive from `PRIM`,
+picks context 1 or 2 from `PRIM.CTXT`, subtracts `XYOFFSET`, clips to
+`SCISSOR`, and writes through `FRAME`'s `FBMSK`. 40 random streams agree with
+the reference on the framebuffer and on the number of pixels drawn — between 69
+and 367 per stream, which is what makes the agreement mean something.
+
+**A masked write is a read-modify-write**, and that is why the GIF grew a read
+port. `FBMSK = 0` is the common case and still writes in one clock; a non-zero
+mask reads the word back, merges, and writes, at the cost of the memory's
+latency. That path is the beginning of the one Z and alpha will need, so it is
+worth having early even though nothing yet uses it for anything but the mask.
+
+The pixel count is compared, not just printed. A primitive that quietly draws
+nothing — clipped away, empty rectangle, a pixel format that is not
+PSMCT32 — otherwise looks exactly like a framebuffer that was never meant to
+change, and a whole test file can pass that way.
+
+### What the sprite does not do yet
+
+No Z test, no alpha blending, no texture, no dither, no anti-aliasing, and
+PSMCT32 only. `PRMODECONT` is ignored, so the mode always comes from `PRIM`.
+Each of those is a later block, and drawing them wrongly now would be worse
+than not drawing them: a wrong pixel that appears is much harder to notice than
+one that never arrives.
+
 ## What is not started
 
-Steps 4 and 5 — the rasteriser and PCRTC. Local-to-host and local-to-local
-transfers, and pixel formats other than PSMCT32.
+The rest of step 4 — triangles (flat, then Gouraud, then textured), lines and
+points — and step 5, PCRTC. Local-to-host and local-to-local transfers, and
+pixel formats other than PSMCT32.

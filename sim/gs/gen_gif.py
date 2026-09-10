@@ -20,7 +20,11 @@ DESCS = [0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA,
 # addresses A+D may name.  0x53 and 0x54 are excluded here and driven only by
 # the deliberate transfer sequences below, because a random TRXDIR in the middle
 # of a stream would start a transfer whose set-up registers are random too.
-AD_ADDRS = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+# 0x04 and 0x05 are deliberately absent: XYZF2 and XYZ2 kick a primitive, and a
+# random one drawn with a random FRAME and a random SCISSOR is a rectangle of up
+# to four million pixels.  Both models would agree on it, slowly.  Drawing is
+# generated coherently below instead, where the size can be bounded.
+AD_ADDRS = [0x00, 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0A,
             0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x22,
             0x34, 0x35, 0x36, 0x37, 0x3B, 0x3D, 0x3F,
             0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
@@ -40,7 +44,35 @@ def gen(rng, ntags):
     out = []
     for _ in range(ntags):
         pick = rng.random()
-        if pick < 0.18:
+        if pick < 0.20:
+            # a sprite: set the context up coherently, then two vertices.  The
+            # write mask is included because a masked write is a
+            # read-modify-write in hardware and an unmasked one is not, so the
+            # two take different paths through the drawing logic.
+            x0 = rng.randrange(0, 48)
+            y0 = rng.randrange(0, 24)
+            w  = rng.randrange(1, 12)
+            h  = rng.randrange(1, 8)
+            fbp = rng.choice([0, 1, 2])            # in 8 KB pages
+            msk = rng.choice([0x00000000, 0x00000000, 0xFF000000, 0x0000FFFF])
+            sc  = (rng.randrange(0, 8), rng.randrange(40, 64),
+                   rng.randrange(0, 4), rng.randrange(20, 32))
+            items = [(0x4C, fbp | (1 << 16) | (msk << 32)),
+                     (0x18, 0),
+                     (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
+                     (0x40 + 1, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
+                     (0x01, rng.randrange(1 << 32)),
+                     (0x00, 6)]
+            regs = 0
+            for i in range(len(items)):
+                regs |= 0xE << (4 * i)
+            out.append(tag(1, 0, regs, len(items)))
+            for a, d in items:
+                out.append((d & ((1 << 64) - 1)) | (a << 64))
+            out.append(tag(1, 1, 0xEE, 2))
+            out.append(((x0 << 4) | (((y0 << 4)) << 16)) | (0x05 << 64))
+            out.append((((x0 + w) << 4) | ((((y0 + h) << 4)) << 16)) | (0x05 << 64))
+        elif pick < 0.34:
             # a host-to-local transfer of a small rectangle
             w = rng.randrange(1, 9)
             h = rng.randrange(1, 5)

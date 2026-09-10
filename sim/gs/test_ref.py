@@ -95,6 +95,56 @@ for y in range(H):
                          % (x, y, a, got, vals[n]))
         n += 1
 
+# ---- a sprite fills the rectangle it names ------------------------------
+def ad(addr, data):
+    return (data & ((1 << 64) - 1)) | (addr << 64)
+
+def sprite_prog(x0, y0, x1, y1, colour, scissor=(0, 639, 0, 447), ofx=0, ofy=0):
+    setup = [ad(0x4C, 0 | (1 << 16) | (0 << 24)),            # FRAME_1: FBP 0, FBW 1
+             ad(0x18, (ofx << 0) | (ofy << 32)),             # XYOFFSET_1
+             ad(0x40, scissor[0] | (scissor[1] << 16)
+                      | (scissor[2] << 32) | (scissor[3] << 48)),
+             ad(0x00, 6),                                    # PRIM: sprite
+             ad(0x01, colour)]                               # RGBAQ
+    verts = [ad(0x05, (x0 << 4) | ((y0 << 4) << 16)),
+             ad(0x05, (x1 << 4) | ((y1 << 4) << 16))]
+    return ([giftag(len(setup), 0, 0xEEEEEEEEEEEEEEEE & ((1 << (4 * len(setup))) - 1),
+                    len(setup))] + setup
+            + [giftag(2, 1, 0xEE, 2)] + verts)
+
+def run(pkts):
+    g = GS()
+    at = 0
+    while at < len(pkts):
+        nxt = g.gif_packet(pkts, at)
+        if nxt == at:
+            break
+        at = nxt
+    return g
+
+g = run(sprite_prog(2, 1, 6, 3, 0x11223344))
+check("sprite pixel count", g.pixels, (6 - 2) * (3 - 1))
+for y in range(1, 3):
+    for x in range(2, 6):
+        a = gs_ref.addr32p(0, 1, x, y)
+        got = int.from_bytes(g.vm[a * 4:a * 4 + 4], "little")
+        if got != 0x11223344:
+            fails.append("sprite (%d,%d): got %08x" % (x, y, got))
+# the edges are exclusive at the far corner and inclusive at the near one
+a = gs_ref.addr32p(0, 1, 6, 3)
+if int.from_bytes(g.vm[a * 4:a * 4 + 4], "little") != 0:
+    fails.append("sprite wrote its exclusive corner")
+
+# the scissor clips it
+g = run(sprite_prog(0, 0, 8, 8, 0xAABBCCDD, scissor=(2, 4, 3, 5)))
+check("scissored pixel count", g.pixels, 3 * 3)
+
+# XYOFFSET shifts it: the same vertices with an offset of 2 px land 2 px lower
+g = run(sprite_prog(4, 4, 8, 8, 0x01020304, ofx=2 << 4, ofy=2 << 4))
+a = gs_ref.addr32p(0, 1, 2, 2)
+if int.from_bytes(g.vm[a * 4:a * 4 + 4], "little") != 0x01020304:
+    fails.append("XYOFFSET was not subtracted")
+
 # ---- the swizzle is a bijection over a page ------------------------------
 seen = {addr32(0, 1, x, y) for y in range(32) for x in range(64)}
 check("page is a bijection", len(seen), 32 * 64)

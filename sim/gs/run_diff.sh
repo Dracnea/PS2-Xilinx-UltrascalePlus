@@ -34,7 +34,7 @@ fi
 # being filtered out of the RTL side while the reference still printed it, so
 # every stream that touched an undefined address failed on a line the RTL had
 # never been given the chance to produce.
-grep -E "^REG |^VM |^# unknown" xsim.log > rtl.txt
+grep -E "^REG |^VM |^# unknown|^# pixels" xsim.log > rtl.txt
 
 if diff -q ref.txt rtl.txt >/dev/null; then
     echo "PASS  $(wc -l < ref.txt) lines identical (${PROG:+$(basename "$PROG")}${SEED:+seed $SEED})"

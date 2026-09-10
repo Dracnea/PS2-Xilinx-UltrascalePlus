@@ -47,16 +47,23 @@ def column32(y, x):
     return ((x & 1)) | ((y & 1) << 1) | ((x & 6) << 1) | ((y & 6) << 3)
 
 
-def addr32(bp, bw, x, y):
-    """Word address of pixel (x, y) in a PSMCT32 buffer.
+def addr32p(pagebase, bw, x, y):
+    """Word address of pixel (x, y), from a base given in *pages*.
 
-    bp is the buffer pointer in 256-byte blocks, as BITBLTBUF and FRAME carry
-    it; bw is the buffer width in units of 64 pixels.
+    The two register fields that point at a buffer do not agree on units --
+    BITBLTBUF's DBP counts 256-byte blocks and FRAME's FBP counts 8 KB pages --
+    so the conversion belongs at the two call sites rather than inside here,
+    where a single "bp" argument would silently mean different things.
     """
-    page = (bp >> 5) + (y >> 5) * bw + (x >> 6)
+    page = pagebase + (y >> 5) * bw + (x >> 6)
     return (page * PAGE_WORDS
             + block32((y >> 3) & 3, (x >> 3) & 7) * BLOCK_WORDS
             + column32(y & 7, x & 7))
+
+
+def addr32(bp, bw, x, y):
+    """The same, from a BITBLTBUF-style pointer in 256-byte blocks."""
+    return addr32p(bp >> 5, bw, x, y)
 
 
 # ---- GIF -------------------------------------------------------------------
@@ -99,6 +106,8 @@ class GS:
         self.vm = bytearray(4 * 1024 * 1024)
         self.unknown = 0          # writes to addresses the manual does not define
         self.xfer = None          # a host-to-local transfer in progress
+        self.vq = []              # vertices queued for the current primitive
+        self.pixels = 0           # drawn, so a silently-empty test is visible
 
     # -- register writes ----------------------------------------------------
     def write(self, addr, data):
@@ -110,6 +119,76 @@ class GS:
             self.start_transfer()
         elif addr == 0x54:                    # HWREG carries transfer data
             self.hwreg(data)
+        elif addr == 0x00:                    # PRIM restarts the vertex queue
+            self.vq = []
+        elif addr in (0x04, 0x05):            # XYZF2 / XYZ2: queue and draw
+            self.vertex(data, kick=True)
+        elif addr in (0x0C, 0x0D):            # XYZF3 / XYZ3: queue only
+            self.vertex(data, kick=False)
+
+    # -- primitives ---------------------------------------------------------
+    def ctx(self):
+        """0 or 1: which of the two register contexts this primitive uses."""
+        return bits(self.reg[0x00], 9, 9)
+
+    def vertex(self, data, kick):
+        # X and Y are 12.4 fixed point; the fraction is dropped here because
+        # a sprite has no interpolation to need it.  A triangle will.
+        self.vq.append((bits(data, 15, 0), bits(data, 31, 16), bits(data, 63, 32),
+                        self.reg[0x01]))
+        if not kick:
+            return
+        prim = bits(self.reg[0x00], 2, 0)
+        if prim == 6 and len(self.vq) >= 2:            # SPRITE
+            self.draw_sprite(self.vq[-2], self.vq[-1])
+            self.vq = []
+        elif prim in (3, 4, 5) and len(self.vq) >= 3:  # triangles: not yet drawn
+            self.vq = self.vq[-2:] if prim in (4, 5) else []
+        elif len(self.vq) > 8:
+            self.vq = self.vq[-2:]
+
+    def draw_sprite(self, v0, v1):
+        """A flat-coloured, axis-aligned rectangle in PSMCT32.
+
+        No Z test, no alpha blending, no texture and no dither: those are later
+        blocks, and drawing them wrong now would be worse than not drawing them.
+        The colour is the one attached to the *second* vertex, which is what the
+        manual specifies for a sprite.
+        """
+        c = self.ctx()
+        frame  = self.reg[0x4C + c]
+        xyoff  = self.reg[0x18 + c]
+        sciss  = self.reg[0x40 + c]
+        if bits(frame, 29, 24) != 0:               # PSMCT32 only for now
+            return
+        fbp  = bits(frame, 8, 0)                   # in 8 KB pages
+        fbw  = bits(frame, 21, 16)                 # in 64-pixel units
+        fbmsk = bits(frame, 63, 32)
+        ofx, ofy = bits(xyoff, 15, 0), bits(xyoff, 47, 32)
+
+        x0 = (v0[0] - ofx) >> 4
+        y0 = (v0[1] - ofy) >> 4
+        x1 = (v1[0] - ofx) >> 4
+        y1 = (v1[1] - ofy) >> 4
+        if x0 > x1: x0, x1 = x1, x0
+        if y0 > y1: y0, y1 = y1, y0
+
+        # the scissor bounds are inclusive
+        sx0, sx1 = bits(sciss, 10, 0), bits(sciss, 26, 16)
+        sy0, sy1 = bits(sciss, 42, 32), bits(sciss, 58, 48)
+        x0, y0 = max(x0, sx0), max(y0, sy0)
+        x1, y1 = min(x1 - 1, sx1), min(y1 - 1, sy1)
+
+        rgba = v1[3] & 0xFFFFFFFF
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                a = addr32p(fbp, fbw, x, y)
+                if a >= VM_WORDS:
+                    continue
+                old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
+                v = (old & fbmsk) | (rgba & ~fbmsk & 0xFFFFFFFF)
+                self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
+                self.pixels += 1
 
     # -- host-to-local ------------------------------------------------------
     def start_transfer(self):
@@ -276,6 +355,7 @@ def main():
             print("VM %08x %s" % (base + off, row[::-1].hex()))
     if gs.unknown:
         print("# unknown register writes: %d" % gs.unknown)
+    print("# pixels drawn: %d" % gs.pixels)
 
 
 if __name__ == "__main__":

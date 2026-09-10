@@ -210,7 +210,13 @@ change to the datapath.
 | Pipelined multiplier | 185.9 MHz | 6,043 | `instr` → `gpr`, 12 levels, 64% routing — decode, regfile and writeback in one cycle |
 | Five-stage pipeline, one EX | 212.0 MHz | 6,859 | `w_rd` → forwarding mux → 64-bit branch compare → `fetch_pc` adder |
 | Execution split into A1/A2 | 242.8 MHz | 7,081 | `m_rd` → forwarding mux → 64-bit ALU → result register |
-| Fetch unit with 3 requests in flight | **251.9 MHz** | 6,424 | `w_we` → forwarding mux → 64-bit ALU → result register |
+| Fetch unit with 3 requests in flight | 251.9 MHz | 6,424 | `w_we` → forwarding mux → 64-bit ALU → result register |
+| Unaligned loads and stores added | **252.1 MHz** | — | unchanged |
+
+The unaligned group cost nothing in clock, which was not obvious in advance: it
+adds a shifter and a merge to the memory path. It stays off the critical path
+because that path is the ALU in A1, and the merge happens in A2 where there is
+slack.
 
 Target is 294.912 MHz. The core is 10.4x faster than the first measurement and
 needs 1.17x more.
@@ -544,7 +550,8 @@ failed at once when it was missing.
 
 Hazards and pipelining — the core is still one instruction at a time. MMI, the
 FPU, the VUs. And the integer subset itself is not complete: no COP0, no
-exceptions, no unaligned loads or stores, no `LQ`/`SQ`.
+exceptions, no `LQ`/`SQ`. The unaligned group — `LWL`, `LWR`, `SWL`, `SWR`,
+`LDL`, `LDR`, `SDL`, `SDR` — is done.
 
 Timing is not closed: 242.8 MHz against a 294.912 MHz target, a factor of 1.21.
 The critical path is now `forwarding mux → 64-bit ALU → result register`, which

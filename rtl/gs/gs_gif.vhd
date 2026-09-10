@@ -49,11 +49,23 @@ entity gs_gif is
       wr_data   : out std_logic_vector(255 downto 0) := (others => '0');
       wr_be     : out std_logic_vector(31 downto 0) := (others => '0');
 
+      -- read port, for the read-modify-write that FBMSK requires.  The real GS
+      -- reads the framebuffer for every drawn pixel anyway -- Z, alpha and the
+      -- write mask all need it -- so this is where that path starts.
+      rd_en     : out std_logic := '0';
+      rd_addr   : out std_logic_vector(16 downto 0) := (others => '0');
+      rd_data   : in  std_logic_vector(255 downto 0) := (others => '0');
+      rd_valid  : in  std_logic := '0';
+
       -- for the testbench: read any general register, and count writes to
       -- addresses the manual does not define rather than inventing behaviour
       dbg_sel     : in  unsigned(6 downto 0) := (others => '0');
       dbg_reg     : out std_logic_vector(63 downto 0) := (others => '0');
-      dbg_unknown : out unsigned(15 downto 0) := (others => '0')
+      dbg_unknown : out unsigned(15 downto 0) := (others => '0');
+      -- pixels drawn, because a primitive that quietly draws nothing -- clipped
+      -- away, wrong pixel format, empty rectangle -- otherwise looks exactly
+      -- like a framebuffer that was never meant to change
+      dbg_pixels  : out unsigned(31 downto 0) := (others => '0')
    );
 end entity;
 
@@ -62,8 +74,10 @@ architecture arch of gs_gif is
    signal reg : regfile_t := (others => (others => '0'));
 
    signal unknown : unsigned(15 downto 0) := (others => '0');
+   signal pixels  : unsigned(31 downto 0) := (others => '0');
 
-   type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS);
+   type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
+                    S_DRAW, S_DRAWRD);
    signal state : state_t := S_TAG;
 
    -- the tag in flight
@@ -84,6 +98,24 @@ architecture arch of gs_gif is
    signal x_cx     : unsigned(10 downto 0) := (others => '0');
    signal x_cy     : unsigned(10 downto 0) := (others => '0');
    signal x_left   : unsigned(23 downto 0) := (others => '0');  -- pixels remaining
+
+   -- the primitive being drawn.  A sprite is the first one: axis-aligned and
+   -- flat-coloured, so there is no interpolation to get wrong before the
+   -- addressing, the scissor and the write mask are known to be right.
+   signal v_cnt   : unsigned(2 downto 0) := (others => '0');
+   signal v0_x, v0_y : unsigned(15 downto 0) := (others => '0');
+   signal v1_x, v1_y : unsigned(15 downto 0) := (others => '0');
+   signal dr_x, dr_y : unsigned(10 downto 0) := (others => '0');
+   signal dr_x0      : unsigned(10 downto 0) := (others => '0');
+   signal dr_x1      : unsigned(10 downto 0) := (others => '0');
+   signal dr_y1      : unsigned(10 downto 0) := (others => '0');
+   signal dr_rgba    : std_logic_vector(31 downto 0) := (others => '0');
+   signal dr_fbp     : unsigned(8 downto 0) := (others => '0');
+   signal dr_fbw     : unsigned(5 downto 0) := (others => '0');
+   signal dr_fbmsk   : std_logic_vector(31 downto 0) := (others => '0');
+   signal dr_empty   : std_logic := '0';
+   signal dr_ret     : state_t := S_TAG;
+   signal dr_addr    : unsigned(19 downto 0) := (others => '0');
 
    -- pixels waiting to be written, one per clock
    signal px_data  : std_logic_vector(127 downto 0) := (others => '0');
@@ -109,14 +141,24 @@ architecture arch of gs_gif is
 
    -- PSMCT32 word address.  Everything below the page number is a permutation
    -- of the low bits of x and y; see the header.
-   function pix_addr(bp : unsigned(13 downto 0); bw : unsigned(5 downto 0);
-                     x, y : unsigned(10 downto 0)) return unsigned is
+   -- The two register fields that point at a buffer disagree on units:
+   -- BITBLTBUF's DBP counts 256-byte blocks and FRAME's FBP counts 8 KB pages.
+   -- Keeping that conversion at the call sites means one "bp" argument never
+   -- silently means two different things.
+   function pix_addr_page(pg : unsigned(8 downto 0); bw : unsigned(5 downto 0);
+                          x, y : unsigned(10 downto 0)) return unsigned is
       variable page : unsigned(8 downto 0);
    begin
-      page := resize(bp(13 downto 5) + resize(y(10 downto 5) * bw, 9)
+      page := resize(pg + resize(y(10 downto 5) * bw, 9)
                      + resize(x(10 downto 6), 9), 9);
       return page & x(5) & y(4) & x(4) & y(3) & x(3)
                   & y(2) & y(1) & x(2) & x(1) & y(0) & x(0);
+   end function;
+
+   function pix_addr(bp : unsigned(13 downto 0); bw : unsigned(5 downto 0);
+                     x, y : unsigned(10 downto 0)) return unsigned is
+   begin
+      return pix_addr_page(bp(13 downto 5), bw, x, y);
    end function;
 begin
 
@@ -126,10 +168,12 @@ begin
    -- nothing was taken -- which loses a quadword exactly when the consumer
    -- stops to do some work, which is the one case that matters.
    gif_ready <= '0' when reset = '1' else
-                '0' when state = S_PIXELS else '1';
+                '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
+                else '1';
 
    dbg_reg     <= reg(to_integer(dbg_sel));
    dbg_unknown <= unknown;
+   dbg_pixels  <= pixels;
 
    process (clk)
       variable qw      : std_logic_vector(127 downto 0);
@@ -143,14 +187,23 @@ begin
       variable vri     : unsigned(4 downto 0);
       variable vloop   : unsigned(14 downto 0);
       variable vdone   : boolean;
+      variable kick    : boolean;
+      variable ctxi    : integer range 0 to 1;
+      variable ofx, ofy, ax, ay, bx, by, t : integer range -65536 to 65535;
+      variable sx0, sx1, sy0, sy1          : integer range 0 to 2047;
+      variable oldpx, newpx                : std_logic_vector(31 downto 0);
    begin
       if rising_edge(clk) then
          wr_en     <= '0';
+         rd_en     <= '0';
 
          if reset = '1' then
             state    <= S_TAG;
             unknown  <= (others => '0');
+            pixels   <= (others => '0');
             x_active <= '0';
+            v_cnt    <= (others => '0');
+            dr_empty <= '1';
             px_n     <= (others => '0');
             reg      <= (others => (others => '0'));
 
@@ -196,6 +249,7 @@ begin
                      -- register is what makes the A+D form -- which carries its
                      -- own address -- fall out as an ordinary case rather than
                      -- a second mechanism.
+                     kick   := false;
                      w_do   := true;
                      w_addr := to_unsigned(0, 7);
                      w_data := (others => '0');
@@ -255,6 +309,23 @@ begin
                               -- HWREG: two PSMCT32 pixels of transfer data
                               px_data <= x"0000000000000000" & w_data;
                               px_n    <= to_unsigned(2, 3);
+                           elsif w_addr = 0 then
+                              v_cnt <= (others => '0');   -- PRIM restarts it
+                           elsif w_addr = 4 or w_addr = 5
+                                 or w_addr = 16#0C# or w_addr = 16#0D# then
+                              v0_x <= v1_x;  v0_y <= v1_y;
+                              v1_x <= unsigned(w_data(15 downto 0));
+                              v1_y <= unsigned(w_data(31 downto 16));
+                              if v_cnt < 7 then
+                                 v_cnt <= v_cnt + 1;
+                              end if;
+                              -- XYZ2 and XYZF2 kick the primitive; XYZ3 and
+                              -- XYZF3 only queue the vertex
+                              if (w_addr = 4 or w_addr = 5)
+                                 and reg(0)(2 downto 0) = "110"     -- SPRITE
+                                 and v_cnt >= 1 then
+                                 kick := true;
+                              end if;
                            end if;
                         end if;
                      end if;
@@ -272,7 +343,50 @@ begin
                         t_ri <= t_ri + 1;
                      end if;
 
-                     if w_do and defined(w_addr) and w_addr = 16#54# then
+                     if kick then
+                        -- The two vertices are the one already queued and the
+                        -- one arriving now; v1_* still holds the old value on
+                        -- this edge, which is what makes that work.
+                        ctxi := 0;
+                        if reg(0)(9) = '1' then ctxi := 1; end if;
+                        ofx := to_integer(unsigned(reg(16#18# + ctxi)(15 downto 0)));
+                        ofy := to_integer(unsigned(reg(16#18# + ctxi)(47 downto 32)));
+                        ax := (to_integer(v1_x) - ofx) / 16;
+                        ay := (to_integer(v1_y) - ofy) / 16;
+                        bx := (to_integer(unsigned(w_data(15 downto 0))) - ofx) / 16;
+                        by := (to_integer(unsigned(w_data(31 downto 16))) - ofy) / 16;
+                        if ax > bx then t := ax; ax := bx; bx := t; end if;
+                        if ay > by then t := ay; ay := by; by := t; end if;
+                        sx0 := to_integer(unsigned(reg(16#40# + ctxi)(10 downto 0)));
+                        sx1 := to_integer(unsigned(reg(16#40# + ctxi)(26 downto 16)));
+                        sy0 := to_integer(unsigned(reg(16#40# + ctxi)(42 downto 32)));
+                        sy1 := to_integer(unsigned(reg(16#40# + ctxi)(58 downto 48)));
+                        if ax < sx0 then ax := sx0; end if;
+                        if ay < sy0 then ay := sy0; end if;
+                        bx := bx - 1;  by := by - 1;
+                        if bx > sx1 then bx := sx1; end if;
+                        if by > sy1 then by := sy1; end if;
+
+                        dr_fbp   <= unsigned(reg(16#4C# + ctxi)(8 downto 0));
+                        dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
+                        dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
+                        dr_rgba  <= reg(1)(31 downto 0);
+                        dr_x0    <= to_unsigned(ax, 11);
+                        dr_x     <= to_unsigned(ax, 11);
+                        dr_x1    <= to_unsigned(bx, 11);
+                        dr_y     <= to_unsigned(ay, 11);
+                        dr_y1    <= to_unsigned(by, 11);
+                        if ax > bx or ay > by or ax < 0 or ay < 0
+                           or reg(16#4C# + ctxi)(29 downto 24) /= "000000" then
+                           dr_empty <= '1';       -- nothing to draw, or not PSMCT32
+                        else
+                           dr_empty <= '0';
+                        end if;
+                        v_cnt  <= (others => '0');
+                        dr_ret <= S_PACKED;
+                        if last then dr_ret <= S_TAG; end if;
+                        state  <= S_DRAW;
+                     elsif w_do and defined(w_addr) and w_addr = 16#54# then
                         px_ret <= S_PACKED;
                         if last then px_ret <= S_TAG; end if;
                         state  <= S_PIXELS;
@@ -342,6 +456,58 @@ begin
                      end if;
                      t_loop <= t_loop + 1;
                      state  <= S_PIXELS;
+                  end if;
+
+               when S_DRAW =>
+                  if dr_empty = '1' or dr_y > dr_y1 then
+                     state <= dr_ret;
+                  else
+                     wa   := pix_addr_page(dr_fbp, dr_fbw, dr_x, dr_y);
+                     lane := to_integer(wa(2 downto 0));
+                     if dr_fbmsk = x"00000000" then
+                        -- nothing to preserve, so no read is needed: the common
+                        -- case stays one pixel per clock
+                        wr_en   <= '1';
+                        wr_addr <= std_logic_vector(wa(19 downto 3));
+                        wr_data <= std_logic_vector(shift_left(
+                                      resize(unsigned(dr_rgba), 256), 32 * lane));
+                        wr_be   <= std_logic_vector(shift_left(
+                                      resize(unsigned'(x"F"), 32), 4 * lane));
+                        pixels  <= pixels + 1;
+                        if dr_x = dr_x1 then
+                           dr_x <= dr_x0;
+                           dr_y <= dr_y + 1;
+                        else
+                           dr_x <= dr_x + 1;
+                        end if;
+                     else
+                        rd_en   <= '1';
+                        rd_addr <= std_logic_vector(wa(19 downto 3));
+                        dr_addr <= wa;
+                        state   <= S_DRAWRD;
+                     end if;
+                  end if;
+
+               when S_DRAWRD =>
+                  if rd_valid = '1' then
+                     lane := to_integer(dr_addr(2 downto 0));
+                     oldpx := std_logic_vector(
+                                 shift_right(unsigned(rd_data), 32 * lane)(31 downto 0));
+                     newpx := (oldpx and dr_fbmsk) or (dr_rgba and not dr_fbmsk);
+                     wr_en   <= '1';
+                     wr_addr <= std_logic_vector(dr_addr(19 downto 3));
+                     wr_data <= std_logic_vector(shift_left(
+                                   resize(unsigned(newpx), 256), 32 * lane));
+                     wr_be   <= std_logic_vector(shift_left(
+                                   resize(unsigned'(x"F"), 32), 4 * lane));
+                     pixels  <= pixels + 1;
+                     if dr_x = dr_x1 then
+                        dr_x <= dr_x0;
+                        dr_y <= dr_y + 1;
+                     else
+                        dr_x <= dr_x + 1;
+                     end if;
+                     state <= S_DRAW;
                   end if;
 
                when S_PIXELS =>
