@@ -86,6 +86,15 @@ entity iop_top is
       dma_dbg_chcr  : out std_logic_vector(31 downto 0);
       dma_dbg_tadr  : out std_logic_vector(31 downto 0);
 
+      -- the DMA controller's enables and flags, and the interrupt controller's
+      dma_dbg_dpcr  : out std_logic_vector(31 downto 0);
+      dma_dbg_dicr  : out std_logic_vector(31 downto 0);
+      dma_dbg_dpcr2 : out std_logic_vector(31 downto 0);
+      dma_dbg_dicr2 : out std_logic_vector(31 downto 0);
+      dma_dbg_irq   : out std_logic;
+      intc_dbg_stat : out std_logic_vector(31 downto 0);
+      intc_dbg_mask : out std_logic_vector(31 downto 0);
+
       -- SIF0: the IOP's stream out to the EE, drained by the host
       sif0_we       : out std_logic;
       sif0_data     : out std_logic_vector(31 downto 0);
@@ -844,7 +853,9 @@ begin
       bus_read      => bus_irq_read,
       bus_write     => bus_irq_write,
       bus_dataRead  => bus_irq_dataRead,
-      irqRequest    => irqRequest
+      irqRequest    => irqRequest,
+      dbg_stat      => intc_dbg_stat,
+      dbg_mask      => intc_dbg_mask
    );
 
    -- stubs: programmed and read back, nothing behind them yet
@@ -893,6 +904,11 @@ begin
       dbg_sif1_addr  => sif1_dbg_addr,
       dbg_sif1_len   => sif1_dbg_len,
       dbg_sif1_tags  => sif1_dbg_tags,
+      dbg_dpcr       => dma_dbg_dpcr,
+      dbg_dicr       => dma_dbg_dicr,
+      dbg_dpcr2      => dma_dbg_dpcr2,
+      dbg_dicr2      => dma_dbg_dicr2,
+      dbg_irq        => dma_dbg_irq,
       dbg_sel        => dma_dbg_sel,
       dbg_madr       => dma_dbg_madr,
       dbg_bcr        => dma_dbg_bcr,

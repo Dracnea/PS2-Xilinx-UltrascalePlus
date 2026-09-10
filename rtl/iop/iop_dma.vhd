@@ -139,6 +139,15 @@ entity iop_dma is
       -- BIOS programmed rather than infer it.  Whether SIFCMD arms SIF1 at
       -- boot, and in normal or chain mode, is a question about CHCR and TADR
       -- that nothing else here can answer.
+      -- The controller's own enables and flags.  Whether a completed transfer
+      -- becomes an interrupt is decided here, and nothing outside could see it:
+      -- a channel that finishes and a handler that runs are different events.
+      dbg_dpcr      : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_dicr      : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_dpcr2     : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_dicr2     : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_irq       : out std_logic := '0';
+
       dbg_sel       : in  unsigned(3 downto 0) := (others => '0');
       dbg_madr      : out std_logic_vector(31 downto 0) := (others => '0');
       dbg_bcr       : out std_logic_vector(31 downto 0) := (others => '0');
@@ -190,12 +199,21 @@ architecture arch of iop_dma is
    signal s1_addr  : unsigned(23 downto 0) := (others => '0');
    signal s1_words : unsigned(23 downto 0) := (others => '0');
 
-   function master_flag(en : std_logic_vector(7 downto 0);
+   -- The master enable is passed in rather than taken from `en`, because there
+   -- is only one of it and it does not live in both banks.  DICR bit 23 is the
+   -- master channel interrupt enable for **DICR and DICR2 alike**; DICR2 bit 23
+   -- is unused (ps2tek, IOP DMA).  Reading it out of DICR2 -- which is what
+   -- this did -- means no channel from 7 to 12 can ever raise an interrupt:
+   -- SIF0, SIF1, SIO2in, SIO2out, DEV9 and SPU2's second core, all silent,
+   -- while bank 1 works and hides it.  The BIOS sets DICR to 0x00800000 and
+   -- DICR2 to 0x000c0400, which is exactly this arrangement.
+   function master_flag(master : std_logic;
+                        en : std_logic_vector(7 downto 0);
                         fl : std_logic_vector(6 downto 0);
                         lo : std_logic_vector(15 downto 0)) return std_logic is
    begin
       if (lo(15) = '1') then return '1'; end if;                 -- force IRQ
-      if (en(7) = '1' and (en(6 downto 0) and fl) /= "0000000") then return '1'; end if;
+      if (master = '1' and (en(6 downto 0) and fl) /= "0000000") then return '1'; end if;
       return '0';
    end function;
 
@@ -219,8 +237,8 @@ architecture arch of iop_dma is
 
 begin
 
-   irq         <= master_flag(dicr_en, dicr_fl, dicr_lo)
-               or master_flag(dicr2_en, dicr2_fl, dicr2_lo);
+   irq         <= master_flag(dicr_en(7), dicr_en, dicr_fl, dicr_lo)
+               or master_flag(dicr_en(7), dicr2_en, dicr2_fl, dicr2_lo);
    dbg_channel <= to_unsigned(ch, 4);
    dbg_madr <= madr(to_integer(dbg_sel)) when dbg_sel <= 12 else (others => '0');
    dbg_bcr  <= bcr (to_integer(dbg_sel)) when dbg_sel <= 12 else (others => '0');
@@ -241,6 +259,12 @@ begin
                             and (s1_phase = '0' or ram_gnt = '1')) else '0';
    dbg_sif1_tags <= tagcount;
    dbg_sif0_tags <= s0_tags;
+   dbg_dpcr  <= dpcr;
+   dbg_dpcr2 <= dpcr2;
+   dbg_dicr  <= master_flag(dicr_en(7), dicr_en, dicr_fl, dicr_lo) & dicr_fl & dicr_en & dicr_lo;
+   dbg_dicr2 <= master_flag(dicr_en(7), dicr2_en, dicr2_fl, dicr2_lo) & dicr2_fl & dicr2_en & dicr2_lo;
+   dbg_irq   <= master_flag(dicr_en(7), dicr_en, dicr_fl, dicr_lo)
+             or master_flag(dicr_en(7), dicr2_en, dicr2_fl, dicr2_lo);
 
    process (clk1x)
       variable idx   : integer range 0 to 12;
@@ -279,7 +303,7 @@ begin
             elsif (bus_addr(3 downto 2) = "00") then          -- 0xF0 DPCR
                bus_dataRead <= dpcr;
             else                                              -- 0xF4 DICR
-               bus_dataRead <= master_flag(dicr_en, dicr_fl, dicr_lo)
+               bus_dataRead <= master_flag(dicr_en(7), dicr_en, dicr_fl, dicr_lo)
                                & dicr_fl & dicr_en & dicr_lo;
             end if;
          end if;
@@ -296,7 +320,7 @@ begin
             else
                case to_integer(bus2_addr(3 downto 2)) is
                   when 0 => bus2_dataRead <= dpcr2;
-                  when 1 => bus2_dataRead <= master_flag(dicr2_en, dicr2_fl, dicr2_lo)
+                  when 1 => bus2_dataRead <= master_flag(dicr_en(7), dicr2_en, dicr2_fl, dicr2_lo)
                                              & dicr2_fl & dicr2_en & dicr2_lo;
                   when 2 => bus2_dataRead <= dmacen;
                   when others => bus2_dataRead <= dmacinten;

@@ -285,6 +285,15 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.dma_dbg_bcr  = CSRStatus(32, description="BCR of the selected channel")
         self.dma_dbg_chcr = CSRStatus(32, description="CHCR of the selected channel; bit 24 start/busy, bit 10 chain mode")
         self.dma_dbg_tadr = CSRStatus(32, description="TADR of the selected channel, the chain-mode tag list")
+        # A transfer finishing and a handler running are different events, and
+        # only these registers say whether the first becomes the second.
+        self.dma_dpcr   = CSRStatus(32, description="DPCR: which of channels 0-6 are enabled")
+        self.dma_dicr   = CSRStatus(32, description="DICR: interrupt enables and flags for channels 0-6")
+        self.dma_dpcr2  = CSRStatus(32, description="DPCR2: which of channels 7-12 are enabled")
+        self.dma_dicr2  = CSRStatus(32, description="DICR2: interrupt enables and flags for channels 7-12; SIF0 is bit 2, SIF1 bit 3")
+        self.dma_irq    = CSRStatus(1,  description="the DMA controller is asserting its interrupt")
+        self.intc_stat  = CSRStatus(32, description="INTC pending: bit 3 is the DMA controller")
+        self.intc_mask  = CSRStatus(32, description="INTC mask: a pending bit does nothing unless it is set here")
 
         # SIF1, the EE -> IOP stream.  The host writes the four-word tag and
         # then the data; the IOP's DMA channel 10 drains it into IOP RAM at the
@@ -499,6 +508,14 @@ class IOPBringup(LiteXModule, AutoCSR):
         for n, csr in (("madr", self.dma_dbg_madr), ("bcr", self.dma_dbg_bcr),
                        ("chcr", self.dma_dbg_chcr), ("tadr", self.dma_dbg_tadr)):
             self.specials += MultiReg(dma_dbg[n], csr.status, "sys")
+        dma_ctl = {n: Signal(w, name="iop_dmactl_" + n) for n, w in
+                   (("dpcr", 32), ("dicr", 32), ("dpcr2", 32), ("dicr2", 32), ("irq", 1),
+                    ("istat", 32), ("imask", 32))}
+        for n, csr in (("dpcr", self.dma_dpcr), ("dicr", self.dma_dicr),
+                       ("dpcr2", self.dma_dpcr2), ("dicr2", self.dma_dicr2),
+                       ("irq", self.dma_irq), ("istat", self.intc_stat), ("imask", self.intc_mask)):
+            self.specials += MultiReg(dma_ctl[n], csr.status, "sys")
+        self.dma_ctl_iop = dma_ctl
         self.dma_dbg_iop = (dma_dbg_sel_iop, dma_dbg)
 
         # sys -> iop, one word at a time.  AsyncFIFO's own domains are named
@@ -651,6 +668,13 @@ class IOPBringup(LiteXModule, AutoCSR):
             o_sif1_dbg_addr  = self.sif1_iop[4]["addr"],
             o_sif1_dbg_len   = self.sif1_iop[4]["len"],
             o_sif1_dbg_tags  = self.sif1_iop[4]["tags"],
+            o_dma_dbg_dpcr   = self.dma_ctl_iop["dpcr"],
+            o_dma_dbg_dicr   = self.dma_ctl_iop["dicr"],
+            o_dma_dbg_dpcr2  = self.dma_ctl_iop["dpcr2"],
+            o_dma_dbg_dicr2  = self.dma_ctl_iop["dicr2"],
+            o_dma_dbg_irq    = self.dma_ctl_iop["irq"],
+            o_intc_dbg_stat  = self.dma_ctl_iop["istat"],
+            o_intc_dbg_mask  = self.dma_ctl_iop["imask"],
             i_dma_dbg_sel    = self.dma_dbg_iop[0],
             o_dma_dbg_madr   = self.dma_dbg_iop[1]["madr"],
             o_dma_dbg_bcr    = self.dma_dbg_iop[1]["bcr"],

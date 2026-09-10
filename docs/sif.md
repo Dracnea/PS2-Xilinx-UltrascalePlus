@@ -136,6 +136,57 @@ word arrives later on `ram_rvalid`. The arbiter in `iop_top.vhd` now honours
 `dma_ram_rnw` instead of forcing writes, and tracks whether the access in flight
 was a read so the word gets back to the right master.
 
+### SIFCMD: the BIOS answers — 2026-09-10
+
+Sending `SIF_CMD_INIT_CMD` to the address the IOP published in `SMCOM`, with the
+EE's own buffer address as its argument, gets a reply:
+
+```
+EE tag: qwc=2 -> EE address 0x00abc000
+        90000002 00abc000 00000000 00000000
+packet: psize=24 dsize=0 dest=0x00000000 cid=0x80000001 (SIF_CMD_SET_SREG)
+        args: 00000000 00000001      -> SREG[0] (RPCINIT) = 1
+```
+
+The IOP re-armed SIF1, programmed channel 9 with a tag at `0x179cc`, and sent
+`SET_SREG(RPCINIT = 1)` — RPC is initialised and the EE may bind. Changing the
+buffer address in the request moves the address in the reply's EE tag, so the
+IOP really did record what it was told rather than answering from something it
+already had.
+
+Note what the stream contains: **four words of the EE's own DMA tag, then the
+packet.** Decoding the first four as a SIFCMD header produces a header that
+looks almost plausible — a psize, a dsize, a cid of zero — which is worse than
+failing outright, and it is what the first reading of this reply did.
+
+### The bug that had silenced half the DMA controller
+
+None of the above happened until a one-bit fix. The packet had been arriving
+correctly for two builds — `MADR` advancing, tags counting, `CHCR` bit 24
+clearing — and the IOP ignored it, because the completion never became an
+interrupt.
+
+`master_flag()` took the master interrupt enable from whichever DICR it was
+testing. For bank 2 that is **DICR2 bit 23, which does not exist**: ps2tek says
+plainly that DICR2 bit 23 is unused and that *DICR* bit 23 is the master channel
+interrupt enable for DICR and DICR2 alike. The BIOS had set everything correctly
+— `DICR = 0x00800000`, `DICR2 = 0x000c0400` enabling channels 9 and 10, INTC
+mask bit 3 set — and this design required a bit the hardware never defines.
+
+So **no channel from 7 to 12 could raise an interrupt**: SIF0, SIF1, SIO2in,
+SIO2out, DEV9, SPU2's second core. Bank 1 was correct, so CDVD and OTC worked,
+and every disc test in this repository uses exactly those two channels. The
+fault was invisible until something needed a bank-2 interrupt, and when it
+finally surfaced it looked like a protocol problem — "the IOP ignores my
+packet" — with a hardware-model cause.
+
+It was found by building the visibility rather than reasoning about the
+protocol: DICR, DICR2, the controller's IRQ line and the INTC's pending and
+mask words are now host-readable, and they showed every enable set except the
+one this design was looking for. The four candidate explanations at the time
+included a malformed packet, with `psize` as the favourite, and that would have
+been the next hour.
+
 ### What the channels must not do
 
 Both SIF channels sit armed for long stretches with nothing moving, and the
@@ -153,8 +204,9 @@ the ISO9660 walk with SIF1 armed and starved.
 2. ~~**The DMA RAM read path.**~~ **Done 2026-09-10.**
 3. ~~**SIF0 and channel 9**, including the walk of the tag at `TADR`.~~
    **Done 2026-09-10.**
-4. **SIFCMD on the host**: packet headers, and the `SIF_CMD_INIT_CMD` exchange
-   that gives each side the other's buffer address.
+4. ~~**SIFCMD on the host**: packet headers, and the `SIF_CMD_INIT_CMD`
+   exchange that gives each side the other's buffer address.~~
+   **Done 2026-09-10.**
 5. **SIFRPC on the host**: bind, then call, then the FILEIO service — which is
    the point of all of it, because `CDVDMAN` and `IOMAN` are invoked through
    an RPC and in no other way.

@@ -34,7 +34,10 @@ entity iop_intc is
       bus_read      : in  std_logic;
       bus_write     : in  std_logic;
       bus_dataRead  : out std_logic_vector(31 downto 0) := (others => '0');
-      irqRequest    : out std_logic := '0'
+      irqRequest    : out std_logic := '0';
+      -- what the controller holds and lets through, for the host
+      dbg_stat      : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_mask      : out std_logic_vector(31 downto 0) := (others => '0')
    );
 end entity;
 
@@ -44,6 +47,10 @@ architecture arch of iop_intc is
    signal i_ctrl   : std_logic := '0';
    signal irq_last : std_logic_vector(31 downto 0) := (others => '0');
 begin
+
+   dbg_stat <= i_stat;
+   dbg_mask <= i_mask;
+
 
    -- The memory mux ORs every peripheral's read data together (PSX_MiSTer
    -- memorymux.vhd, dataFromBusses), so this must be zero except in the cycle
