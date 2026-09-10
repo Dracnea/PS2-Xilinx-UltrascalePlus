@@ -336,6 +336,69 @@ interrupt was never cleared and re-entered forever; and a target of 64 counts in
 repeat mode re-fires every 1.7 us at 36.864 MHz, which is faster than the
 handler returns. Both present as a hung test.
 
+### The BIOS opens a file on the disc — 2026-09-10
+
+`FIO_F_OPEN` is **0**, read out of this BIOS rather than a header: FILEIO's RPC
+dispatcher indexes a 17-entry jump table at `0x410c0`, and identifying each
+worker by the debug string it prints puts `remove` at 6, `mkdir` at 7, `rmdir`
+at 8, `dopen` at 9, `format` at 14, `adddrv` at 15 and `deldrv` at 16 — the
+conventional numbering — with function 0's worker printing
+`'open name %s flag %x data %x'` and `'open fd = %d'`.
+
+Binding to `0x80000001` and calling function 0 with
+`struct _fio_open_arg { int mode; char name[]; }` gets, from the IOP's own log:
+
+```
+read/write allocate memory 4000
+open name cdrom0:\SLUS_212.40;1 flag 1 data 41378
+```
+
+and then, from the CDVD command log, **CDVDMAN issuing a real sector read**:
+
+```
+N command 0x06  11 params  10 00 00 00 01 00 00 00 10 83 00
+   -> LBA 16, 1 sector
+```
+
+which the HBM disc source serves. So the path runs end to end: host RPC →
+SIFCMD → SIFRPC → FILEIO → IOMAN → CDVDMAN → the CDVD block → HBM → the disc.
+That is the BIOS's own file stack reading the game disc, which is what the
+roadmap asked for.
+
+**It does not complete yet.** The open stalls after that first sector: DMA
+channel 3 finished (`CHCR` bit 24 clear, 2048 bytes delivered to `0x24850`),
+INTC has CDROM unmasked with nothing pending, and `DICR` shows channel 3's
+completion *flag* set with its per-channel *enable* clear. No further N command
+follows. Locating that is the next piece of work, and it is in the CDVD block
+rather than anywhere in the SIF path.
+
+**One transfer bug worth keeping.** The first call went out with a 7-word
+argument block, and the SIF1 tag's word count has its low two bits dropped, so
+the channel obeyed 4: it took four words and read the fifth — the middle of the
+filename — as the next tag, which showed up as `addr=0x31325f len=13356`, ASCII
+misread as a header. Argument blocks are padded to a quadword now. The header's
+`dsize` stays the true size; only the transfer is rounded.
+
+### The BIOS patch changes nothing that matters
+
+Everything above was then repeated on the **stock, unpatched** BIOS, and the
+patched image is not required for any of it — only for reading the log.
+
+| | stock | patched |
+|---|---|---|
+| `SMFLAG` / `SMCOM` | `00070000` / `00019600` | identical |
+| modules resident | 28, same names | identical |
+| thread entries and states | same | identical |
+| bind to fileio | `sd=0x41330 buf=0x41378` | identical |
+| RPC open | accepted, CDVDMAN reads LBA 16 | identical |
+| where it stalls | after that sector | identical |
+
+The gateware is byte-identical between the two runs, so this compares the same
+hardware running two programs that differ by eight instructions in a debug sink.
+Every structural invariant matches, including the addresses the service
+registers at. See [bios-fidelity.md](bios-fidelity.md) for why that is the right
+test and what the patch does cost.
+
 ### What the channels must not do
 
 Both SIF channels sit armed for long stretches with nothing moving, and the
@@ -358,8 +421,8 @@ the ISO9660 walk with SIF1 armed and starved.
    **Done 2026-09-10.**
 5. **SIFRPC on the host**: bind, then call, then the FILEIO service — which is
    the point of all of it, because `CDVDMAN` and `IOMAN` are invoked through
-   an RPC and in no other way. *Transport and bind done 2026-09-10; the call
-   remains.*
+   an RPC and in no other way. *Done 2026-09-10: bind, call, and CDVDMAN
+   reading the disc. The open does not yet return — see above.*
 
 Steps 1-3 are also exactly what the Emotion Engine needs later, so none of it
 is spent solely on closing out the disc path.
