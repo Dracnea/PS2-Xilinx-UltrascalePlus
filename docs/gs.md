@@ -306,12 +306,62 @@ A second fix came out of the same pass: `ceil(y/16)` written as `(y+15)/16`
 truncates toward zero in VHDL rather than flooring, so it was wrong for any
 vertex above or left of `XYOFFSET`. An arithmetic shift is the floor.
 
-### What the triangle does not do yet
+## Alpha blending, and the coordinate width — 2026-09-10
+
+**The blender is in**, for sprites and triangles alike:
+`Cv = ((A - B) * C >> 7) + D` per component, where A, B and D each select the
+source colour, the destination colour or zero, and C selects the source alpha,
+the destination alpha or a fixed value. `COLCLAMP` chooses between clamping and
+wrapping, and wrapping is implemented rather than rounded off — content uses the
+overflow deliberately. Only RGB is blended; the alpha written is the source's.
+
+All **162 selector combinations** — every A, B, C, D by both clamp modes — are
+checked directly, and the random suite now generates blending, including the
+selectors that read the destination, since those force a framebuffer read on
+every pixel and take a different path through the drawing logic than an opaque
+write.
+
+**The signed-16 coordinate assumption is gone.** A vertex and `XYOFFSET` are
+each 16-bit unsigned, so their difference spans [-65535, 65535] and never fitted
+in a signed 16 — the window coordinates and the edge unit's ports are 18 bits
+now. Real content stayed well inside the old range, which is exactly why the
+overflow would have gone unnoticed.
+
+### Three faults found on the way, all of them mine
+
+**The blender ran when it should not have.** `PRIM.ABE` gates it, and the RTL
+applied it unconditionally on the masked-write path — which is also taken for an
+ordinary masked write with no blending at all. It was found by forcing `ABE` off
+in the generator and watching *every* seed fail, which said at once that the
+divergence was not in the blender.
+
+**A width change that only half applied.** The edge unit's setup had been
+factored into a procedure, and a patch aimed at the inline version it replaced
+matched nothing — leaving two operands at the old width. It does not elaborate,
+which is the good case.
+
+**The framebuffer model raced itself.** Write and read were separate `always_ff`
+blocks, both non-blocking, so a read could sample memory before a write landed
+and a blended pixel would read a stale destination. They are one block now, the
+write applied first. That is a modelling artifact rather than hardware, but it
+would have made the two disagree in exactly the case blending exists for:
+drawing over something already there.
+
+### What the rasteriser does not do yet
 
 No Gouraud interpolation — flat shading only, the colour of the last vertex. No
-Z, no alpha, no texture, no dither, PSMCT32 only. Vertex coordinates are assumed
-to fit signed 16 bits after `XYOFFSET` is subtracted, which real content
-satisfies and a random generator does not.
+Z test or Z buffer, no texture, no dither, and PSMCT32 only.
+
+Gouraud and Z are the same problem twice: both need a value interpolated across
+the primitive, and the interpolation rule has to be established the way the fill
+rule was — from the hardware, not from a plausible-looking gradient. The edge
+unit generalises to carry them, since a colour or a Z steps along an edge
+exactly as x does.
+
+Dither is small but needs a 16-bit pixel format to act on, so the formats come
+first. Texture is the largest remaining block by a wide margin — `TEX0`, `TEX1`,
+the CLUT, coordinate modes, filtering and mipmaps — and is a milestone rather
+than an increment.
 
 ## Superseded: the first attempt, reverted — 2026-09-10
 

@@ -39,9 +39,14 @@ entity gs_edge_dda is
       -- scanline the triangle covers, which is shared by all three edges so
       -- that they step together.
       start  : in  std_logic;
-      x0, y0 : in  signed(15 downto 0);        -- 12.4 fixed point
-      x1, y1 : in  signed(15 downto 0);
-      ytop   : in  signed(11 downto 0);        -- whole pixels
+      -- 12.4 fixed point, in *window* space -- that is, after XYOFFSET has been
+      -- subtracted.  Seventeen bits, not sixteen: the vertex and the offset are
+      -- each 16-bit unsigned, so their difference spans [-65535, 65535] and does
+      -- not fit in a signed 16.  Real content keeps well inside that, which is
+      -- exactly why the overflow would have gone unnoticed.
+      x0, y0 : in  signed(17 downto 0);
+      x1, y1 : in  signed(17 downto 0);
+      ytop   : in  signed(13 downto 0);        -- whole pixels
       busy   : out std_logic := '0';
 
       -- One scanline down.
@@ -76,16 +81,16 @@ architecture arch of gs_edge_dda is
 begin
    process (clk)
       variable sh    : unsigned(47 downto 0);
-      variable dyv, dxv : signed(17 downto 0);
-      variable ytv      : signed(23 downto 0);
+      variable dyv, dxv : signed(19 downto 0);
+      variable ytv      : signed(25 downto 0);
 
       procedure setup is
       begin
          busy  <= '1';
          -- den = 16*dy, positive because the caller ordered the edge
-         dyv := resize(y1, 18) - resize(y0, 18);
-         dxv := resize(x1, 18) - resize(x0, 18);
-         ytv := shift_left(resize(ytop, 24), 4) - resize(y0, 24);
+         dyv := resize(y1, 20) - resize(y0, 20);
+         dxv := resize(x1, 20) - resize(x0, 20);
+         ytv := shift_left(resize(ytop, 26), 4) - resize(y0, 26);
          den   <= shift_left(resize(dyv, 48), 4);
          dstep <= shift_left(resize(dxv, 48), 4);
          num   <= resize(x0 * dyv, 48) + resize(dxv * ytv, 48);

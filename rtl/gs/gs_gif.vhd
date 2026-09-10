@@ -121,10 +121,10 @@ architecture arch of gs_gif is
    -- Stepping the third as well costs nothing: the recurrence is linear, so an
    -- edge extrapolated outside its own y range is still correct when the
    -- scanline reaches it.
-   type sv16_a is array (0 to 2) of signed(15 downto 0);
+   type sv16_a is array (0 to 2) of signed(17 downto 0);
    type sv13_a is array (0 to 2) of signed(12 downto 0);
    signal e_x0, e_y0, e_x1, e_y1 : sv16_a := (others => (others => '0'));
-   signal e_ytop  : signed(11 downto 0) := (others => '0');
+   signal e_ytop  : signed(13 downto 0) := (others => '0');
    signal e_start : std_logic := '0';
    signal e_step  : std_logic := '0';
    signal e_busy  : std_logic_vector(2 downto 0);
@@ -139,6 +139,11 @@ architecture arch of gs_gif is
    signal dr_fbp     : unsigned(8 downto 0) := (others => '0');
    signal dr_fbw     : unsigned(5 downto 0) := (others => '0');
    signal dr_fbmsk   : std_logic_vector(31 downto 0) := (others => '0');
+   -- the blender's settings, latched with the rest of the primitive
+   signal dr_abe     : std_logic := '0';
+   signal dr_alpha   : std_logic_vector(7 downto 0) := (others => '0');  -- A B C D
+   signal dr_fix     : unsigned(7 downto 0) := (others => '0');
+   signal dr_clamp   : std_logic := '0';
    signal dr_empty   : std_logic := '0';
    signal dr_ret     : state_t := S_TAG;
    signal dr_addr    : unsigned(19 downto 0) := (others => '0');
@@ -171,6 +176,59 @@ architecture arch of gs_gif is
    -- BITBLTBUF's DBP counts 256-byte blocks and FRAME's FBP counts 8 KB pages.
    -- Keeping that conversion at the call sites means one "bp" argument never
    -- silently means two different things.
+   -- Cv = ((A - B) * C >> 7) + D per component, where A, B and D each select the
+   -- source colour, the destination colour or zero, and C the source alpha, the
+   -- destination alpha or a fixed value.  The subtraction is signed and the
+   -- product leaves the byte range in both directions, so COLCLAMP chooses
+   -- between clamping and wrapping -- and wrapping is not a degenerate case to
+   -- skip, because content uses the overflow deliberately.  Only RGB is
+   -- blended; the alpha written is the source's.
+   function blend_px(src, dst : std_logic_vector(31 downto 0);
+                     sel : std_logic_vector(7 downto 0);
+                     fix : unsigned(7 downto 0);
+                     clamp : std_logic) return std_logic_vector is
+      variable res : std_logic_vector(31 downto 0);
+      variable c   : signed(9 downto 0);
+      variable a, b, d : signed(9 downto 0);
+      variable t   : signed(19 downto 0);
+
+      function pick(s : std_logic_vector(1 downto 0);
+                    sv, dv : std_logic_vector(31 downto 0);
+                    n : integer) return signed is
+      begin
+         case s is
+            when "00"   => return signed(resize(unsigned(sv(8 * n + 7 downto 8 * n)), 10));
+            when "01"   => return signed(resize(unsigned(dv(8 * n + 7 downto 8 * n)), 10));
+            when others => return to_signed(0, 10);
+         end case;
+      end function;
+   begin
+      case sel(5 downto 4) is
+         when "00"   => c := signed(resize(unsigned(src(31 downto 24)), 10));
+         when "01"   => c := signed(resize(unsigned(dst(31 downto 24)), 10));
+         when others => c := signed(resize(fix, 10));
+      end case;
+      res := src;
+      for n in 0 to 2 loop
+         a := pick(sel(1 downto 0), src, dst, n);
+         b := pick(sel(3 downto 2), src, dst, n);
+         d := pick(sel(7 downto 6), src, dst, n);
+         t := shift_right((a - b) * c, 7) + resize(d, 20);
+         if clamp = '1' then
+            if t < 0 then
+               res(8 * n + 7 downto 8 * n) := x"00";
+            elsif t > 255 then
+               res(8 * n + 7 downto 8 * n) := x"FF";
+            else
+               res(8 * n + 7 downto 8 * n) := std_logic_vector(t(7 downto 0));
+            end if;
+         else
+            res(8 * n + 7 downto 8 * n) := std_logic_vector(t(7 downto 0));
+         end if;
+      end loop;
+      return res;
+   end function;
+
    function pix_addr_page(pg : unsigned(8 downto 0); bw : unsigned(5 downto 0);
                           x, y : unsigned(10 downto 0)) return unsigned is
       variable page : unsigned(8 downto 0);
@@ -228,7 +286,7 @@ begin
       variable ctxi    : integer range 0 to 1;
       variable ofx, ofy, ax, ay, bx, by, t : integer range -65536 to 65535;
       variable sx0, sx1, sy0, sy1          : integer range 0 to 2047;
-      variable oldpx, newpx                : std_logic_vector(31 downto 0);
+      variable oldpx, newpx, blended       : std_logic_vector(31 downto 0);
       variable ylo, yhi, tya, tyb          : integer range -65536 to 65535;
       variable lft, rgt                    : integer range -4096 to 4095;
       variable ka, kb                      : integer range 0 to 2;
@@ -427,6 +485,10 @@ begin
                         dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
                         dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
                         dr_rgba  <= reg(1)(31 downto 0);
+                        dr_abe   <= reg(0)(6);
+                        dr_alpha <= reg(16#42# + ctxi)(7 downto 0);
+                        dr_fix   <= unsigned(reg(16#42# + ctxi)(39 downto 32));
+                        dr_clamp <= reg(16#46#)(0);
                         dr_x0    <= to_unsigned(ax, 11);
                         dr_x     <= to_unsigned(ax, 11);
                         dr_x1    <= to_unsigned(bx, 11);
@@ -450,20 +512,24 @@ begin
                         -- a fan takes its first vertex from the anchor; a list
                         -- and a strip take the oldest of the three in flight
                         if reg(0)(2 downto 0) = "101" then
-                           t_x(0) <= to_signed(to_integer(vf_x) - ofx, 16);
-                           t_y(0) <= to_signed(to_integer(vf_y) - ofy, 16);
+                           t_x(0) <= to_signed(to_integer(vf_x) - ofx, 18);
+                           t_y(0) <= to_signed(to_integer(vf_y) - ofy, 18);
                         else
-                           t_x(0) <= to_signed(to_integer(v1_x) - ofx, 16);
-                           t_y(0) <= to_signed(to_integer(v1_y) - ofy, 16);
+                           t_x(0) <= to_signed(to_integer(v1_x) - ofx, 18);
+                           t_y(0) <= to_signed(to_integer(v1_y) - ofy, 18);
                         end if;
-                        t_x(1) <= to_signed(to_integer(v2_x) - ofx, 16);
-                        t_y(1) <= to_signed(to_integer(v2_y) - ofy, 16);
-                        t_x(2) <= to_signed(to_integer(unsigned(w_data(15 downto 0))) - ofx, 16);
-                        t_y(2) <= to_signed(to_integer(unsigned(w_data(31 downto 16))) - ofy, 16);
+                        t_x(1) <= to_signed(to_integer(v2_x) - ofx, 18);
+                        t_y(1) <= to_signed(to_integer(v2_y) - ofy, 18);
+                        t_x(2) <= to_signed(to_integer(unsigned(w_data(15 downto 0))) - ofx, 18);
+                        t_y(2) <= to_signed(to_integer(unsigned(w_data(31 downto 16))) - ofy, 18);
                         dr_fbp   <= unsigned(reg(16#4C# + ctxi)(8 downto 0));
                         dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
                         dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
                         dr_rgba  <= reg(1)(31 downto 0);
+                        dr_abe   <= reg(0)(6);
+                        dr_alpha <= reg(16#42# + ctxi)(7 downto 0);
+                        dr_fix   <= unsigned(reg(16#42# + ctxi)(39 downto 32));
+                        dr_clamp <= reg(16#46#)(0);
                         if reg(16#4C# + ctxi)(29 downto 24) /= "000000" then
                            dr_empty <= '1';            -- not PSMCT32
                         else
@@ -596,7 +662,7 @@ begin
                      dr_y  <= to_unsigned(tya, 11);
                      dr_y1 <= to_unsigned(tyb, 11);
                   end if;
-                  e_ytop   <= to_signed(tya, 12);
+                  e_ytop   <= to_signed(tya, 14);
                   e_start  <= '1';
                   tri_mode <= '1';
                   state    <= S_TRI_WAIT;
@@ -660,7 +726,7 @@ begin
                   else
                      wa   := pix_addr_page(dr_fbp, dr_fbw, dr_x, dr_y);
                      lane := to_integer(wa(2 downto 0));
-                     if dr_fbmsk = x"00000000" then
+                     if dr_fbmsk = x"00000000" and dr_abe = '0' then
                         -- nothing to preserve, so no read is needed: the common
                         -- case stays one pixel per clock
                         wr_en   <= '1';
@@ -702,7 +768,16 @@ begin
                      lane := to_integer(dr_addr(2 downto 0));
                      oldpx := std_logic_vector(
                                  shift_right(unsigned(rd_data), 32 * lane)(31 downto 0));
-                     newpx := (oldpx and dr_fbmsk) or (dr_rgba and not dr_fbmsk);
+                     -- PRIM.ABE decides whether the blender runs at all.  This
+                     -- path is also taken for a plain masked write, where the
+                     -- destination is read to preserve the masked bits and the
+                     -- source must go through untouched.
+                     if dr_abe = '1' then
+                        blended := blend_px(dr_rgba, oldpx, dr_alpha, dr_fix, dr_clamp);
+                     else
+                        blended := dr_rgba;
+                     end if;
+                     newpx := (oldpx and dr_fbmsk) or (blended and not dr_fbmsk);
                      wr_en   <= '1';
                      wr_addr <= std_logic_vector(dr_addr(19 downto 3));
                      wr_data <= std_logic_vector(shift_left(

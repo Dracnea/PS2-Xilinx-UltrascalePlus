@@ -42,6 +42,23 @@ AD_ADDRS = [0x00, 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0A,
             0x0B, 0x20, 0x55, 0x70]
 
 
+def blend_regs(rng):
+    """ALPHA and COLCLAMP, and whether PRIM enables blending at all.
+
+    All four selectors are generated, including the ones that read the
+    *destination* -- those are what force a framebuffer read on every pixel and
+    so take a different path through the drawing logic than an opaque write.
+    Both clamp modes appear, because wrapping is a deliberate effect and not a
+    corner to be rounded off.
+    """
+    abe = rng.randrange(2)
+    a, b, c, d = (rng.randrange(3), rng.randrange(3),
+                  rng.randrange(3), rng.randrange(3))
+    fix = rng.randrange(256)
+    alpha = a | (b << 2) | (c << 4) | (d << 6) | (fix << 32)
+    return abe, alpha, rng.randrange(2)
+
+
 def tag(nloop, eop, regs, nreg, flg=0, pre=0, prim=0):
     return (nloop | (eop << 15) | (pre << 46) | (prim << 47) |
             (flg << 58) | ((nreg & 15) << 60) | (regs << 64))
@@ -64,12 +81,14 @@ def gen(rng, ntags):
             msk = rng.choice([0x00000000, 0x00000000, 0xFF000000, 0x0000FFFF])
             sc  = (rng.randrange(0, 8), rng.randrange(40, 64),
                    rng.randrange(0, 4), rng.randrange(20, 32))
+            abe, alpha, clamp = blend_regs(rng)
             items = [(0x4C, fbp | (1 << 16) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x40 + 1, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
+                     (0x42, alpha), (0x46, clamp),
                      (0x01, rng.randrange(1 << 32)),
-                     (0x00, 6)]
+                     (0x00, 6 | (abe << 6))]
             regs = 0
             for i in range(len(items)):
                 regs |= 0xE << (4 * i)
@@ -90,11 +109,13 @@ def gen(rng, ntags):
             msk = rng.choice([0x00000000, 0x00000000, 0xFF000000])
             sc  = (rng.randrange(0, 4), rng.randrange(40, 64),
                    rng.randrange(0, 4), rng.randrange(20, 32))
+            abe, alpha, clamp = blend_regs(rng)
             items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
+                     (0x42, alpha), (0x46, clamp),
                      (0x01, rng.randrange(1 << 32)),
-                     (0x00, prim)]
+                     (0x00, prim | (abe << 6))]
             regs = 0
             for i in range(len(items)):
                 regs |= 0xE << (4 * i)

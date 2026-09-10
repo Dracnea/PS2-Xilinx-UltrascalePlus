@@ -132,6 +132,50 @@ class GS:
         elif addr in (0x0C, 0x0D):            # XYZF3 / XYZ3: queue only
             self.vertex(data, kick=False)
 
+    # -- the pixel back end --------------------------------------------------
+    def blend(self, src, dst, ctx):
+        """One pixel through the alpha blender, if PRIM.ABE says so.
+
+        Cv = ((A - B) * C >> 7) + D, per component, where A, B and D each select
+        the source colour, the destination colour or zero, and C selects the
+        source alpha, the destination alpha or a fixed value.  The subtraction
+        is signed and the product can leave the byte range in both directions,
+        so COLCLAMP decides between clamping and wrapping -- and wrapping is not
+        a degenerate case to skip: content uses it deliberately for effects that
+        rely on the overflow.
+
+        Only RGB is blended.  The alpha written is the source's, which is why
+        the blender cannot simply be run over four components.
+        """
+        if bits(self.reg[0x00], 6, 6) == 0:          # PRIM.ABE
+            return src
+        al = self.reg[0x42 + ctx]
+        sel_a, sel_b, sel_c, sel_d = (bits(al, 1, 0), bits(al, 3, 2),
+                                      bits(al, 5, 4), bits(al, 7, 6))
+        fix = bits(al, 39, 32)
+        clamp = bits(self.reg[0x46], 0, 0)
+
+        def comp(v, n):
+            return (v >> (8 * n)) & 0xFF
+
+        if   sel_c == 0: c = comp(src, 3)
+        elif sel_c == 1: c = comp(dst, 3)
+        else:            c = fix
+
+        out = 0
+        for n in range(3):
+            def pick(sel):
+                if sel == 0: return comp(src, n)
+                if sel == 1: return comp(dst, n)
+                return 0
+            v = (((pick(sel_a) - pick(sel_b)) * c) >> 7) + pick(sel_d)
+            if clamp:
+                v = 0 if v < 0 else (255 if v > 255 else v)
+            else:
+                v &= 0xFF
+            out |= v << (8 * n)
+        return out | (comp(src, 3) << 24)            # alpha comes from the source
+
     # -- primitives ---------------------------------------------------------
     def ctx(self):
         """0 or 1: which of the two register contexts this primitive uses."""
@@ -234,7 +278,8 @@ class GS:
                 if a >= VM_WORDS:
                     continue
                 old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
-                v = (old & fbmsk) | (rgba & ~fbmsk & 0xFFFFFFFF)
+                px = self.blend(rgba, old, c)
+                v = (old & fbmsk) | (px & ~fbmsk & 0xFFFFFFFF)
                 self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
                 self.pixels += 1
 
@@ -277,7 +322,8 @@ class GS:
                 if a >= VM_WORDS:
                     continue
                 old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
-                v = (old & fbmsk) | (rgba & ~fbmsk & 0xFFFFFFFF)
+                px = self.blend(rgba, old, c)
+                v = (old & fbmsk) | (px & ~fbmsk & 0xFFFFFFFF)
                 self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
                 self.pixels += 1
 

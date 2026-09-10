@@ -43,23 +43,31 @@ module tb_gs;
    localparam VMBYTES = 4*1024*1024;
    logic [7:0] vm [0:VMBYTES-1];
    integer b;
-   always_ff @(posedge clk) begin
-      if (wr_en)
-         for (b = 0; b < 32; b = b + 1)
-            if (wr_be[b]) vm[{wr_addr, 5'd0} + b] <= wr_data[b*8 +: 8];
-   end
-
-   // Read port, two clocks of latency, as gs_lmem gives with its UltraRAM
-   // output registers.  A masked write is a read-modify-write, so the draw path
-   // has to tolerate that latency rather than assume the value is just there.
+   // Write and read live in one block, with the write applied first, so a read
+   // always sees every write that has already happened.  Two separate always_ff
+   // blocks race: both use non-blocking assignment, so the read can sample the
+   // memory before the write lands, and a blended pixel then reads a stale
+   // destination.  That is a modelling artifact, not hardware -- but it makes
+   // the reference and the RTL disagree about colours in exactly the case
+   // blending exists for, which is drawing over something already there.
    logic [255:0] rd_s1;
    logic         rd_v1;
    integer       c;
    always_ff @(posedge clk) begin
+      if (wr_en)
+         for (b = 0; b < 32; b = b + 1)
+            if (wr_be[b]) vm[{wr_addr, 5'd0} + b] <= wr_data[b*8 +: 8];
+      // two clocks of latency, as gs_lmem gives with its UltraRAM output
+      // registers, so the draw path has to tolerate it rather than assume the
+      // value is simply there
       rd_v1 <= rd_en;
       if (rd_en)
          for (c = 0; c < 32; c = c + 1)
-            rd_s1[c*8 +: 8] <= vm[{rd_addr, 5'd0} + c];
+            rd_s1[c*8 +: 8] <= (wr_en && wr_be[c] &&
+                                ({rd_addr, 5'd0} + c) == ({wr_addr, 5'd0} + c) &&
+                                rd_addr == wr_addr)
+                               ? wr_data[c*8 +: 8]
+                               : vm[{rd_addr, 5'd0} + c];
       rd_data  <= rd_s1;
       rd_valid <= rd_v1;
    end

@@ -11,8 +11,8 @@ module tb_edge_dda;
    always #5 clk = ~clk;
 
    logic               start = 0, step = 0, busy;
-   logic signed [15:0] x0, y0, x1, y1;
-   logic signed [11:0] ytop;
+   logic signed [17:0] x0, y0, x1, y1;
+   logic signed [13:0] ytop;
    logic signed [12:0] x;
 
    gs_edge_dda dut (.clk(clk), .reset(reset), .start(start),
