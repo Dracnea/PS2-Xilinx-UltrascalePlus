@@ -223,6 +223,43 @@ division, and VHDL's integer division truncates toward zero. For a leftward edge
 the two differ, and the remainder must stay in `[0, den)` for the single
 correction to be enough.
 
+## The edge DDA in RTL — 2026-09-10
+
+`rtl/gs/gs_edge_dda.vhd` implements one triangle edge: two divisions at setup,
+then an add and at most one correction per scanline. It agrees with the
+reference exactly across **13,693 scanlines over twelve seeds**, sub-pixel
+endpoints included.
+
+It is built and tested **on its own, before the rasteriser that will use it**,
+because a wrong span and a wrong pixel loop look identical in a framebuffer and
+only one of them is an arithmetic problem. Three bugs came out of that, and none
+would have been obvious from a picture:
+
+**Width.** A VHDL multiplication returns the sum of its operands' widths, so
+forming the products at 41 bits each and assigning an 82-bit result to a 41-bit
+signal does not even elaborate. The products are now formed at their natural
+width and resized once.
+
+**A sampling race in the testbench.** `busy` is driven by the same edge the
+driving process wakes on, so reading it there gets the value from *before* the
+edge: the wait loop fell straight through and every result was read out of a
+unit that had not started. This is the identical race the EE testbench had on
+`retire_pc`, which is worth noting — the instrument fails the same way twice if
+you let it.
+
+**A lost start pulse.** `start` is high for one cycle, and the restart path went
+back to `S_IDLE` to wait for a pulse that had already gone. Every edge after the
+first kept the previous one's quotient and remainder, so the output was a
+plausible *constant* rather than an obvious failure — the kind that survives a
+quick look at a waveform. The setup is now a procedure called from both entry
+points, so the two cannot drift apart.
+
+The floor-versus-truncate hazard flagged when the formulation was proven turned
+out to be real and is handled: VHDL's integer division truncates toward zero, so
+for a leftward edge the quotient step is off by one and the remainder goes
+negative. Edge 1 of the very first seed was such an edge — `dx = -5433`, where
+floor gives `qstep = -29, rstep = 1232` and truncation gives `-28, -1808`.
+
 ## What is not started
 
 The rest of step 4 — triangles (flat, then Gouraud, then textured), lines and

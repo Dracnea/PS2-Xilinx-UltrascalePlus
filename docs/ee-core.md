@@ -211,12 +211,30 @@ change to the datapath.
 | Five-stage pipeline, one EX | 212.0 MHz | 6,859 | `w_rd` → forwarding mux → 64-bit branch compare → `fetch_pc` adder |
 | Execution split into A1/A2 | 242.8 MHz | 7,081 | `m_rd` → forwarding mux → 64-bit ALU → result register |
 | Fetch unit with 3 requests in flight | 251.9 MHz | 6,424 | `w_we` → forwarding mux → 64-bit ALU → result register |
-| Unaligned loads and stores added | **252.1 MHz** | — | unchanged |
+| Unaligned loads and stores added | 252.1 MHz | — | unchanged |
+| Exceptions added | **228.2 MHz** | — | `w_rd` → forwarding mux → ALU → result register (unchanged in shape) |
 
 The unaligned group cost nothing in clock, which was not obvious in advance: it
 adds a shifter and a merge to the memory path. It stays off the critical path
 because that path is the ALU in A1, and the merge happens in A2 where there is
 slack.
+
+**Exceptions cost about 10%, and the reason is not yet established.** The first
+guess was the overflow check: it was written as a 33-bit add with the carry and
+sign bits compared, which puts a wider adder *in series* on the path that was
+already critical. Rewriting it to read overflow off the sign bits — two operands
+of the same sign giving a sum of the other sign — puts that test beside the
+32-bit adder instead of after a wider one, and moved the number from 227.7 to
+228.2 MHz. That is nothing. The hypothesis was wrong.
+
+The rewrite is kept because it is the better formulation regardless, but the
+10% remains unexplained: the critical path is unchanged in *shape* (`w_rd` →
+forwarding mux → ALU → result register) and only slightly longer in levels, so
+the cost is more likely spread through congestion than sitting in one place.
+Given that placement variance on this design has already measured at ±5% in both
+directions, part of the gap may not be real at all. It is recorded rather than
+explained, and worth a proper look before the next datapath change rather than
+an assumption now.
 
 Target is 294.912 MHz. The core is 10.4x faster than the first measurement and
 needs 1.17x more.
