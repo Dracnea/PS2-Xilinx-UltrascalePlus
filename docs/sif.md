@@ -209,14 +209,67 @@ answering correctly; the IOP simply has no registered servers. Searching a
 2 MB dump of IOP RAM agrees: no aligned `SifRpcServerData_t` holding
 `0x80000001` exists, and `0x80000006` and `0x80000592` never appear at all.
 
-> **NOTE (unverified): why no service is registered.** Every BIOS module that
-> would provide one is resident — FILEIO, CDVDFSV, LOADFILE are all in the
-> module map — and the RPC layer reports itself initialised (`SREG[0]` =
-> RPCINIT = 1). What has not been established is whether their server threads
-> ever run, or whether registration waits on something the EE has not yet done.
-> *Verify by:* finding the RPC service table the bind handler searches, which
-> is reachable from the same structures SIFCMD uses, and reading it directly
-> rather than inferring its contents from bind failures.
+### The service table, read directly
+
+The bind handler and the table it searches were found by walking the IOP's own
+structures out of a RAM dump rather than inferring them from failures.
+
+`SMCOM` names the receive buffer at `0x19600`. The SIFCMD data block that owns
+it is at **`0x196c0`**:
+
+```
++0x00 00019600   the receive buffer, which is what SMCOM publishes
++0x08 00abc000   the EE buffer address -- the one the host sent in INIT_CMD
++0x0c 000196f0   the handler table
++0x10 00000020   32 slots
+```
+
+The handler table at `0x196f0` is (function, data) pairs indexed by the low byte
+of the cid, and it is populated exactly where it should be:
+
+```
+[ 0] CHANGE_SADDR func=00017e4c data=000196c0
+[ 1] SET_SREG     func=00017e30 data=000196c0
+[ 2] INIT_CMD     func=00017e9c data=000196c0
+[ 3] RESET_CMD    func=0001a9f8 data=0001ad20
+[ 8] RPC_END      func=000187c4 data=0001a870
+[ 9] RPC_BIND     func=00018a78 data=0001a870
+[10] RPC_CALL     func=00018c38 data=0001a870
+[12] RPC_RDATA    func=00018898 data=0001a870
+```
+
+Disassembling `RPC_BIND` at `0x18a78` shows it take the sid from word 8 of the
+packet, call a lookup at `0x18a18`, and on a zero result write zero to the
+reply's `sd`, `buf` and `cbuf` — which is exactly the reply the host received.
+
+The lookup is nine instructions and names the table outright:
+
+```
+lw $a1,32($a1)      ; the service queue list head, at rpc_data + 0x20
+beq $a1,$zero,fail  ; null -> not found
+lw $v1,8($a1)       ; queue->start
+lw $v0,0($v1)       ; server->sid
+beq $v0,$a0,found
+lw $v1,56($v1)      ; server->next
+lw $a1,20($a1)      ; queue->next
+```
+
+The RPC data block is at `0x1a870` and holds live buffers — `+0x04 = 0x19870`,
+which is the address channel 9 was observed sending from. Its list head,
+**`0x1a890`, reads `0x00000000`.**
+
+So the lookup fails at its first dereference. There is no server missing from a
+queue: **no queue has ever been registered.** The RPC subsystem is initialised
+and dispatching correctly, and nothing has called into it to offer a service.
+
+> **NOTE (unverified): why no module registers one.** Every module that would
+> is resident — FILEIO, CDVDFSV and LOADFILE are all in the map — the RPC layer
+> reports itself initialised, and the scheduler is running (below). What has not
+> been established is whether those modules' server threads start and block, or
+> never start, or deliberately wait for something the EE has not done. The
+> difference matters: the first is a defect here, the last is simply more EE.
+> *Verify by:* finding THREADMAN's thread list the same way this table was
+> found, and reading the state of the threads those modules create.
 
 **A theory that was wrong, recorded because the method matters.** The first
 explanation was that the IOP's thread scheduler never ticks: INTC bit 16 —
@@ -225,8 +278,11 @@ pending across three seconds of 1 ms sampling, and no scheduler tick would mean
 no module thread ever runs. It fitted the evidence exactly, including why
 interrupt-context work (SIFCMD) succeeds while thread-context work does not.
 
-It was wrong. Boot-test stage `14` programs timer 5 directly at each of its four
-prescaler settings and **all four raise their interrupt**. The bit was never
+It was wrong, twice over. Boot-test stage `14` programs timer 5 directly at each
+of its four prescaler settings and **all four raise their interrupt**; and
+sampling INTC every 2.6 us instead of every millisecond — 1.57 million samples
+in four seconds — catches **TIMER5 pending while the BIOS runs**. The tick is
+there and always was. The bit was never
 observed pending because the BIOS's own handler acknowledges it faster than the
 host can sample — the same mistake as reading `CHCR` bit 24 on a channel whose
 completion was instant, twice now in one week: *sampling a bit that is cleared
