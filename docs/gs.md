@@ -360,6 +360,85 @@ interleaves like the 32-bit ones, `blk = by2·bx1·by1·bx0·by0` and
 and a block of 16×8. It needs the 16-bit pixel packing (RGBA5551) to go with it,
 and dither needs *it*, since dither is inert on a 32-bit format.
 
+## What the primary source settles, and what it does not — 2026-09-10
+
+Sony's **GS User's Manual version 6.0** was obtained and read (it is an
+encrypted PDF; `poppler-utils` reads it). It is the authority this project has
+been citing second-hand, and it settles three questions and refuses a fourth.
+
+### Confirmed: the fill rule, from the source
+
+> *"Draws the pixels in the three sides specified by the three vertices. When a
+> side passes the center of a pixel, drawing is performed if it is the left
+> side, and is not performed if it is the right side. When a side parallel to
+> the X axis passes the center of a pixel, drawing is performed if it is the top
+> side, and is not performed if it is the bottom side."* — §3.2.9
+
+That is the top-left rule, and the "center of a pixel" wording reconciles with
+what was derived from PCSX2's `ceil` behaviour once the coordinate convention is
+pinned down: paraLLEl-GS states independently that on the GS **pixel centres sit
+at integer coordinates**, so "a side passes the centre of a pixel" is a side
+passing through integer (x, y) — which is where this implementation samples.
+Three sources now agree, one of them Sony's own. The rule is no longer
+provisional.
+
+### Confirmed: two rules already implemented
+
+> *"the Z coordinate and Fog coordinate of the first vertex are ignored, and the
+> setting for the second one takes effect"* — for a Sprite.
+
+> *"when doing Flat shading … the vertex color information set immediately
+> before each drawing kick becomes effective"* — the last vertex's colour.
+
+Both match what is implemented. It is worth having checked rather than assumed:
+either could have been the first vertex, and nothing in the differential harness
+would have noticed, because the reference and the RTL would have been wrong
+together.
+
+### Not documented: the DDA's interpolation precision
+
+The manual describes the pipeline — setup computes "the gradient … and the
+initial value of DDA", rasterising generates 8 or 16 pixels concurrently and
+"the RGBA value, Z value, texture value and Fog value for each pixel are
+calculated from the gradient" — and states the pixel pipeline's *arithmetic*
+precision as "32-bit calculation precision (8 bits each for RGB + 8 bits for
+Alpha)". **It never states how many fractional bits the DDA carries between
+pixels.** Keyword search, a semantic search over the whole manual using a local
+embedding model, ps2tek and psdevwiki all come up empty.
+
+Nor is it known elsewhere. paraLLEl-GS — the most accuracy-focused GS
+implementation in existence — says plainly that it "isn't really aiming for
+bit-accuracy against hardware", rasterises with barycentrics rather than
+emulating the DDA, and uses FP32 for Z while acknowledging uncertainty about
+32-bit fixed-point Z. PCSX2 interpolates in floating point. **Nobody has this.**
+
+### The decision that follows
+
+Three options existed and the middle one is now excluded:
+
+1. **Exact interpolation** — evaluate the plane exactly at each pixel centre,
+   in rational arithmetic in the reference and as an exact quotient/remainder
+   DDA in the RTL, which is the same mechanism `gs_edge_dda` already uses and
+   was already proved bit-exact against the reference.
+2. **Reverse-engineer the hardware DDA** — needs a PS2 and test ROMs, which
+   this project does not have.
+3. **Copy an existing emulator** — would encode *its* floating-point
+   approximation as though it were hardware, and it is documented as not being
+   hardware.
+
+**Option 1.** It is the mathematically exact answer to "what colour is this
+pixel", it is deterministic and reproducible on both sides of the harness, and
+it is at least as close to hardware as anything that exists. The residual risk
+is bounded and should be stated: against real silicon a Gouraud channel may
+differ by a least-significant bit where the hardware DDA's rounding differs from
+exact. For colour that is invisible. **For Z it is not** — a depth test at an
+exact tie could flip — so when Z is implemented that risk is carried
+deliberately and noted where a game shows Z-fighting the hardware does not.
+
+If a real PS2 becomes available, the open question is small and precisely
+stated: draw a triangle with known vertex colours and read back the framebuffer,
+and the LSB pattern along a scanline answers it.
+
 ### What the rasteriser does not do yet
 
 No Gouraud interpolation — flat shading only, the colour of the last vertex. No
