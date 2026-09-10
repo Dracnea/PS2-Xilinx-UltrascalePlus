@@ -262,68 +262,51 @@ So the lookup fails at its first dereference. There is no server missing from a
 queue: **no queue has ever been registered.** The RPC subsystem is initialised
 and dispatching correctly, and nothing has called into it to offer a service.
 
-### Why nothing registers: FILEIO never gets that far
+### Why nothing registered: INIT_CMD carries two meanings — solved 2026-09-10
 
-Read out of the same dump, by walking the structures rather than guessing.
-
-**The module is resident and healthy.** Its module-info block is at `0x3fd00`,
-naming `FILEIO_service` with entry `0x3fd30`, which matches the module map.
-
-**It does not refuse to start.** FILEIO's entry begins with `QueryBootMode(3)`
-and, if that key exists with bit 0 or bit 1 set, prints `' No SIF
-service(fileio)'` or `' No FILEIO service'` and returns without starting. The
-boot-mode table pointer lives at absolute `0x3f0`, points at `0x32c0`, and holds
-exactly one entry — key 4, length 0. **There is no key 3**, so the query returns
-zero and FILEIO takes the normal path.
-
-**Its threads exist and were started.** The IOP has five thread control blocks;
-every TCB begins with the same word (`0x11948`), which makes them enumerable,
-and the status byte is at `+0x44`:
+`SIF_CMD_INIT_CMD` is not one message. Its handler at `0x17e9c` branches on the
+packet's `opt` field:
 
 ```
-TCB       entry     stack     size  prio  status
-0x0117c8  0001aef8  001fce00  4096   10   WAIT
-0x011820  0001aa58  001fde00  2048    0   -
-0x0391e0  00040ca0  001fae00  2048   96   WAIT     FILEIO
-0x039238  00040a34  001fb600  4096   80   WAIT     FILEIO
-0x039290  00039434  001fc600  2048    0   RUN
+lw $v0,12($s1)          ; opt
+bne $v0,$zero,0x17ee0
+  ; opt == 0: SetEventFlag(evf, 0x100), and store the EE's buffer address
+0x17ee0:
+  ; opt != 0: SetEventFlag(evf, 0x800)
 ```
 
-Both FILEIO threads are **WAIT**, not DORMANT and not absent: `CreateThread`
-and `StartThread` both succeeded.
+FILEIO's service thread prints its banner and then blocks in
+`WaitEventFlag(evf, 0x800, WAIT_AND, NULL)` — identified from its argument
+checks, where `-18` masks the mode against `~0x11` and a zero pattern is
+rejected — *before* it calls `sceSifSetRpcQueue` and registers. Every module
+that offers an RPC service waits on the same bit.
 
-**It never reaches the registration.** Disassembling the service thread at
-`0x40a34` shows it print its banner, take its thread id, call
-`sceSifSetRpcQueue` with a queue descriptor at `0x41318`, then register with
-`$a1 = 0x80000001` — the fileio service id — and a server-data block at
-`0x41330`. Both of those blocks read **all zeros**, so neither call has run.
-That is consistent with the service list head at `0x1a890` being null, and with
-every bind the host has sent coming back with `sd`, `buf` and `cbuf` zero.
+ps2sdk's `sceSifInitCmd` sends `opt = 0`, which records the EE's buffer and sets
+bit `0x100`. That is the half the host had been sending. The modules are
+released by a **second** INIT_CMD with `opt != 0`, and until it arrives the
+service list stays empty and every bind returns null — which is exactly what was
+observed for three rounds.
 
-The thread's stack carries the return addresses `0x40a74` (the call before
-`GetThreadId`), then `0x18630` inside the SIF library, then kernel frames —
-which places the block inside SIF RPC initialisation, ahead of the registration.
+Sending both, in order, gets:
 
-> **NOTE (unverified): what it is waiting on.** The saved return addresses put
-> the thread in the SIF init path, but a return address on a stack is where a
-> call *was* made, not necessarily where the thread is parked now, and the exact
-> kernel primitive has not been identified.
-> *Verify by:* not the serial console. That was tried on 2026-09-10 and does
-> not work against a retail BIOS, for a reason `iop_top.vhd` already recorded
-> before it was tried: "there is no serial console on a retail BIOS to print
-> it." The console block taps SIO1 at `0x1F801050`, and the BIOS's `printf`
-> does not go there — it formats into a buffer and flushes through **IOMAN**,
-> to file descriptor 1. With no tty device bound to that descriptor the bytes
-> are discarded, so the port stays silent no matter how much the BIOS prints.
-> The capture is still worth having for the test ROMs, which can write SIO1
-> directly, but it answers nothing about a BIOS boot.
->
-> What would work is redirecting the BIOS's own output: the ROM image is
-> supplied by the host, so patching the character sink at `0x163e0` (or the
-> flush at `0x16478`) to store to SIO1 would make every module's messages
-> visible through the FIFO that now exists, without a gateware rebuild. It
-> changes the image under test, which is a real cost and has to be stated
-> whenever a result depends on it.
+```
+server: sd=0x00041330 buf=0x00041378 cbuf=0x00000000
+bound. Arguments for a call go to IOP 0x00041378
+```
+
+`0x41330` is the server-data address read out of FILEIO's own code before any of
+this worked, now filled in — so the prediction and the result agree. The boot
+also goes further, adding `cdvd driver module version 0.1.1 (C)SCEI` to the log,
+because CDVDFSV was waiting on the same bit.
+
+**How it was found, since three rounds of reading structures had not.** The IOP
+prints a line per module and a retail BIOS discards all of them; patching the
+character sink to write SIO1 made the log readable
+([bios-fidelity.md](bios-fidelity.md)), and the log showed FILEIO's banner
+present and everything after it absent. That located the block between two
+specific instructions, and the handler's `opt` branch was three disassembled
+lines away. Reading the machine's own account of itself beat inferring its state
+from the structures it had not yet written.
 
 **A theory that was wrong, recorded because the method matters.** The first
 explanation was that the IOP's thread scheduler never ticks: INTC bit 16 —
@@ -375,8 +358,8 @@ the ISO9660 walk with SIF1 armed and starved.
    **Done 2026-09-10.**
 5. **SIFRPC on the host**: bind, then call, then the FILEIO service — which is
    the point of all of it, because `CDVDMAN` and `IOMAN` are invoked through
-   an RPC and in no other way. *Transport done 2026-09-10; blocked on the IOP
-   registering a service to bind to.*
+   an RPC and in no other way. *Transport and bind done 2026-09-10; the call
+   remains.*
 
 Steps 1-3 are also exactly what the Emotion Engine needs later, so none of it
 is spent solely on closing out the disc path.
