@@ -86,6 +86,14 @@ entity iop_top is
       dma_dbg_chcr  : out std_logic_vector(31 downto 0);
       dma_dbg_tadr  : out std_logic_vector(31 downto 0);
 
+      -- SIF0: the IOP's stream out to the EE, drained by the host
+      sif0_we       : out std_logic;
+      sif0_data     : out std_logic_vector(31 downto 0);
+      sif0_full     : in  std_logic := '0';
+      sif0_dbg_addr : out std_logic_vector(23 downto 0);
+      sif0_dbg_len  : out std_logic_vector(23 downto 0);
+      sif0_dbg_tags : out unsigned(15 downto 0);
+
       -- SIF1: the EE's half of the stream, driven by the host
       sif1_kick     : in  std_logic := '0';
       sif1_valid    : in  std_logic := '0';
@@ -203,11 +211,15 @@ architecture arch of iop_top is
    signal bus_dma_writeMask, bus_dma2_writeMask, bus_ssb2_writeMask, bus_sif_writeMask : std_logic_vector(3 downto 0);
    -- DMA controller: its RAM master port and the arbitration against the mux
    signal dma_ram_req    : std_logic;
+   signal dma_ram_rnw    : std_logic;
+   signal dma_ram_rdata  : std_logic_vector(31 downto 0);
+   signal dma_ram_rvalid : std_logic;
    signal dma_ram_addr   : std_logic_vector(23 downto 0);
    signal dma_ram_wdata  : std_logic_vector(31 downto 0);
    signal dma_grant      : std_logic;
    signal ramarb_busy    : std_logic := '0';
    signal ramarb_dma     : std_logic := '0';
+   signal ramarb_dmard   : std_logic := '0';   -- the DMA access in flight is a read
    signal ram_done_mux   : std_logic;
    -- one-entry hold for a CPU request that arrives while the DMA has the port
    signal cpu_pend       : std_logic := '0';
@@ -372,8 +384,8 @@ begin
    cpu_wdata <= pend_wdata when cpu_pend = '1' else ram_dataWrite;
 
    ram_ena_m   <= peek_req  when peek_mode = '1' else (cpu_issue or dma_grant);
-   ram_rnw_m   <= '1'       when peek_mode = '1' else
-                  '0'       when dma_grant = '1' else cpu_rnw;
+   ram_rnw_m   <= '1'          when peek_mode = '1' else
+                  dma_ram_rnw  when dma_grant = '1' else cpu_rnw;
    ram_Adr_m   <= peek_addr when peek_mode = '1' else
                   ('0' & dma_ram_addr) when dma_grant = '1' else cpu_adr;
    ram_be_m    <= "1111"    when peek_mode = '1' else
@@ -383,19 +395,24 @@ begin
    ram_dataWrite_m <= dma_ram_wdata when dma_grant = '1' else cpu_wdata;
 
    ram_done_mux <= ram_done and not (ramarb_dma or dma_grant);
+   dma_ram_rvalid <= ram_done and ramarb_dmard;
+   dma_ram_rdata  <= ram_dataRead;
 
    process (clk1x)
    begin
       if rising_edge(clk1x) then
          if (reset = '1') then
-            ramarb_busy <= '0';
-            ramarb_dma  <= '0';
+            ramarb_busy  <= '0';
+            ramarb_dma   <= '0';
+            ramarb_dmard <= '0';
          elsif (ram_done = '1') then
-            ramarb_busy <= '0';
-            ramarb_dma  <= '0';
+            ramarb_busy  <= '0';
+            ramarb_dma   <= '0';
+            ramarb_dmard <= '0';
          elsif (ram_ena_m = '1' and peek_mode = '0') then
-            ramarb_busy <= '1';
-            ramarb_dma  <= dma_grant;
+            ramarb_busy  <= '1';
+            ramarb_dma   <= dma_grant;
+            ramarb_dmard <= dma_grant and dma_ram_rnw;
          end if;
       end if;
    end process;
@@ -850,6 +867,9 @@ begin
       bus2_write     => bus_dma2_write,
       bus2_dataRead  => bus_dma2_dataRead,
       ram_req        => dma_ram_req,
+      ram_rnw        => dma_ram_rnw,
+      ram_rdata      => dma_ram_rdata,
+      ram_rvalid     => dma_ram_rvalid,
       ram_addr       => dma_ram_addr,
       ram_wdata      => dma_ram_wdata,
       ram_gnt        => dma_grant,
@@ -860,6 +880,12 @@ begin
       dbg_channel    => open,
       dbg_words      => open,
       dbg_running    => open,
+      sif0_we        => sif0_we,
+      sif0_data      => sif0_data,
+      sif0_full      => sif0_full,
+      dbg_sif0_addr  => sif0_dbg_addr,
+      dbg_sif0_len   => sif0_dbg_len,
+      dbg_sif0_tags  => sif0_dbg_tags,
       sif1_kick      => sif1_kick,
       sif1_valid     => sif1_valid,
       sif1_data      => sif1_data,

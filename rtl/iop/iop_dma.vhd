@@ -78,9 +78,14 @@ entity iop_dma is
       bus2_write    : in  std_logic;
       bus2_dataRead : out std_logic_vector(31 downto 0) := (others => '0');
 
-      -- RAM master.  ram_req is held until ram_gnt; the word is written on the
-      -- granted cycle.  Reads are not used yet (no channel moves RAM -> device).
+      -- RAM master.  ram_req is held until ram_gnt; a write completes on the
+      -- granted cycle.  A read is two-sided: the grant only means the access
+      -- was issued, and the word arrives later on ram_rvalid.  SIF0 is the
+      -- first channel that moves RAM -> device and so the first to need it.
       ram_req       : out std_logic := '0';
+      ram_rnw       : out std_logic := '0';
+      ram_rdata     : in  std_logic_vector(31 downto 0) := (others => '0');
+      ram_rvalid    : in  std_logic := '0';
       ram_addr      : out std_logic_vector(23 downto 0) := (others => '0');
       ram_wdata     : out std_logic_vector(31 downto 0) := (others => '0');
       ram_gnt       : in  std_logic;
@@ -100,6 +105,18 @@ entity iop_dma is
       -- silent channel cannot be told apart from a broken data path.  It is a
       -- host-driven pulse and nothing in the console uses it.
       sif1_kick     : in  std_logic := '0';
+
+      -- device side for channel 9 (SIF0, IOP -> EE).  The tag is not in the
+      -- stream this time: it sits in IOP memory at TADR, so this is the one
+      -- channel that has to read RAM.  Four words of the EE's own tag, taken
+      -- from TADR+8, go into the stream ahead of the data, which is what the
+      -- EE reads to learn where to put it (PCSX2 Sif0.cpp).
+      sif0_we       : out std_logic := '0';
+      sif0_data     : out std_logic_vector(31 downto 0) := (others => '0');
+      sif0_full     : in  std_logic := '0';
+      dbg_sif0_addr : out std_logic_vector(23 downto 0) := (others => '0');
+      dbg_sif0_len  : out std_logic_vector(23 downto 0) := (others => '0');
+      dbg_sif0_tags : out unsigned(15 downto 0) := (others => '0');
 
       sif1_valid    : in  std_logic := '0';
       sif1_data     : in  std_logic_vector(31 downto 0) := (others => '0');
@@ -144,7 +161,7 @@ architecture arch of iop_dma is
    signal dmacinten : std_logic_vector(31 downto 0) := (others => '0');
 
    -- transfer engine
-   type t_state is (IDLE, SIF1RUN, RUN, FINISH);
+   type t_state is (IDLE, SIF0RUN, SIF1RUN, RUN, FINISH);
    signal state    : t_state := IDLE;
    signal ch       : integer range 0 to 12 := 0;
    signal cur_addr : unsigned(23 downto 0) := (others => '0');
@@ -155,6 +172,18 @@ architecture arch of iop_dma is
    -- armed for long stretches with nothing arriving, and the engine runs one
    -- transfer at a time: parking it in the shared registers would stop CDVD and
    -- OTC dead for as long as the EE stayed quiet.
+   -- Channel 9's own state, for the same reason channel 10 has one: it reads
+   -- IOP RAM, and a read is two-sided -- the grant says the access went out,
+   -- the word comes back later -- so it cannot borrow the engine's registers.
+   signal s0_armed  : std_logic := '0';
+   signal s0_phase  : std_logic := '0';              -- 0 reading the tag, 1 moving data
+   signal s0_issued : std_logic := '0';              -- a read is out, waiting for the word
+   signal s0_tw     : integer range 0 to 5 := 0;
+   signal s0_addr   : unsigned(23 downto 0) := (others => '0');
+   signal s0_words  : unsigned(23 downto 0) := (others => '0');
+   signal s0_tadr   : unsigned(23 downto 0) := (others => '0');
+   signal s0_tags   : unsigned(15 downto 0) := (others => '0');
+
    signal s1_armed : std_logic := '0';
    signal s1_phase : std_logic := '0';               -- 0 reading the tag, 1 moving data
    signal s1_tagw  : integer range 0 to 3 := 0;
@@ -211,6 +240,7 @@ begin
                             and not (s1_phase = '1' and s1_words = 0)
                             and (s1_phase = '0' or ram_gnt = '1')) else '0';
    dbg_sif1_tags <= tagcount;
+   dbg_sif0_tags <= s0_tags;
 
    process (clk1x)
       variable idx   : integer range 0 to 12;
@@ -230,6 +260,8 @@ begin
          bus_dataRead  <= (others => '0');
          bus2_dataRead <= (others => '0');
          ram_req       <= '0';
+         ram_rnw       <= '0';
+         sif0_we       <= '0';
          start         := -1;
          start_chcr    := (others => '0');
 
@@ -289,6 +321,8 @@ begin
             -- exists.  tagcount is deliberately not cleared: it counts tags
             -- since the bitstream was loaded, which is what makes it useful
             -- across a reset.
+            s0_armed <= '0'; s0_phase <= '0'; s0_issued <= '0'; s0_tw <= 0;
+            s0_addr  <= (others => '0'); s0_words <= (others => '0');
             s1_armed <= '0'; s1_phase <= '0'; s1_tagw <= 0;
             s1_addr  <= (others => '0'); s1_words <= (others => '0');
          else
@@ -335,6 +369,12 @@ begin
                               s1_armed <= '1';       -- wait for the EE, off the engine
                               s1_phase <= '0';
                               s1_tagw  <= 0;
+                           elsif (idx = 9) then
+                              s0_armed  <= '1';
+                              s0_phase  <= '0';
+                              s0_issued <= '0';
+                              s0_tw     <= 0;
+                              s0_tadr   <= unsigned(tadr(9)(23 downto 0));
                            else
                               start := idx; start_chcr := wr;
                            end if;
@@ -374,6 +414,58 @@ begin
                      s1_tagw  <= 0;
                   elsif (s1_armed = '1' and sif1_valid = '1') then
                      state <= SIF1RUN;                 -- only once there is something
+                  elsif (s0_armed = '1' and sif0_full = '0') then
+                     state <= SIF0RUN;                 -- only once there is room
+                  end if;
+
+               when SIF0RUN =>
+                  if (s0_phase = '1' and s0_words = 0 and s0_issued = '0') then
+                     tadr(9)     <= x"00" & std_logic_vector(s0_tadr + 16);
+                     madr(9)     <= x"00" & std_logic_vector(s0_addr);
+                     chcr(9)     <= chcr(9) and x"FEFFFFFF";
+                     dicr2_fl(2) <= '1';               -- channel 9 -> DICR2 bit 2
+                     s0_armed    <= '0';
+                     s0_phase    <= '0';
+                     s0_tw       <= 0;
+                     s0_tags     <= s0_tags + 1;
+                     state       <= IDLE;
+                  elsif (s0_issued = '1') then
+                     -- The word the port owes us.  A read is the only access
+                     -- here whose grant is not its completion.
+                     if (ram_rvalid = '1') then
+                        s0_issued <= '0';
+                        if (s0_phase = '0') then
+                           case s0_tw is
+                              when 0 =>
+                                 s0_addr       <= unsigned(ram_rdata(23 downto 0));
+                                 dbg_sif0_addr <= ram_rdata(23 downto 0);
+                              when 1 =>
+                                 s0_words     <= x"0" & unsigned(ram_rdata(19 downto 0));
+                                 dbg_sif0_len <= x"0" & ram_rdata(19 downto 0);
+                              when others =>
+                                 sif0_we   <= '1';     -- the EE's half of the tag
+                                 sif0_data <= ram_rdata;
+                           end case;
+                           if (s0_tw = 5) then s0_phase <= '1';
+                           else                s0_tw    <= s0_tw + 1; end if;
+                        else
+                           sif0_we   <= '1';
+                           sif0_data <= ram_rdata;
+                           s0_words  <= s0_words - 1;
+                           s0_addr   <= s0_addr + 4;
+                        end if;
+                     end if;
+                  elsif (sif0_full = '1') then
+                     state <= IDLE;                    -- yield until the host drains
+                  else
+                     ram_req <= '1';
+                     ram_rnw <= '1';
+                     if (s0_phase = '0') then
+                        ram_addr <= std_logic_vector(s0_tadr + to_unsigned(s0_tw * 4, 24));
+                     else
+                        ram_addr <= std_logic_vector(s0_addr);
+                     end if;
+                     if (ram_gnt = '1') then s0_issued <= '1'; end if;
                   end if;
 
                when SIF1RUN =>

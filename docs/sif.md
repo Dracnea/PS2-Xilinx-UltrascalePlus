@@ -21,8 +21,8 @@ accepts its registers and reports completion immediately.
 
 ## What the BIOS has actually programmed
 
-Measured on the C1100 on 2026-09-09 with the 0220A BIOS booted to `BOOTEND`,
-through the DMA register window added the same day:
+Measured on the C1100 with the 0220A BIOS booted to `BOOTEND`, through the DMA
+register window:
 
 ```
 ch  MADR      BCR       CHCR      TADR
@@ -30,17 +30,32 @@ ch  MADR      BCR       CHCR      TADR
 10  00000000  00000020  40000300  00000000   SIF1, EE -> IOP
 ```
 
-Both were sampled every 2 ms for six seconds and **neither changes**. So:
+So SIFCMD configures channel 10 and leaves channel 9 alone; `CHCR = 0x40000300`
+is bit 30 (bus snooping), bit 8 (chopping) and bit 9 — SyncMode 1, "sync blocks
+to DMA requests" — with bit 0 clear, which is device-to-RAM and correct for EE
+to IOP. `TADR` is zero, consistent with SIF1 taking its tags from the stream.
+`SMCOM` reads `0x00019600`: the IOP publishing where the EE should send.
 
-* SIFCMD configures channel 10 and leaves channel 9 entirely alone.
-* `CHCR = 0x40000300` is bit 30 (bus snooping), bit 8 (chopping enable) and
-  bit 9 — SyncMode 1, "sync blocks to DMA requests". Bit 0 is clear, which is
-  device-to-RAM and correct for EE to IOP.
-* **Bit 24, start/busy, is clear.** The channel is configured and not armed.
-* `TADR` is zero, which is consistent with SIF1 taking its tags from the FIFO
-  rather than from memory (below).
-* `SMCOM` reads `0x00019600`: the IOP publishing the address of its SIFCMD
-  receive buffer, which is where the EE is expected to send.
+### Bit 24 was clear, and that was this design's fault
+
+This page previously concluded from the reading above that the IOP configures
+SIF1 and **never arms it**, and listed three candidate stimuli for what might.
+That was wrong, and the way it was wrong is worth keeping.
+
+`iop_dma.vhd` had no data path for channel 10. A CHCR write with bit 24 set
+therefore took the registers-only route and **completed on the next cycle**, so
+bit 24 was cleared long before any host poll could see it. Sampling every 2 ms
+for six seconds found it clear every time, and the obvious reading of that — the
+channel is never armed — was an artefact of the observer.
+
+With a real data path the same measurement reads `41000300`: armed, waiting for
+the EE. The IOP had been arming SIF1 all along, and re-arms after every
+completion. None of the three stimuli mattered; the premise did.
+
+The lesson is not "instrument more", because the instrument was right. It is
+that **a register whose value is produced by a stub says nothing about the
+hardware** — the DMA controller was answering for a channel it had not
+implemented.
 
 ## The two directions are not symmetric
 
@@ -91,38 +106,53 @@ controller.
 The FIFO is **128 words** (`FIFO_SIF_W`), shared, and it is what lets the EE
 push a packet before the IOP is ready to take it.
 
-## The open question, and how to settle it
+## Both directions work — 2026-09-10
 
-Nothing observed so far says **what makes the IOP arm channel 10.** It is
-configured and idle, and it stays that way through six seconds of sampling with
-the BIOS running. A packet pushed into the FIFO would simply wait there.
+**SIF1, EE to IOP.** A four-word tag at the head of the stream, then the data.
+Checked on the card: a loopback to `0x60000` consumes exactly 4 + 16 words and
+lands byte-exact; the same to `0x61000` lands there instead while `0x60800`
+stays untouched, so the tag really steers the destination; and a packet aimed at
+the BIOS's own receive buffer arrives at `0x19600` as written with `MADR`
+advanced to `0x19610`.
 
-The candidates, in the order worth testing:
+**SIF0, IOP to EE.** The IOP builds a tag in RAM, points `TADR` at it and starts
+channel 9; the DMA reads six words from `TADR`, takes the source and count from
+the first two, forwards the four words at `TADR+8` as the EE's own tag, and then
+streams the payload. Boot-test stage `13` does exactly that and the host drains
 
-1. The EE finishing its side of `sceSifInitCmd` — the EE publishes its own
-   buffer address (`MAINADDR`) and the IOP responds by arming. The host has so
-   far only set MSFLAG bit 16; it has never written MSCOM.
-2. An MSFLAG bit the IOP treats as a doorbell, which would need `iop_sif.vhd`
-   to raise an interrupt rather than only store the value.
-3. The IOP arming lazily on some timer or kernel event, which the six-second
-   sample argues against.
+```
+ee7a6000 ee7a6001 ee7a6002 ee7a6003   the EE's tag, forwarded untouched
+5150f000 .. 5150f007                  the payload, from RAM
+```
 
-> **NOTE (unverified):** the arming trigger is the one part of this page that
-> is a list of guesses rather than a reading.
-> *Verify by:* implementing the SIF1 FIFO and channel 10 data path, pushing a
-> well-formed tag, then applying each stimulus in turn and watching CHCR bit 24
-> through the DMA register window. The window exists precisely so this is a
-> reading rather than an argument.
+with the tag reported as `addr=0x071000 len=8`. Changing the tag to name
+`0x72000` and 12 words moves both: `addr=0x072000 len=12`, and 16 words come out
+instead of 12. That is what makes it a reading of the tag rather than a
+coincidence.
+
+**This is the first DMA in this design that reads IOP memory.** Writes complete
+on the grant cycle; a read's grant only means the access was issued, and the
+word arrives later on `ram_rvalid`. The arbiter in `iop_top.vhd` now honours
+`dma_ram_rnw` instead of forcing writes, and tracks whether the access in flight
+was a read so the word gets back to the right master.
+
+### What the channels must not do
+
+Both SIF channels sit armed for long stretches with nothing moving, and the
+transfer engine runs one channel at a time. Parking either of them in the shared
+registers stops CDVD and OTC dead for as long as the other side stays quiet —
+which is not a hypothetical: channel 10 did exactly that in its first version,
+and no disc test caught it because every disc test runs the boot ROM, where SIF1
+is never armed. Each channel keeps its own state and yields the engine whenever
+its stream is dry or full, resuming mid-tag or mid-transfer. Verified by running
+the ISO9660 walk with SIF1 armed and starved.
 
 ## Order of work
 
-1. **SIF1 FIFO and channel 10.** Host writes tag and data into a FIFO; the
-   channel drains it into IOP RAM. Reuses the device-to-RAM direction that
-   channel 3 already proves. Settles the arming question by experiment.
-2. **The DMA RAM read path.** `dma_ram_rnw` out of `iop_dma`, the arbiter
-   honouring it, and read data returned on `ram_done`. Needed by SIF0 and by
-   nothing else so far.
-3. **SIF0 and channel 9**, including the walk of the tag at `TADR`.
+1. ~~**SIF1 FIFO and channel 10.**~~ **Done 2026-09-10.**
+2. ~~**The DMA RAM read path.**~~ **Done 2026-09-10.**
+3. ~~**SIF0 and channel 9**, including the walk of the tag at `TADR`.~~
+   **Done 2026-09-10.**
 4. **SIFCMD on the host**: packet headers, and the `SIF_CMD_INIT_CMD` exchange
    that gives each side the other's buffer address.
 5. **SIFRPC on the host**: bind, then call, then the FILEIO service — which is

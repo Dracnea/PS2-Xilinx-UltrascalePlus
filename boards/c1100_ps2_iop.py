@@ -301,6 +301,19 @@ class IOPBringup(LiteXModule, AutoCSR):
         self.sif1_addr  = CSRStatus(24, description="destination the last consumed tag named")
         self.sif1_len   = CSRStatus(24, description="word count the last consumed tag named")
         self.sif1_tags  = CSRStatus(16, description="tags the channel has consumed since the bitstream was loaded")
+
+        # SIF0, the IOP -> EE stream.  The IOP pushes four words of the EE's own
+        # tag and then the data; the host drains it.  Reading pops one word, so
+        # a read with nothing waiting is a mistake the status register exists to
+        # prevent.
+        self.sif0_pop   = CSRStatus(32, description="one word from the SIF0 stream; reading pops it")
+        self.sif0_stat  = CSRStatus(fields=[
+            CSRField("readable", size=1, description="the stream has at least one word"),
+            CSRField("full",     size=1, description="the stream cannot take another word from the IOP"),
+        ])
+        self.sif0_addr  = CSRStatus(24, description="IOP source the last tag named")
+        self.sif0_len   = CSRStatus(24, description="word count the last tag named")
+        self.sif0_tags  = CSRStatus(16, description="tags channel 9 has sent since the bitstream was loaded")
         self.cdvd_disc  = CSRStorage(fields=[
             CSRField("present", size=1, offset=0, description="1 tells the driver a disc is in the tray"),
             CSRField("type",    size=8, offset=8, reset=0x14, description="disc type byte (0x14 = PS2 DVD)"),
@@ -519,6 +532,26 @@ class IOPBringup(LiteXModule, AutoCSR):
             self.specials += MultiReg(sif1_dbg[n], csr.status, "sys")
         self.sif1_iop = (sif1_kick_iop, sif1_valid, sif1_fifo.dout, sif1_ready, sif1_dbg)
 
+        # iop -> sys.  The read side is the host's, so a CSR read pops it.
+        sif0_fifo = ClockDomainsRenamer({"write": "iop", "read": "sys"})(AsyncFIFO(32, 512))
+        self.submodules.sif0_fifo = sif0_fifo
+        sif0_we   = Signal(name="iop_sif0_we")
+        sif0_data = Signal(32, name="iop_sif0_data")
+        self.comb += [
+            sif0_fifo.din.eq(sif0_data),
+            sif0_fifo.we.eq(sif0_we),
+            self.sif0_pop.status.eq(sif0_fifo.dout),
+            sif0_fifo.re.eq(self.sif0_pop.we),        # a read of the CSR pops one word
+            self.sif0_stat.fields.readable.eq(sif0_fifo.readable),
+        ]
+        sif0_full = Signal(name="iop_sif0_full")
+        self.specials += MultiReg(~sif0_fifo.writable, sif0_full, "iop")
+        self.comb += self.sif0_stat.fields.full.eq(sif0_full)
+        sif0_dbg = {n: Signal(w, name="iop_sif0_" + n) for n, w in (("addr", 24), ("len", 24), ("tags", 16))}
+        for n, csr in (("addr", self.sif0_addr), ("len", self.sif0_len), ("tags", self.sif0_tags)):
+            self.specials += MultiReg(sif0_dbg[n], csr.status, "sys")
+        self.sif0_iop = (sif0_we, sif0_data, sif0_full, sif0_dbg)
+
         # --- iop -> sys -------------------------------------------------------
         post_code = Signal(8)
         post_wr   = Signal()
@@ -605,6 +638,12 @@ class IOPBringup(LiteXModule, AutoCSR):
             o_sif_msflag     = self.sif_iop[3]["msflag"],
             o_sif_smflag     = self.sif_iop[3]["smflag"],
             o_sif_ctrl       = self.sif_iop[3]["ctrl"],
+            o_sif0_we        = self.sif0_iop[0],
+            o_sif0_data      = self.sif0_iop[1],
+            i_sif0_full      = self.sif0_iop[2],
+            o_sif0_dbg_addr  = self.sif0_iop[3]["addr"],
+            o_sif0_dbg_len   = self.sif0_iop[3]["len"],
+            o_sif0_dbg_tags  = self.sif0_iop[3]["tags"],
             i_sif1_kick      = self.sif1_iop[0],
             i_sif1_valid     = self.sif1_iop[1],
             i_sif1_data      = self.sif1_iop[2],

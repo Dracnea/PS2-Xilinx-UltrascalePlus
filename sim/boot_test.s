@@ -898,6 +898,64 @@ isofnd2:
         sb      $t0, 0($s7)
 isodone:
 
+# ---- 13: SIF0, the IOP sending to the EE -------------------------------------
+# Every other channel here writes memory.  This one reads it: the tag is not in
+# the stream, it is in RAM at TADR, so the DMA has to fetch six words and then
+# the payload.  Needs no disc and no EE -- the host drains what comes out.
+        li      $t0, 0xA0070000         # the tag
+        li      $t1, 0x00071000         # word 0: where the payload is
+        sw      $t1, 0($t0)
+        li      $t1, 8                  # word 1: how many words of it
+        sw      $t1, 4($t0)
+        li      $t1, 0xEE7A6000         # words 2-5: the EE's own tag, which the
+        sw      $t1, 8($t0)             # IOP forwards without reading
+        li      $t1, 0xEE7A6001
+        sw      $t1, 12($t0)
+        li      $t1, 0xEE7A6002
+        sw      $t1, 16($t0)
+        li      $t1, 0xEE7A6003
+        sw      $t1, 20($t0)
+
+        li      $t0, 0xA0071000         # the payload
+        li      $t2, 0
+s0fill: sll     $t4, $t2, 2
+        addu    $t5, $t0, $t4
+        li      $t6, 0x5150F000
+        or      $t6, $t6, $t2
+        sw      $t6, 0($t5)
+        addiu   $t2, $t2, 1
+        li      $t3, 8
+        bne     $t2, $t3, s0fill
+        nop
+
+        li      $t0, 0x1F801570         # DPCR2 bit 11 enables channel 9, and it
+        lw      $t1, 0($t0)             # is clear out of reset
+        nop
+        ori     $t1, $t1, 0x0800
+        sw      $t1, 0($t0)
+
+        li      $t0, 0x1F801520         # channel 9
+        li      $t1, 0x00070000         # TADR: the tag
+        sw      $t1, 12($t0)
+        li      $t1, 0x01000000         # CHCR: start
+        sw      $t1, 8($t0)
+
+        li      $t3, 0x00020000         # CHCR bit 24 clears when it is done
+s0w:    lw      $t1, 8($t0)
+        nop
+        lui     $t2, 0x0100
+        and     $t1, $t1, $t2
+        beq     $t1, $zero, s0done
+        nop
+        addiu   $t3, $t3, -1
+        bne     $t3, $zero, s0w
+        nop
+        b       fail
+        nop
+s0done:
+        li      $t0, 0x13
+        sb      $t0, 0($s7)
+
 # ---- done -----------------------------------------------------------------
         li      $t0, 0xAA
         sb      $t0, 0($s7)
