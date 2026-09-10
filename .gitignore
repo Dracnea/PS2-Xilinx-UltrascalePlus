@@ -23,6 +23,8 @@ venv/
 # simulation and fit scratch
 sim/work/
 sim/work_dbg/
+sim/ee/work/
+fit/ee/*.rpt
 sim/*.out
 sim/*.hex
 fit/*.out

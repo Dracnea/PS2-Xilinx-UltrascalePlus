@@ -73,7 +73,7 @@ architecture arch of ee_core is
    signal br_pend   : std_logic := '0';
    signal br_target : unsigned(63 downto 0) := (others => '0');
 
-   type state_t is (S_FETCH, S_WAIT_I, S_EXEC, S_WAIT_D);
+   type state_t is (S_FETCH, S_WAIT_I, S_EXEC, S_WAIT_D, S_DIV, S_MUL);
    signal state : state_t := S_FETCH;
 
    -- the load in flight, held while the data port answers
@@ -82,6 +82,39 @@ architecture arch of ee_core is
    signal ld_sign  : std_logic := '0';
    signal ld_shift : integer range 0 to 7 := 0;
    signal ld_pend  : std_logic := '0';        -- the access in flight is a load
+
+   -- The 32-cycle restoring divider.  DIV and DIVU cannot be single
+   -- combinational expressions: `/` and `rem` synthesise into a 155-level
+   -- carry chain, and an out-of-context place-and-route of this core with a
+   -- combinational divide came back at 24 MHz -- the divider alone was a 41 ns
+   -- path from a GPR to HI, against a 3.39 ns budget.  Iterating one quotient
+   -- bit per clock costs 32 cycles on an instruction the real R5900 already
+   -- spends 37 cycles on, and takes the divide out of the critical path
+   -- entirely.
+   signal div_rem  : unsigned(32 downto 0) := (others => '0');
+   signal div_quot : unsigned(31 downto 0) := (others => '0');
+   signal div_dvsr : unsigned(31 downto 0) := (others => '0');
+   signal div_cnt  : integer range 0 to 32 := 0;
+   signal div_negq : std_logic := '0';       -- negate the quotient when it lands
+   signal div_negr : std_logic := '0';       -- negate the remainder when it lands
+
+   -- The pipelined multiplier.  A combinational 32x32 lands as an unregistered
+   -- DSP48E2 cascade -- GPR through PREADD, MULTIPLIER, ALU and OUTPUT and back
+   -- to a GPR in one cycle, 7.9 ns of it -- and once the divider stopped being
+   -- the worst path, that became it.  Registering the operands and the product
+   -- puts real flip-flops at the DSP's A/B, M and P stages, which is the only
+   -- shape the primitive runs fast in.  MULT costs three cycles here against
+   -- four on the real R5900, so this buys the clock back for free.
+   --
+   -- One 33-bit signed multiplier serves both MULT and MULTU: sign-extending
+   -- the operands for one and zero-extending them for the other makes the low
+   -- 64 bits of the product correct in both cases, so there is no second
+   -- unsigned multiplier to place and no second path to time.
+   signal mul_a, mul_b : signed(32 downto 0) := (others => '0');
+   signal mul_p1       : signed(65 downto 0) := (others => '0');
+   signal mul_p        : signed(65 downto 0) := (others => '0');
+   signal mul_rd       : integer range 0 to 31 := 0;
+   signal mul_cnt      : integer range 0 to 2 := 0;
 
    function sext32(v : std_logic_vector(31 downto 0)) return std_logic_vector is
    begin
@@ -112,10 +145,8 @@ begin
       variable wb_v                   : std_logic_vector(63 downto 0);
       variable wb_en                  : boolean;
       variable ea                     : unsigned(63 downto 0);
-      variable prod                   : signed(63 downto 0);
-      variable uprod                  : unsigned(63 downto 0);
-      variable sq, sr                 : signed(31 downto 0);
-      variable uq, ur                 : unsigned(31 downto 0);
+      variable dvd_mag, dvsr_mag      : unsigned(31 downto 0);
+      variable div_shift              : unsigned(32 downto 0);
       variable ldv, ldw               : std_logic_vector(63 downto 0);
       -- Whether this instruction goes to memory has to be a variable, not the
       -- state signal: a signal assigned earlier in this process still reads as
@@ -123,6 +154,11 @@ begin
       -- the later `state <= S_FETCH` overrode it.  Loads and stores never
       -- entered the wait state, and a load therefore never wrote its register.
       variable mem_op                 : boolean;
+      -- likewise for the divider and the multiplier: each holds the machine in
+      -- its own state for several cycles and must suppress the retire pulse
+      -- without suppressing the PC advance.
+      variable div_op                 : boolean;
+      variable mul_op                 : boolean;
    begin
       if rising_edge(clk) then
          retire <= '0';
@@ -138,6 +174,8 @@ begin
             traps    <= (others => '0');
             br_pend  <= '0';
             gpr      <= (others => (others => '0'));
+            div_cnt  <= 0;
+            mul_cnt  <= 0;
          else
             case state is
 
@@ -170,6 +208,8 @@ begin
                   take := false;
                   wb_en := false;
                   mem_op := false;
+                  div_op := false;
+                  mul_op := false;
                   wb_n := 0;
                   wb_v := (others => '0');
 
@@ -203,42 +243,56 @@ begin
                                       wb_v := std_logic_vector(shift_right(unsigned(b), to_integer(unsigned(a(5 downto 0)))));
                            when 23 => wb_en := true; wb_n := rd;                      -- DSRAV
                                       wb_v := std_logic_vector(shift_right(signed(b), to_integer(unsigned(a(5 downto 0)))));
-                           when 24 =>                                                 -- MULT
-                              prod := resize(signed(a(31 downto 0)) * signed(b(31 downto 0)), 64);
-                              lo <= sext32(std_logic_vector(prod(31 downto 0)));
-                              hi <= sext32(std_logic_vector(prod(63 downto 32)));
-                              wb_en := true; wb_n := rd;
-                              wb_v := sext32(std_logic_vector(prod(31 downto 0)));
-                           when 25 =>                                                 -- MULTU
-                              uprod := resize(unsigned(a(31 downto 0)) * unsigned(b(31 downto 0)), 64);
-                              lo <= sext32(std_logic_vector(uprod(31 downto 0)));
-                              hi <= sext32(std_logic_vector(uprod(63 downto 32)));
-                              wb_en := true; wb_n := rd;
-                              wb_v := sext32(std_logic_vector(uprod(31 downto 0)));
-                           when 26 =>                                                 -- DIV
-                              if signed(b(31 downto 0)) = 0 then
-                                 if signed(a(31 downto 0)) >= 0 then
-                                    lo <= (others => '1');
-                                 else
-                                    lo <= sext32(x"00000001");
-                                 end if;
-                                 hi <= sext32(a(31 downto 0));
+                           when 24 | 25 =>                                            -- MULT / MULTU
+                              if fn = 24 then
+                                 mul_a <= resize(signed(a(31 downto 0)), 33);
+                                 mul_b <= resize(signed(b(31 downto 0)), 33);
                               else
-                                 sq := signed(a(31 downto 0)) / signed(b(31 downto 0));
-                                 sr := signed(a(31 downto 0)) rem signed(b(31 downto 0));
-                                 lo <= sext32(std_logic_vector(sq));
-                                 hi <= sext32(std_logic_vector(sr));
+                                 mul_a <= signed(std_logic_vector'('0' & a(31 downto 0)));
+                                 mul_b <= signed(std_logic_vector'('0' & b(31 downto 0)));
                               end if;
-                           when 27 =>                                                 -- DIVU
-                              if unsigned(b(31 downto 0)) = 0 then
-                                 lo <= (others => '1');
-                                 hi <= sext32(a(31 downto 0));
+                              mul_rd  <= rd;
+                              mul_cnt <= 2;
+                              mul_op  := true;
+                              state   <= S_MUL;
+                           when 26 | 27 =>                                            -- DIV / DIVU
+                              -- Magnitudes go into the iterative unit and the
+                              -- signs are applied when the result lands, which
+                              -- is what gives MIPS truncation-toward-zero with
+                              -- the remainder taking the dividend's sign.
+                              --
+                              -- Divide by zero needs no special case.  A
+                              -- restoring divider with a zero divisor subtracts
+                              -- nothing, so it sets every quotient bit and
+                              -- shifts the dividend intact into the remainder:
+                              -- LO = 0xFFFFFFFF, HI = dividend, exactly what the
+                              -- manual specifies for DIVU.  For DIV the sign
+                              -- fixups below turn that into LO = -1 for a
+                              -- non-negative dividend and LO = 1 for a negative
+                              -- one, which is the specified result there too.
+                              if fn = 26 and a(31) = '1' then
+                                 dvd_mag := 0 - unsigned(a(31 downto 0));
                               else
-                                 uq := unsigned(a(31 downto 0)) / unsigned(b(31 downto 0));
-                                 ur := unsigned(a(31 downto 0)) rem unsigned(b(31 downto 0));
-                                 lo <= sext32(std_logic_vector(uq));
-                                 hi <= sext32(std_logic_vector(ur));
+                                 dvd_mag := unsigned(a(31 downto 0));
                               end if;
+                              if fn = 26 and b(31) = '1' then
+                                 dvsr_mag := 0 - unsigned(b(31 downto 0));
+                              else
+                                 dvsr_mag := unsigned(b(31 downto 0));
+                              end if;
+                              div_rem  <= (others => '0');
+                              div_quot <= dvd_mag;
+                              div_dvsr <= dvsr_mag;
+                              div_cnt  <= 32;
+                              if fn = 26 then
+                                 div_negq <= a(31) xor b(31);
+                                 div_negr <= a(31);
+                              else
+                                 div_negq <= '0';
+                                 div_negr <= '0';
+                              end if;
+                              div_op := true;
+                              state  <= S_DIV;
                            when 32 | 33 => wb_en := true; wb_n := rd;                 -- ADD/ADDU
                               wb_v := sext32(std_logic_vector(signed(a(31 downto 0)) + signed(b(31 downto 0))));
                               if fn = 32 then null; end if;   -- overflow trap: not taken yet
@@ -364,7 +418,7 @@ begin
                   -- setting it here is safe for both paths.
                   retire_pc <= std_logic_vector(pc);
 
-                  if not mem_op then
+                  if not (mem_op or div_op or mul_op) then
                      if br_pend = '1' then
                         pc <= br_target; br_pend <= '0';
                      else
@@ -377,12 +431,64 @@ begin
                      state     <= S_FETCH;
                   else
                      -- the branch bookkeeping still has to happen for a
-                     -- load or store sitting in a delay slot
+                     -- load, store or divide sitting in a delay slot
                      if br_pend = '1' then
                         pc <= br_target; br_pend <= '0';
                      else
                         pc <= nxt;
                      end if;
+                  end if;
+
+               when S_MUL =>
+                  case mul_cnt is
+                     when 2 =>
+                        mul_p1  <= mul_a * mul_b;
+                        mul_cnt <= 1;
+                     when 1 =>
+                        -- a second register stage, so the tool has one to push
+                        -- into the DSP's own output pipeline rather than
+                        -- leaving the cascade adder in fabric
+                        mul_p   <= mul_p1;
+                        mul_cnt <= 0;
+                     when others =>
+                        lo <= sext32(std_logic_vector(mul_p(31 downto 0)));
+                        hi <= sext32(std_logic_vector(mul_p(63 downto 32)));
+                        -- MULT and MULTU are three-operand on the R5900: rd
+                        -- takes the low word too, and rd = 0 writes nothing.
+                        if mul_rd /= 0 then
+                           gpr(mul_rd)(63 downto 0) <= sext32(std_logic_vector(mul_p(31 downto 0)));
+                        end if;
+                        retire <= '1';
+                        state  <= S_FETCH;
+                  end case;
+
+               when S_DIV =>
+                  if div_cnt = 0 then
+                     if div_negq = '1' then
+                        lo <= sext32(std_logic_vector(0 - div_quot));
+                     else
+                        lo <= sext32(std_logic_vector(div_quot));
+                     end if;
+                     if div_negr = '1' then
+                        hi <= sext32(std_logic_vector(0 - div_rem(31 downto 0)));
+                     else
+                        hi <= sext32(std_logic_vector(div_rem(31 downto 0)));
+                     end if;
+                     retire <= '1';
+                     state  <= S_FETCH;
+                  else
+                     -- one quotient bit per clock: shift the next dividend bit
+                     -- into the running remainder, subtract the divisor if it
+                     -- fits, and record whether it did.
+                     div_shift := div_rem(31 downto 0) & div_quot(31);
+                     if div_shift >= ('0' & div_dvsr) then
+                        div_rem  <= div_shift - ('0' & div_dvsr);
+                        div_quot <= div_quot(30 downto 0) & '1';
+                     else
+                        div_rem  <= div_shift;
+                        div_quot <= div_quot(30 downto 0) & '0';
+                     end if;
+                     div_cnt <= div_cnt - 1;
                   end if;
 
                when S_WAIT_D =>

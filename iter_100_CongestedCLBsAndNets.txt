@@ -1,0 +1,7 @@
+List of CLB Tiles
+CLEL_R_X38Y164
+
+List of Congested Nets
+n[1]
+gpr_reg_n_0_[3][9]
+

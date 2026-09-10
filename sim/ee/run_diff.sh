@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # Run a program on the reference and on the RTL, and diff them.
 #   sim/ee/run_diff.sh [--seed N] [--count N] [--steps N] [--branches]
+#   sim/ee/run_diff.sh --prog FILE [--steps N]      # a pre-made program
 # A difference names the instruction that produced it, not the symptom.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-SEED=1; COUNT=200; STEPS=150; BR=""
+SEED=1; COUNT=200; STEPS=150; BR=""; PROG=""
 while [[ $# -gt 0 ]]; do case $1 in
   --seed) SEED=$2; shift 2;; --count) COUNT=$2; shift 2;;
   --steps) STEPS=$2; shift 2;; --branches) BR="--branches"; shift;;
+  --prog) PROG=$(readlink -f "$2"); shift 2;;
   *) echo "unknown: $1" >&2; exit 2;; esac; done
 
 command -v xvhdl >/dev/null 2>&1 || . "$HOME/Xilinx/2026.1/Vivado/settings64.sh"
-W="$HERE/work"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
+W="$HERE/work/$$"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
 
-python3 "$HERE/gen_prog.py" --seed "$SEED" --count "$COUNT" $BR > prog.hex
+if [[ -n $PROG ]]; then cp "$PROG" prog.hex
+else python3 "$HERE/gen_prog.py" --seed "$SEED" --count "$COUNT" $BR > prog.hex; fi
 python3 "$HERE/r5900_ref.py" prog.hex --steps "$STEPS" --dump-mem 0x2000 0x400 > ref.txt 2> ref.traps
 
 xvhdl -2008 "$ROOT/rtl/ee/ee_core.vhd"      > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }
@@ -25,10 +28,10 @@ xsim tb -R -testplusarg "program=prog.hex" -testplusarg "steps=$STEPS" \
 grep -E "^ *[0-9]+ pc=|^MEM " xsim.log > rtl.txt
 
 if diff -q ref.txt rtl.txt >/dev/null; then
-    echo "PASS  $(wc -l < ref.txt) instructions identical (seed $SEED)"
+    echo "PASS  $(wc -l < ref.txt) instructions identical (${PROG:-seed $SEED})"
     exit 0
 fi
-echo "FAIL  seed $SEED"
+echo "FAIL  ${PROG:-seed $SEED}"
 echo "first difference:"
 diff ref.txt rtl.txt | head -6
 n=$(diff --unchanged-group-format='' --old-group-format='%dF
