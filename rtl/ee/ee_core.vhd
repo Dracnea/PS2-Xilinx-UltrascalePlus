@@ -1200,7 +1200,22 @@ begin
                   m_width  <= ex_width;
                   m_sign   <= ex_sign;
                   m_shift  <= ex_shift;
-                  if d_valid = '1' and ex_ismem = '1' then
+                  -- A store is the one thing an exception cannot take back.
+                  -- Registers and HI/LO are still in latches when the exception
+                  -- commits, so invalidating those latches is enough for them;
+                  -- a store has already been handed to the memory port and is
+                  -- gone.  So an instruction older than this one that is about
+                  -- to raise -- sitting in A2 with m_exc set, one edge from
+                  -- committing -- has to stop the port request being issued at
+                  -- all, rather than being undone afterwards.
+                  --
+                  -- Found by a wide random campaign: an ADD overflowed, the
+                  -- store behind it should never have run, and it left a word in
+                  -- memory that no register trace could show, because a store
+                  -- writes no register.
+                  if d_valid = '1' and ex_ismem = '1'
+                     and m_exc = '0' and m_eret = '0'
+                     and w_exc = '0' and w_eret = '0' then
                      d_addr <= ex_addr;
                      if ex_isload = '1' then
                         d_read <= '1';

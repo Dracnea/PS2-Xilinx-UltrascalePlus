@@ -771,6 +771,33 @@ it was given a cycle it did not need to save.
 208 differential runs pass, and the cross-check against birdybro/PS2_fpga is
 clean.
 
+### A store an exception could not take back
+
+A wider random campaign — 160 runs on seeds the standing matrix does not cover —
+found the one piece of state an exception was not undoing.
+
+Registers and HI/LO are still sitting in latches when an exception commits, so
+invalidating those latches is the whole of the flush for them. **A store is not
+in a latch.** By the time the faulting instruction reaches WB, the store behind
+it has already handed its request to the memory port, and the write happens
+whether or not the instruction is ever allowed to retire.
+
+In seed 346 an `ADD` overflowed — `0x7d7e0000 + 0x7d7e0000` — and the `SD` one
+instruction later should never have run. The reference did not run it; the core
+did, and left a word in memory. **No register trace could show it**, because a
+store writes no register: all 200 traced instructions matched exactly and only
+the memory dump differed, which is why the standing matrix had never caught it
+and why the memory dump earns its place in the comparison.
+
+The fix is to stop the request rather than undo it: an instruction sitting in A2
+with `m_exc` set is one edge from committing an exception, so nothing younger
+issues a port request at all. A load is suppressed too — harmless in itself, but
+the alternative is a special case — and the flush clears `m_ismem` on the
+following edge, so the suppressed access cannot leave A2 waiting for a `d_ready`
+that will never come.
+
+368 runs pass: the standing matrix and the wide campaign together.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. MMI, the
