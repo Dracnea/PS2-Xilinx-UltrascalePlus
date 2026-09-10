@@ -429,23 +429,23 @@ The break is exactly at the FIFO boundary: a 2048-byte transfer needs 516 words 
 512 of data plus a four-word EE tag — through a 512-word FIFO, so it is the first
 read that has to survive backpressure.
 
-**The cause was a synchroniser that should not have existed.** 
+**The cause was a synchroniser that should not have existed.** `sif0_fifo.writable`
 is the FIFO's *write* side, and this FIFO's write side is the IOP domain, so it
-is already in the domain the channel runs in. Passing it through  into
+is already in the domain the channel runs in. Passing it through `MultiReg` into
 that same domain added two cycles of staleness: the channel read "not full",
 issued a RAM fetch, and pushed the returned word into a FIFO that had since
 filled. The word was dropped, and nothing anywhere reports a dropped word — the
 transfer simply arrives short, which is invisible until a transfer is larger than
 the FIFO. The status register was the mirror image: an IOP-domain signal read
-straight into a  CSR, which needed the synchroniser it did not have.
+straight into a `sys` CSR, which needed the synchroniser it did not have.
 
-With that fixed, **166,704 of 's 166,708 bytes read back
+With that fixed, **166,704 of `SLUS_212.40`'s 166,708 bytes read back
 byte-identical to the disc**, across about 82 sectors of sequential reads that
 CDVDMAN issues itself against LBA 2,265,116 onwards.
 
 > **NOTE (unverified): the last four bytes.** The final chunk is 2868 bytes =
 > 717 words, and SIF DMA moves quadwords, so 716 words go by DMA and the odd word
-> is left over.  carries a  pointer precisely for such
+> is left over. `_fio_read_arg` carries a `read_data` pointer precisely for such
 > head and tail fragments, and this harness discards that transfer, so the
 > arithmetic explains the shortfall exactly — but it was not confirmed by reading
 > the fragment struct and finding those four bytes in it.
