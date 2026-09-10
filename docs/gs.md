@@ -412,7 +412,7 @@ bit-accuracy against hardware", rasterises with barycentrics rather than
 emulating the DDA, and uses FP32 for Z while acknowledging uncertainty about
 32-bit fixed-point Z. PCSX2 interpolates in floating point. **Nobody has this.**
 
-### The decision that follows
+### The decision that follows — **superseded, see below**
 
 Three options existed and the middle one is now excluded:
 
@@ -438,6 +438,63 @@ deliberately and noted where a game shows Z-fighting the hardware does not.
 If a real PS2 becomes available, the open question is small and precisely
 stated: draw a triangle with known vertex colours and read back the framebuffer,
 and the LSB pattern along a scanline answers it.
+
+## Someone has measured it — 2026-09-10
+
+The conclusion above ("nobody has this") was **wrong within a day of being
+written**, and the correction matters more than the original finding.
+
+`ARMSX2`, a PS2 emulator aimed at ARM handhelds, ships a software renderer whose
+Gouraud and depth interpolation were **measured against a real console** — an
+SCPH-30001, driven by purpose-written probes (`gs-zgrad`, `gs-interp`,
+`gs-walk2`) that force integer landings under a raw depth readback and score a
+width curve over tens of thousands of readings. Their source documents what was
+measured, what was inferred, and — unusually — what is still an open divergence.
+It is GPL-3, so nothing is taken from it; what follows are facts about Sony's
+silicon, established by their probes and cited here.
+
+**The GS does not interpolate exactly, and it does not interpolate per pixel.**
+
+1. **The DDA steps a block of eight pixels at a time.** One DDA step spans eight
+   pixels horizontally, on every draw, textured or not. It seeds at the span's
+   first pixel, adds a truncated per-lane offset within the block, and adds one
+   truncated step per block. Eight is measured — the width curve peaks on powers
+   of two and globally at eight — not assumed.
+2. **The step is truncated to a 2⁻¹⁰ grid.** A gradient of 1/4 is the identity
+   under that truncation, which is what made the depth bias visible in isolation.
+3. **Interpolated depth runs short of its plane** by half a step of that grid,
+   1/2048, and the two axes carry the shortfall differently: along X it is
+   present from the span's first pixel and does not follow the gradient's sign;
+   along Y it accumulates, is exempt on the primitive's first scanline, and does
+   follow the sign. A flat triangle is exact — 896 of 896 readings — so the bias
+   belongs to the walk rather than the seed.
+4. **Sprites never interpolate depth**: it is carried as an integer. That agrees
+   with the manual's statement that a Sprite takes Z from its second vertex.
+
+### What this does to the decision
+
+**Exact interpolation is now the wrong answer.** It would be systematically
+wrong rather than wrong in the last bit: hardware truncates its step to 2⁻¹⁰ and
+walks in blocks of eight, and a mathematically exact plane does neither. The
+choice made yesterday on the evidence available was right on that evidence and
+is superseded by better evidence, which is how it should go.
+
+The rule to implement is therefore a **blocked truncating DDA**: eight-pixel
+blocks, per-lane offsets and per-block steps both truncated to 2⁻¹⁰, with the
+depth bias applied to the scanline seed. That is *more* tractable in hardware
+than exact rational interpolation, not less — truncation to a fixed grid is what
+a DDA does naturally, and it removes the need for exact division per component.
+
+Two questions their probes leave open are worth recording, because they are the
+first things to ask of a real console if one becomes available:
+
+- **Silicon pairs rows two at a time** — rows *k* and *k+2* read identically at
+  every *k* — and nothing models the vertical structure that implies.
+- **The affine texture coordinate is truncated** and so could carry a block of
+  its own, but no capture has swept its width.
+
+Sources: ARMSX2's `GSBlockWalk.h` and `GSDepthWalk.h` (GPL-3; read, not copied),
+and paraLLEl-GS for the independent confirmation of the sampling convention.
 
 ### What the rasteriser does not do yet
 
