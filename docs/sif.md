@@ -262,14 +262,58 @@ So the lookup fails at its first dereference. There is no server missing from a
 queue: **no queue has ever been registered.** The RPC subsystem is initialised
 and dispatching correctly, and nothing has called into it to offer a service.
 
-> **NOTE (unverified): why no module registers one.** Every module that would
-> is resident — FILEIO, CDVDFSV and LOADFILE are all in the map — the RPC layer
-> reports itself initialised, and the scheduler is running (below). What has not
-> been established is whether those modules' server threads start and block, or
-> never start, or deliberately wait for something the EE has not done. The
-> difference matters: the first is a defect here, the last is simply more EE.
-> *Verify by:* finding THREADMAN's thread list the same way this table was
-> found, and reading the state of the threads those modules create.
+### Why nothing registers: FILEIO never gets that far
+
+Read out of the same dump, by walking the structures rather than guessing.
+
+**The module is resident and healthy.** Its module-info block is at `0x3fd00`,
+naming `FILEIO_service` with entry `0x3fd30`, which matches the module map.
+
+**It does not refuse to start.** FILEIO's entry begins with `QueryBootMode(3)`
+and, if that key exists with bit 0 or bit 1 set, prints `' No SIF
+service(fileio)'` or `' No FILEIO service'` and returns without starting. The
+boot-mode table pointer lives at absolute `0x3f0`, points at `0x32c0`, and holds
+exactly one entry — key 4, length 0. **There is no key 3**, so the query returns
+zero and FILEIO takes the normal path.
+
+**Its threads exist and were started.** The IOP has five thread control blocks;
+every TCB begins with the same word (`0x11948`), which makes them enumerable,
+and the status byte is at `+0x44`:
+
+```
+TCB       entry     stack     size  prio  status
+0x0117c8  0001aef8  001fce00  4096   10   WAIT
+0x011820  0001aa58  001fde00  2048    0   -
+0x0391e0  00040ca0  001fae00  2048   96   WAIT     FILEIO
+0x039238  00040a34  001fb600  4096   80   WAIT     FILEIO
+0x039290  00039434  001fc600  2048    0   RUN
+```
+
+Both FILEIO threads are **WAIT**, not DORMANT and not absent: `CreateThread`
+and `StartThread` both succeeded.
+
+**It never reaches the registration.** Disassembling the service thread at
+`0x40a34` shows it print its banner, take its thread id, call
+`sceSifSetRpcQueue` with a queue descriptor at `0x41318`, then register with
+`$a1 = 0x80000001` — the fileio service id — and a server-data block at
+`0x41330`. Both of those blocks read **all zeros**, so neither call has run.
+That is consistent with the service list head at `0x1a890` being null, and with
+every bind the host has sent coming back with `sd`, `buf` and `cbuf` zero.
+
+The thread's stack carries the return addresses `0x40a74` (the call before
+`GetThreadId`), then `0x18630` inside the SIF library, then kernel frames —
+which places the block inside SIF RPC initialisation, ahead of the registration.
+
+> **NOTE (unverified): what it is waiting on.** The saved return addresses put
+> the thread in the SIF init path, but a return address on a stack is where a
+> call *was* made, not necessarily where the thread is parked now, and the exact
+> kernel primitive has not been identified.
+> *Verify by:* capturing the IOP's serial console, which this image does not.
+> The signals exist in the board file (`con_wr`, `con_data`) and only the
+> diagnostic image consumes them. Every module prints as it initialises —
+> FILEIO's own `'Multi Threaded Fileio module.(99/11/15)'` is in its data
+> segment — so the console says how far each module got and in what order,
+> which is a far better instrument for this than reading more disassembly.
 
 **A theory that was wrong, recorded because the method matters.** The first
 explanation was that the IOP's thread scheduler never ticks: INTC bit 16 —
