@@ -19,7 +19,7 @@ else python3 "$HERE/gen_gif.py" --seed "$SEED" --tags "$TAGS" > packets.hex; fi
 
 python3 "$HERE/gs_ref.py" packets.hex --raw --dump-mem "$BASE" "$LEN" > ref.txt 2> ref.err
 
-xvhdl -2008 "$ROOT/rtl/gs/gs_gif.vhd" > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }
+xvhdl -2008 "$ROOT/rtl/gs/gs_edge_dda.vhd" "$ROOT/rtl/gs/gs_gif.vhd" > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }
 xvlog -sv   "$HERE/tb_gs.sv"          > xvlog.log 2>&1 || { tail -20 xvlog.log; exit 1; }
 xelab -debug off tb_gs -s tb          > xelab.log 2>&1 || { tail -30 xelab.log; exit 1; }
 xsim tb -R -testplusarg "packets=packets.hex" \
@@ -34,7 +34,7 @@ fi
 # being filtered out of the RTL side while the reference still printed it, so
 # every stream that touched an undefined address failed on a line the RTL had
 # never been given the chance to produce.
-grep -E "^REG |^VM |^# unknown|^# pixels" xsim.log > rtl.txt
+grep -E "^REG |^VM |^VMSUM |^# unknown|^# pixels" xsim.log > rtl.txt
 
 if diff -q ref.txt rtl.txt >/dev/null; then
     echo "PASS  $(wc -l < ref.txt) lines identical (${PROG:+$(basename "$PROG")}${SEED:+seed $SEED})"

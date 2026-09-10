@@ -34,6 +34,7 @@ module tb_gs;
 
    integer sent, npkt;
    integer n, r, budget;
+   logic [31:0] vmsum;
    integer dump_base, dump_len;
    string  pktfile;
    logic [127:0] pkts [0:4095];
@@ -134,6 +135,11 @@ module tb_gs;
                 n, vm[n+15], vm[n+14], vm[n+13], vm[n+12], vm[n+11], vm[n+10],
                 vm[n+9], vm[n+8], vm[n+7], vm[n+6], vm[n+5], vm[n+4],
                 vm[n+3], vm[n+2], vm[n+1], vm[n+0]);
+      // the same checksum the reference prints, over all 4 MB
+      vmsum = 32'h811C9DC5;
+      for (n = 0; n < VMBYTES; n = n + 1)
+         vmsum = (vmsum ^ vm[n]) * 32'h01000193;
+      $write("VMSUM %08x\n", vmsum);
       if (dbg_unknown != 0) $display("# unknown register writes: %0d", dbg_unknown);
       $display("# pixels drawn: %0d", dbg_pixels);
       $finish;

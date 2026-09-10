@@ -12,9 +12,16 @@ the boundary between a tag and its data -- not in the middle of a long run.
 """
 import argparse, random
 
-# descriptors worth generating: A+D dominates because it is how a real packet
-# writes most registers, and it is the only one carrying its own address
-DESCS = [0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA,
+# Descriptors worth generating: A+D dominates because it is how a real packet
+# writes most registers, and it is the only one carrying its own address.
+#
+# 0x4 and 0x5 -- XYZF2 and XYZ2 -- are absent for the same reason they are
+# absent from AD_ADDRS: they *kick a primitive*, and one kicked from random
+# coordinates with a random PRIM is a triangle of arbitrary extent, drawn from
+# vertices that mean nothing.  Excluding them there and leaving them here was an
+# oversight that took a bisect to find.  0xC and 0xD (XYZF3, XYZ3) stay: they
+# queue a vertex without drawing, which is exactly the harmless half.
+DESCS = [0x0, 0x1, 0x2, 0x3, 0x6, 0x7, 0x8, 0x9, 0xA,
          0xC, 0xD, 0xE, 0xE, 0xE, 0xE, 0xF]
 
 # addresses A+D may name.  0x53 and 0x54 are excluded here and driven only by
@@ -73,6 +80,36 @@ def gen(rng, ntags):
             out.append(((x0 << 4) | (((y0 << 4)) << 16)) | (0x05 << 64))
             out.append((((x0 + w) << 4) | ((((y0 + h) << 4)) << 16)) | (0x05 << 64))
         elif pick < 0.34:
+            # a triangle, strip or fan, generated coherently.  Kept small on
+            # purpose: a large one is thousands of pixels at one per clock plus
+            # a long divide per edge, and the interesting behaviour is at the
+            # edges rather than in the middle.
+            prim = rng.choice([3, 4, 5])
+            nv   = 3 if prim == 3 else rng.choice([3, 4, 5])
+            bx, by = rng.randrange(0, 40), rng.randrange(0, 20)
+            msk = rng.choice([0x00000000, 0x00000000, 0xFF000000])
+            sc  = (rng.randrange(0, 4), rng.randrange(40, 64),
+                   rng.randrange(0, 4), rng.randrange(20, 32))
+            items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (msk << 32)),
+                     (0x18, 0),
+                     (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
+                     (0x01, rng.randrange(1 << 32)),
+                     (0x00, prim)]
+            regs = 0
+            for i in range(len(items)):
+                regs |= 0xE << (4 * i)
+            out.append(tag(1, 0, regs, len(items)))
+            for a, d in items:
+                out.append((d & ((1 << 64) - 1)) | (a << 64))
+            vr = 0
+            for i in range(nv):
+                vr |= 0xE << (4 * i)
+            out.append(tag(1, 1, vr, nv))
+            for _ in range(nv):
+                vx = (bx + rng.randrange(0, 14)) * 16 + rng.randrange(0, 16)
+                vy = (by + rng.randrange(0, 10)) * 16 + rng.randrange(0, 16)
+                out.append((vx | (vy << 16)) | (0x05 << 64))
+        elif pick < 0.46:
             # a host-to-local transfer of a small rectangle
             w = rng.randrange(1, 9)
             h = rng.randrange(1, 5)

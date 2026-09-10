@@ -260,7 +260,60 @@ for a leftward edge the quotient step is off by one and the remainder goes
 negative. Edge 1 of the very first seed was such an edge — `dx = -5433`, where
 floor gives `qstep = -29, rstep = 1232` and truncation gives `-28, -1808`.
 
-## The triangle rasteriser: attempted, reverted — 2026-09-10
+## The triangle rasteriser runs — 2026-09-10
+
+Triangles, strips and fans, on top of `gs_edge_dda`: three edge units started
+together at the first scanline, exactly two spanning any given scanline, the
+span between their `ceil(x)` values. **16 random streams agree with the
+reference** — registers, framebuffer, pixel count and a checksum over all 4 MB —
+alongside sprites, transfers and the directed cases.
+
+Two things had to be fixed in the *harness* before the RTL could be trusted, and
+both had been hiding failures rather than causing them.
+
+**The framebuffer comparison only looked through a window.** A dump of the first
+few hundred bytes is a test that checks where it was told to, and a primitive of
+any size draws mostly outside it. That is how "the framebuffer matches" and "one
+side drew twenty times as many pixels as the other" were both true at once. The
+comparison is now a checksum over the whole of local memory, which is cheaper
+than a wider dump and complete.
+
+**The random generator was kicking primitives from garbage.** `0x4` and `0x5` —
+`XYZF2` and `XYZ2` — draw when they are written, and they had been removed from
+the A+D address list for exactly that reason while being left in the *packed
+descriptor* list, which is the other way a packet names a register. So random
+streams were drawing triangles from random coordinates under a random `PRIM`,
+with extents of millions of pixels, and the two models disagreed somewhere out
+there. `0xC` and `0xD` stay, because `XYZF3` and `XYZ3` queue a vertex without
+drawing — the harmless half of the same idea.
+
+Neither of those is a subtlety of the hardware. Both are the same failure the EE
+work kept hitting: **the instrument was weaker than it looked, and what it did
+not reach stayed broken.**
+
+### The bug the incremental approach found
+
+The first attempt at this was reverted because it broke seven of ten random
+sprite streams. Re-applying it one change at a time, with the sprite suite as
+the gate after every step, put the cause in the open immediately: vertex
+tracking passed, the `S_DRAW` restructure passed, and the integration failed —
+because **`tkick` was declared, reset and used but never assigned.** The state
+machine, the edge instances, the kick decode and the divert were all present and
+correct, and the triangle path was unreachable. A patch anchor had not matched
+after an earlier edit, and nothing checked.
+
+A second fix came out of the same pass: `ceil(y/16)` written as `(y+15)/16`
+truncates toward zero in VHDL rather than flooring, so it was wrong for any
+vertex above or left of `XYOFFSET`. An arithmetic shift is the floor.
+
+### What the triangle does not do yet
+
+No Gouraud interpolation — flat shading only, the colour of the last vertex. No
+Z, no alpha, no texture, no dither, PSMCT32 only. Vertex coordinates are assumed
+to fit signed 16 bits after `XYOFFSET` is subtracted, which real content
+satisfies and a random generator does not.
+
+## Superseded: the first attempt, reverted — 2026-09-10
 
 The rasteriser was built on top of `gs_edge_dda` — three edge units started
 together at the triangle's first scanline, two of them spanning any given

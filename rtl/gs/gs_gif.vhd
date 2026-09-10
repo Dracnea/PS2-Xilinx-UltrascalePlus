@@ -77,7 +77,8 @@ architecture arch of gs_gif is
    signal pixels  : unsigned(31 downto 0) := (others => '0');
 
    type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
-                    S_DRAW, S_DRAWRD);
+                    S_DRAW, S_DRAWRD,
+                    S_TRI_SET, S_TRI_WAIT, S_TRI_SCAN, S_TRI_STEP);
    signal state : state_t := S_TAG;
 
    -- the tag in flight
@@ -105,6 +106,31 @@ architecture arch of gs_gif is
    signal v_cnt   : unsigned(2 downto 0) := (others => '0');
    signal v0_x, v0_y : unsigned(15 downto 0) := (others => '0');
    signal v1_x, v1_y : unsigned(15 downto 0) := (others => '0');
+   -- A triangle needs three vertices in flight, and a fan keeps its *first*
+   -- for every triangle it draws, which a shift register alone cannot provide;
+   -- the anchor is captured on the first vertex after PRIM.
+   signal v2_x, v2_y : unsigned(15 downto 0) := (others => '0');
+   signal vf_x, vf_y : unsigned(15 downto 0) := (others => '0');
+   -- '1' while a triangle is being walked; sprites leave it clear
+   signal tri_mode : std_logic := '0';
+
+   -- Three edges, each stepped a scanline at a time by gs_edge_dda, which was
+   -- verified against the reference on its own before being used here.  All
+   -- three start at the triangle's first scanline and step together; exactly
+   -- two span any scanline, and the span lies between their two ceil(x).
+   -- Stepping the third as well costs nothing: the recurrence is linear, so an
+   -- edge extrapolated outside its own y range is still correct when the
+   -- scanline reaches it.
+   type sv16_a is array (0 to 2) of signed(15 downto 0);
+   type sv13_a is array (0 to 2) of signed(12 downto 0);
+   signal e_x0, e_y0, e_x1, e_y1 : sv16_a := (others => (others => '0'));
+   signal e_ytop  : signed(11 downto 0) := (others => '0');
+   signal e_start : std_logic := '0';
+   signal e_step  : std_logic := '0';
+   signal e_busy  : std_logic_vector(2 downto 0);
+   signal e_x     : sv13_a;
+   signal e_yst, e_yen : sv13_a := (others => (others => '0'));
+   signal t_x, t_y : sv16_a := (others => (others => '0'));
    signal dr_x, dr_y : unsigned(10 downto 0) := (others => '0');
    signal dr_x0      : unsigned(10 downto 0) := (others => '0');
    signal dr_x1      : unsigned(10 downto 0) := (others => '0');
@@ -162,6 +188,14 @@ architecture arch of gs_gif is
    end function;
 begin
 
+   edges : for k in 0 to 2 generate
+      u : entity work.gs_edge_dda
+         port map (clk => clk, reset => reset, start => e_start,
+                   x0 => e_x0(k), y0 => e_y0(k), x1 => e_x1(k), y1 => e_y1(k),
+                   ytop => e_ytop, busy => e_busy(k), step => e_step,
+                   x => e_x(k));
+   end generate;
+
    -- Combinational, because valid/ready only means anything if both sides agree
    -- on which edge the transfer happened.  A registered ready lags the state it
    -- describes by a cycle, and the producer then advances on an edge where
@@ -169,6 +203,8 @@ begin
    -- stops to do some work, which is the one case that matters.
    gif_ready <= '0' when reset = '1' else
                 '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
+                         or state = S_TRI_SET or state = S_TRI_WAIT
+                         or state = S_TRI_SCAN or state = S_TRI_STEP
                 else '1';
 
    dbg_reg     <= reg(to_integer(dbg_sel));
@@ -188,20 +224,27 @@ begin
       variable vloop   : unsigned(14 downto 0);
       variable vdone   : boolean;
       variable kick    : boolean;
+      variable tkick   : boolean;
       variable ctxi    : integer range 0 to 1;
       variable ofx, ofy, ax, ay, bx, by, t : integer range -65536 to 65535;
       variable sx0, sx1, sy0, sy1          : integer range 0 to 2047;
       variable oldpx, newpx                : std_logic_vector(31 downto 0);
+      variable ylo, yhi, tya, tyb          : integer range -65536 to 65535;
+      variable lft, rgt                    : integer range -4096 to 4095;
+      variable ka, kb                      : integer range 0 to 2;
    begin
       if rising_edge(clk) then
          wr_en     <= '0';
          rd_en     <= '0';
+         e_step    <= '0';
 
          if reset = '1' then
             state    <= S_TAG;
             unknown  <= (others => '0');
             pixels   <= (others => '0');
             x_active <= '0';
+            tri_mode <= '0';
+            e_start  <= '0';
             v_cnt    <= (others => '0');
             dr_empty <= '1';
             px_n     <= (others => '0');
@@ -250,6 +293,7 @@ begin
                      -- own address -- fall out as an ordinary case rather than
                      -- a second mechanism.
                      kick   := false;
+                     tkick  := false;
                      w_do   := true;
                      w_addr := to_unsigned(0, 7);
                      w_data := (others => '0');
@@ -314,17 +358,29 @@ begin
                            elsif w_addr = 4 or w_addr = 5
                                  or w_addr = 16#0C# or w_addr = 16#0D# then
                               v0_x <= v1_x;  v0_y <= v1_y;
-                              v1_x <= unsigned(w_data(15 downto 0));
-                              v1_y <= unsigned(w_data(31 downto 16));
+                              v1_x <= v2_x;  v1_y <= v2_y;
+                              v2_x <= unsigned(w_data(15 downto 0));
+                              v2_y <= unsigned(w_data(31 downto 16));
+                              if v_cnt = 0 then          -- the fan's anchor
+                                 vf_x <= unsigned(w_data(15 downto 0));
+                                 vf_y <= unsigned(w_data(31 downto 16));
+                              end if;
                               if v_cnt < 7 then
                                  v_cnt <= v_cnt + 1;
                               end if;
                               -- XYZ2 and XYZF2 kick the primitive; XYZ3 and
-                              -- XYZF3 only queue the vertex
-                              if (w_addr = 4 or w_addr = 5)
-                                 and reg(0)(2 downto 0) = "110"     -- SPRITE
-                                 and v_cnt >= 1 then
-                                 kick := true;
+                              -- XYZF3 only queue the vertex.  A sprite needs two
+                              -- vertices, a triangle three, and the counter here
+                              -- is the value *before* this one is counted.
+                              if w_addr = 4 or w_addr = 5 then
+                                 if reg(0)(2 downto 0) = "110" and v_cnt >= 1 then
+                                    kick := true;         -- SPRITE
+                                 elsif (reg(0)(2 downto 0) = "011"
+                                        or reg(0)(2 downto 0) = "100"
+                                        or reg(0)(2 downto 0) = "101")
+                                       and v_cnt >= 2 then
+                                    tkick := true;        -- TRIANGLE / STRIP / FAN
+                                 end if;
                               end if;
                            end if;
                         end if;
@@ -351,8 +407,8 @@ begin
                         if reg(0)(9) = '1' then ctxi := 1; end if;
                         ofx := to_integer(unsigned(reg(16#18# + ctxi)(15 downto 0)));
                         ofy := to_integer(unsigned(reg(16#18# + ctxi)(47 downto 32)));
-                        ax := (to_integer(v1_x) - ofx) / 16;
-                        ay := (to_integer(v1_y) - ofy) / 16;
+                        ax := (to_integer(v2_x) - ofx) / 16;
+                        ay := (to_integer(v2_y) - ofy) / 16;
                         bx := (to_integer(unsigned(w_data(15 downto 0))) - ofx) / 16;
                         by := (to_integer(unsigned(w_data(31 downto 16))) - ofy) / 16;
                         if ax > bx then t := ax; ax := bx; bx := t; end if;
@@ -386,6 +442,42 @@ begin
                         dr_ret <= S_PACKED;
                         if last then dr_ret <= S_TAG; end if;
                         state  <= S_DRAW;
+                     elsif tkick then
+                        ctxi := 0;
+                        if reg(0)(9) = '1' then ctxi := 1; end if;
+                        ofx := to_integer(unsigned(reg(16#18# + ctxi)(15 downto 0)));
+                        ofy := to_integer(unsigned(reg(16#18# + ctxi)(47 downto 32)));
+                        -- a fan takes its first vertex from the anchor; a list
+                        -- and a strip take the oldest of the three in flight
+                        if reg(0)(2 downto 0) = "101" then
+                           t_x(0) <= to_signed(to_integer(vf_x) - ofx, 16);
+                           t_y(0) <= to_signed(to_integer(vf_y) - ofy, 16);
+                        else
+                           t_x(0) <= to_signed(to_integer(v1_x) - ofx, 16);
+                           t_y(0) <= to_signed(to_integer(v1_y) - ofy, 16);
+                        end if;
+                        t_x(1) <= to_signed(to_integer(v2_x) - ofx, 16);
+                        t_y(1) <= to_signed(to_integer(v2_y) - ofy, 16);
+                        t_x(2) <= to_signed(to_integer(unsigned(w_data(15 downto 0))) - ofx, 16);
+                        t_y(2) <= to_signed(to_integer(unsigned(w_data(31 downto 16))) - ofy, 16);
+                        dr_fbp   <= unsigned(reg(16#4C# + ctxi)(8 downto 0));
+                        dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
+                        dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
+                        dr_rgba  <= reg(1)(31 downto 0);
+                        if reg(16#4C# + ctxi)(29 downto 24) /= "000000" then
+                           dr_empty <= '1';            -- not PSMCT32
+                        else
+                           dr_empty <= '0';
+                        end if;
+                        -- a list starts over; a strip and a fan keep two
+                        if reg(0)(2 downto 0) = "011" then
+                           v_cnt <= (others => '0');
+                        else
+                           v_cnt <= to_unsigned(2, 3);
+                        end if;
+                        dr_ret <= S_PACKED;
+                        if last then dr_ret <= S_TAG; end if;
+                        state  <= S_TRI_SET;
                      elsif w_do and defined(w_addr) and w_addr = 16#54# then
                         px_ret <= S_PACKED;
                         if last then px_ret <= S_TAG; end if;
@@ -458,6 +550,110 @@ begin
                      state  <= S_PIXELS;
                   end if;
 
+               when S_TRI_SET =>
+                  -- Order each edge so y increases, note the scanlines it spans,
+                  -- and start all three at the triangle's first scanline.  A
+                  -- horizontal edge spans nothing and is left with an empty
+                  -- range rather than special-cased: its divider divides by zero
+                  -- and produces nonsense, which is harmless because the span
+                  -- test never selects it.
+                  ylo := to_integer(t_y(0));
+                  yhi := ylo;
+                  for k in 1 to 2 loop
+                     if to_integer(t_y(k)) < ylo then ylo := to_integer(t_y(k)); end if;
+                     if to_integer(t_y(k)) > yhi then yhi := to_integer(t_y(k)); end if;
+                  end loop;
+                  sy0 := to_integer(unsigned(reg(16#40# + ctxi)(42 downto 32)));
+                  sy1 := to_integer(unsigned(reg(16#40# + ctxi)(58 downto 48)));
+                  -- ceil(y/16) is floor((y+15)/16), and floor is an arithmetic
+                  -- shift.  Integer division truncates toward zero instead,
+                  -- which differs as soon as a coordinate is negative -- and a
+                  -- vertex above or left of XYOFFSET is exactly that.
+                  tya := to_integer(shift_right(to_signed(ylo + 15, 24), 4));
+                  tyb := to_integer(shift_right(to_signed(yhi + 15, 24), 4)) - 1;
+                  if tya < sy0 then tya := sy0; end if;
+                  if tyb > sy1 then tyb := sy1; end if;
+                  for k in 0 to 2 loop
+                     ka := k;
+                     kb := (k + 1) mod 3;
+                     if t_y(ka) <= t_y(kb) then
+                        e_x0(k) <= t_x(ka); e_y0(k) <= t_y(ka);
+                        e_x1(k) <= t_x(kb); e_y1(k) <= t_y(kb);
+                        e_yst(k) <= resize(shift_right(t_y(ka) + 15, 4), 13);
+                        e_yen(k) <= resize(shift_right(t_y(kb) + 15, 4), 13);
+                     else
+                        e_x0(k) <= t_x(kb); e_y0(k) <= t_y(kb);
+                        e_x1(k) <= t_x(ka); e_y1(k) <= t_y(ka);
+                        e_yst(k) <= resize(shift_right(t_y(kb) + 15, 4), 13);
+                        e_yen(k) <= resize(shift_right(t_y(ka) + 15, 4), 13);
+                     end if;
+                  end loop;
+                  if tya > tyb or tya < 0 then
+                     dr_empty <= '1';
+                     dr_y  <= (others => '0');
+                     dr_y1 <= (others => '0');
+                  else
+                     dr_y  <= to_unsigned(tya, 11);
+                     dr_y1 <= to_unsigned(tyb, 11);
+                  end if;
+                  e_ytop   <= to_signed(tya, 12);
+                  e_start  <= '1';
+                  tri_mode <= '1';
+                  state    <= S_TRI_WAIT;
+
+               when S_TRI_WAIT =>
+                  e_start <= '0';
+                  if e_start = '0' and e_busy = "000" then
+                     if dr_empty = '1' then
+                        tri_mode <= '0';
+                        state    <= dr_ret;
+                     else
+                        state <= S_TRI_SCAN;
+                     end if;
+                  end if;
+
+               when S_TRI_STEP =>
+                  -- e_step was raised on the previous edge, so the edges update
+                  -- at the end of *this* cycle.  Reading them in the same cycle
+                  -- the step is raised gives the previous scanline's span, which
+                  -- draws a triangle one pixel too wide on every line but the
+                  -- first -- a shape that is still a triangle, and so the kind
+                  -- of wrong that survives a look at the picture.
+                  state <= S_TRI_SCAN;
+
+               when S_TRI_SCAN =>
+                  -- Exactly two edges span any scanline, and the span runs
+                  -- between their two ceil(x) values, half-open.
+                  lft := 4095;
+                  rgt := -4096;
+                  for k in 0 to 2 loop
+                     if e_yst(k) <= signed(resize(dr_y, 13))
+                        and signed(resize(dr_y, 13)) < e_yen(k) then
+                        if to_integer(e_x(k)) < lft then lft := to_integer(e_x(k)); end if;
+                        if to_integer(e_x(k)) > rgt then rgt := to_integer(e_x(k)); end if;
+                     end if;
+                  end loop;
+                  sx0 := to_integer(unsigned(reg(16#40# + ctxi)(10 downto 0)));
+                  sx1 := to_integer(unsigned(reg(16#40# + ctxi)(26 downto 16)));
+                  rgt := rgt - 1;
+                  if lft < sx0 then lft := sx0; end if;
+                  if rgt > sx1 then rgt := sx1; end if;
+                  if lft > rgt or lft < 0 or rgt < 0 then
+                     e_step <= '1';
+                     if dr_y >= dr_y1 then
+                        tri_mode <= '0';
+                        state    <= dr_ret;
+                     else
+                        dr_y  <= dr_y + 1;
+                        state <= S_TRI_STEP;
+                     end if;
+                  else
+                     dr_x  <= to_unsigned(lft, 11);
+                     dr_x0 <= to_unsigned(lft, 11);
+                     dr_x1 <= to_unsigned(rgt, 11);
+                     state <= S_DRAW;
+                  end if;
+
                when S_DRAW =>
                   if dr_empty = '1' or dr_y > dr_y1 then
                      state <= dr_ret;
@@ -475,8 +671,21 @@ begin
                                       resize(unsigned'(x"F"), 32), 4 * lane));
                         pixels  <= pixels + 1;
                         if dr_x = dr_x1 then
-                           dr_x <= dr_x0;
-                           dr_y <= dr_y + 1;
+                           -- end of a scanline: a sprite goes back to the same
+                           -- left edge, a triangle will ask its edges for the next
+                           if tri_mode = '1' then
+                              e_step <= '1';
+                              if dr_y >= dr_y1 then
+                                 tri_mode <= '0';
+                                 state    <= dr_ret;
+                              else
+                                 dr_y  <= dr_y + 1;
+                                 state <= S_TRI_STEP;
+                              end if;
+                           else
+                              dr_x <= dr_x0;
+                              dr_y <= dr_y + 1;
+                           end if;
                         else
                            dr_x <= dr_x + 1;
                         end if;
@@ -502,12 +711,24 @@ begin
                                    resize(unsigned'(x"F"), 32), 4 * lane));
                      pixels  <= pixels + 1;
                      if dr_x = dr_x1 then
-                        dr_x <= dr_x0;
-                        dr_y <= dr_y + 1;
+                        if tri_mode = '1' then
+                           e_step <= '1';
+                           if dr_y >= dr_y1 then
+                              tri_mode <= '0';
+                              state    <= dr_ret;
+                           else
+                              dr_y  <= dr_y + 1;
+                              state <= S_TRI_STEP;
+                           end if;
+                        else
+                           dr_x <= dr_x0;
+                           dr_y <= dr_y + 1;
+                           state <= S_DRAW;
+                        end if;
                      else
                         dr_x <= dr_x + 1;
+                        state <= S_DRAW;
                      end if;
-                     state <= S_DRAW;
                   end if;
 
                when S_PIXELS =>

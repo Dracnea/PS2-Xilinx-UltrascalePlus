@@ -444,6 +444,15 @@ def main():
         for off in range(0, ln, 16):
             row = gs.vm[base + off:base + off + 16]
             print("VM %08x %s" % (base + off, row[::-1].hex()))
+    # A checksum over the *whole* of local memory, because a dump window is a
+    # test that only looks where it was told to.  A large primitive draws mostly
+    # outside any window worth printing, so "the framebuffer matches" and "one
+    # side drew twenty times as many pixels" were both true at once -- which is
+    # a hole in the comparison, not a subtlety of the hardware.
+    h = 0x811C9DC5
+    for b in gs.vm:
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    print("VMSUM %08x" % h)
     if gs.unknown:
         print("# unknown register writes: %d" % gs.unknown)
     print("# pixels drawn: %d" % gs.pixels)
