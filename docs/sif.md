@@ -308,12 +308,22 @@ which places the block inside SIF RPC initialisation, ahead of the registration.
 > the thread in the SIF init path, but a return address on a stack is where a
 > call *was* made, not necessarily where the thread is parked now, and the exact
 > kernel primitive has not been identified.
-> *Verify by:* capturing the IOP's serial console, which this image does not.
-> The signals exist in the board file (`con_wr`, `con_data`) and only the
-> diagnostic image consumes them. Every module prints as it initialises —
-> FILEIO's own `'Multi Threaded Fileio module.(99/11/15)'` is in its data
-> segment — so the console says how far each module got and in what order,
-> which is a far better instrument for this than reading more disassembly.
+> *Verify by:* not the serial console. That was tried on 2026-09-10 and does
+> not work against a retail BIOS, for a reason `iop_top.vhd` already recorded
+> before it was tried: "there is no serial console on a retail BIOS to print
+> it." The console block taps SIO1 at `0x1F801050`, and the BIOS's `printf`
+> does not go there — it formats into a buffer and flushes through **IOMAN**,
+> to file descriptor 1. With no tty device bound to that descriptor the bytes
+> are discarded, so the port stays silent no matter how much the BIOS prints.
+> The capture is still worth having for the test ROMs, which can write SIO1
+> directly, but it answers nothing about a BIOS boot.
+>
+> What would work is redirecting the BIOS's own output: the ROM image is
+> supplied by the host, so patching the character sink at `0x163e0` (or the
+> flush at `0x16478`) to store to SIO1 would make every module's messages
+> visible through the FIFO that now exists, without a gateware rebuild. It
+> changes the image under test, which is a real cost and has to be stated
+> whenever a result depends on it.
 
 **A theory that was wrong, recorded because the method matters.** The first
 explanation was that the IOP's thread scheduler never ticks: INTC bit 16 —

@@ -34,7 +34,7 @@ from litescope import LiteScopeAnalyzer
 from litepcie.software import generate_litepcie_software
 
 import xilinx_c1100
-from c1100_ps2_iop import PS2IOPSoC
+from c1100_ps2_iop import PS2IOPSoC, ConsoleFifo   # the console lives in the base image now
 
 _serial = [
     ("serial", 0,
@@ -87,26 +87,6 @@ class PostRing(LiteXModule, AutoCSR):
         ]
 
 
-class ConsoleFifo(LiteXModule, AutoCSR):
-    """Bytes the IOP writes to its serial console, iop -> sys, read by the host."""
-    def __init__(self, con_wr, con_data, depth=4096):
-        self.level = CSRStatus(16, description="bytes waiting (saturating at the FIFO depth)")
-        self.data  = CSRStatus(8,  description="next byte; reading `pop` advances")
-        self.pop   = CSRStorage(1, description="write 1 to drop the byte in `data`")
-        self.overflow = CSRStatus(1, description="1 once a byte was lost to a full FIFO")
-        fifo = AsyncFIFO(8, depth)
-        self.fifo = ClockDomainsRenamer({"write": "iop", "read": "sys"})(fifo)
-        ovf = Signal()
-        self.comb += fifo.din.eq(con_data), fifo.we.eq(con_wr & fifo.writable)
-        self.sync.iop += If(con_wr & ~fifo.writable, ovf.eq(1))
-        self.comb += [
-            self.data.status.eq(fifo.dout),
-            self.level.status.eq(Mux(fifo.readable, 1, 0)),      # AsyncFIFO has no level: 1 = at least one byte
-            fifo.re.eq(self.pop.re),
-        ]
-        self.specials += MultiReg(ovf, self.overflow.status, "sys")
-
-
 class StallDetector(LiteXModule, AutoCSR):
     """Cycles since the CPU's last bus request; `stall` after 2^22 of them."""
     def __init__(self, req, reset_iop):
@@ -133,7 +113,6 @@ class PS2DiagSoC(PS2IOPSoC):
 
         self.zpost  = PostRing(iop.post_code, iop.post_wr, reset_iop)
         self.zstall = StallDetector(iop.dbg["req"], reset_iop)
-        self.zcon   = ConsoleFifo(iop.con_wr, iop.con_data)
 
         d = iop.dbg
         sigs = [d["req"], d["rnw"], d["isdata"], d["done"], d["wmask"], d["addr_instr"], d["addr_data"],

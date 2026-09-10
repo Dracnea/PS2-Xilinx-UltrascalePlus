@@ -131,6 +131,26 @@ class _CRG(LiteXModule):
         platform.add_period_constraint(pads.p, 1e9/100e6)
 
 
+class ConsoleFifo(LiteXModule, AutoCSR):
+    """Bytes the IOP writes to its serial console, iop -> sys, read by the host."""
+    def __init__(self, con_wr, con_data, depth=4096):
+        self.level = CSRStatus(16, description="bytes waiting (saturating at the FIFO depth)")
+        self.data  = CSRStatus(8,  description="next byte; reading `pop` advances")
+        self.pop   = CSRStorage(1, description="write 1 to drop the byte in `data`")
+        self.overflow = CSRStatus(1, description="1 once a byte was lost to a full FIFO")
+        fifo = AsyncFIFO(8, depth)
+        self.fifo = ClockDomainsRenamer({"write": "iop", "read": "sys"})(fifo)
+        ovf = Signal()
+        self.comb += fifo.din.eq(con_data), fifo.we.eq(con_wr & fifo.writable)
+        self.sync.iop += If(con_wr & ~fifo.writable, ovf.eq(1))
+        self.comb += [
+            self.data.status.eq(fifo.dout),
+            self.level.status.eq(Mux(fifo.readable, 1, 0)),      # AsyncFIFO has no level: 1 = at least one byte
+            fifo.re.eq(self.pop.re),
+        ]
+        self.specials += MultiReg(ovf, self.overflow.status, "sys")
+
+
 class _IOPClocks(LiteXModule):
     """The IOP clock and its phase-aligned 2x and 3x from the 100 MHz reference.
 
@@ -753,6 +773,14 @@ class PS2IOPSoC(SoCMini):
         self.iop_clocks = _IOPClocks(platform, self.crg.clk100, self.crg.rst)
         self.iop        = IOPBringup(platform, self.iop_clocks.locked,
                                      hbm_axi=self.hbm.axi[1])
+
+        # The IOP's serial console.  Every BIOS module prints as it initialises,
+        # so this says how far each one got and in what order -- which is the
+        # instrument for questions like "did FILEIO reach its RPC registration",
+        # and it is far better than reading the disassembly to guess.  It used
+        # to exist only in the diagnostic image, which meant the one build that
+        # can run a real BIOS over PCIe threw the answer away.
+        self.zcon = ConsoleFifo(self.iop.con_wr, self.iop.con_data)
 
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_axi.clk)
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_apb.clk)
