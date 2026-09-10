@@ -24,6 +24,7 @@ venv/
 sim/work/
 sim/work_dbg/
 sim/ee/work/
+sim/gs/work/
 fit/ee/*.rpt
 # Vivado batch-mode droppings: fmax.tcl and fmax_pblock.tcl are run from the
 # repo root, and Vivado writes these into the working directory.

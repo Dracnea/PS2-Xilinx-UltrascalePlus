@@ -179,6 +179,12 @@ architecture arch of ee_core is
    signal m_take    : std_logic := '0';
    signal m_tgt     : unsigned(31 downto 0) := (others => '0');
    signal m_ismem   : std_logic := '0';
+   -- the unaligned group: which of LWL/LWR/LDL/LDR is in flight, and the value
+   -- rt held before it, which is what the loaded bytes merge into
+   signal m_unal    : std_logic := '0';
+   signal m_unal_dw : std_logic := '0';
+   signal m_unal_l  : std_logic := '0';
+   signal m_mbase   : std_logic_vector(63 downto 0) := (others => '0');
    signal m_isload  : std_logic := '0';
    signal m_width   : integer range 1 to 8 := 4;
    signal m_sign    : std_logic := '0';
@@ -254,6 +260,13 @@ architecture arch of ee_core is
             end case;
          when 4 | 5 => return true;                             -- BEQ, BNE
          when 40 | 41 | 43 | 63 => return true;                 -- stores
+         -- LWL/LWR/LDL/LDR merge into rt, so they *read* the register they
+         -- write; the store forms read it for their data.  Leaving these out
+         -- would mean the merge base was never forwarded, and the bug would
+         -- only appear when a compiler emitted the pair back to back -- which
+         -- is the only way it ever emits them.
+         when 34 | 38 | 26 | 27 => return true;                 -- LWL/LWR/LDL/LDR
+         when 42 | 46 | 44 | 45 => return true;                 -- SWL/SWR/SDL/SDR
          when others => return false;   -- rt is the destination, or unused
       end case;
    end function;
@@ -263,6 +276,7 @@ architecture arch of ee_core is
    begin
       case op is
          when 32 | 33 | 35 | 36 | 37 | 39 | 55 => return true;
+         when 34 | 38 | 26 | 27 => return true;   -- the unaligned load forms
          when others => return false;
       end case;
    end function;
@@ -301,6 +315,10 @@ begin
       variable ex_addr                : std_logic_vector(31 downto 0);
       variable ex_be                  : std_logic_vector(7 downto 0);
       variable ex_wdata               : std_logic_vector(63 downto 0);
+      variable ex_unal, ex_unal_dw    : std_logic;
+      variable ex_unal_l              : std_logic;
+      variable ex_mbase               : std_logic_vector(63 downto 0);
+      variable kk, hw                 : integer range 0 to 7;
       variable ex_take                : boolean;
       variable ex_trap                : boolean;
       variable ex_busy                : boolean;
@@ -322,6 +340,9 @@ begin
 
       -- MEM
       variable ldv, ldw          : std_logic_vector(63 downto 0);
+      variable uw, um, uv        : unsigned(31 downto 0);
+      variable uv64              : unsigned(63 downto 0);
+      variable ku, shu           : integer range 0 to 63;
 
       -- IF queue bookkeeping
       variable vq_pc   : q_pc_t;
@@ -353,6 +374,7 @@ begin
             d_valid    <= '0';
             m_valid    <= '0';
             m_ismem    <= '0';
+            m_unal     <= '0';
             m_take     <= '0';
             w_valid    <= '0';
             ex_cnt     <= 0;
@@ -425,6 +447,11 @@ begin
             ex_addr   := (others => '0');
             ex_be     := (others => '0');
             ex_wdata  := (others => '0');
+            ex_unal    := '0';
+            ex_unal_dw := '0';
+            ex_unal_l  := '0';
+            ex_mbase   := (others => '0');
+            kk := 0; hw := 0;
             ex_take   := false;
             ex_trap   := false;
             tgt       := (others => '0');
@@ -589,6 +616,19 @@ begin
                   end case;
                   ex_shift := to_integer(ea(2 downto 0));
 
+               when 34 | 38 | 26 | 27 =>                     -- LWL/LWR/LDL/LDR
+                  ea := unsigned(signed(a) + simm);
+                  ex_addr   := std_logic_vector(ea(31 downto 0));
+                  ex_ismem  := '1';
+                  ex_isload := '1';
+                  ex_we     := '1';
+                  ex_rd     := rt;
+                  ex_shift  := to_integer(ea(2 downto 0));
+                  ex_unal   := '1';
+                  if op = 26 or op = 27 then ex_unal_dw := '1'; end if;
+                  if op = 34 or op = 26 then ex_unal_l  := '1'; end if;
+                  ex_mbase  := b;      -- the value the loaded bytes merge into
+
                when 40 | 41 | 43 | 63 =>                     -- stores
                   ea := unsigned(signed(a) + simm);
                   ex_addr  := std_logic_vector(ea(31 downto 0));
@@ -600,6 +640,41 @@ begin
                      when 43 => ex_be := std_logic_vector(shift_left(unsigned'(x"0F"), to_integer(ea(2 downto 0))));
                      when others => ex_be := x"FF";
                   end case;
+
+               when 42 | 46 | 44 | 45 =>                     -- SWL/SWR/SDL/SDR
+                  -- Each writes part of the aligned unit containing the
+                  -- address, so the byte enables carry the whole of the
+                  -- meaning: the data port sees an ordinary write of a
+                  -- 64-bit word with only some lanes on.
+                  ea := unsigned(signed(a) + simm);
+                  ex_addr  := std_logic_vector(ea(31 downto 0));
+                  ex_ismem := '1';
+                  if op = 44 or op = 45 then                 -- doubleword forms
+                     kk := to_integer(ea(2 downto 0));
+                     if op = 44 then                         -- SDL
+                        ex_wdata := std_logic_vector(shift_right(unsigned(b), 8 * (7 - kk)));
+                        ex_be    := std_logic_vector(resize(unsigned'(x"FF") srl (7 - kk), 8));
+                     else                                    -- SDR
+                        ex_wdata := std_logic_vector(shift_left(unsigned(b), 8 * kk));
+                        ex_be    := std_logic_vector(shift_left(unsigned'(x"FF"), kk));
+                     end if;
+                  else                                       -- word forms
+                     kk := to_integer(ea(1 downto 0));
+                     hw := to_integer(ea(2 downto 2));       -- which half of the 64-bit unit
+                     if op = 42 then                         -- SWL
+                        ex_wdata := std_logic_vector(shift_left(
+                                       resize(shift_right(unsigned(b(31 downto 0)), 8 * (3 - kk)), 64),
+                                       32 * hw));
+                        ex_be    := std_logic_vector(shift_left(
+                                       resize(unsigned'(x"0F") srl (3 - kk), 8), 4 * hw));
+                     else                                    -- SWR
+                        ex_wdata := std_logic_vector(shift_left(
+                                       resize(shift_left(unsigned(b(31 downto 0)), 8 * kk), 64),
+                                       32 * hw));
+                        ex_be    := std_logic_vector(shift_left(
+                                       resize(shift_left(unsigned'(x"0F"), kk) and x"0F", 8), 4 * hw));
+                     end if;
+                  end if;
 
                when others => ex_trap := true;
             end case;
@@ -676,7 +751,46 @@ begin
                w_lo_we  <= m_lo_we;
                w_hi     <= m_hi;
                w_lo     <= m_lo;
-               if m_isload = '1' then
+               if m_isload = '1' and m_unal = '1' then
+                  -- LWL/LWR/LDL/LDR: take part of the aligned unit the address
+                  -- falls in and merge it with what rt already held.  The base
+                  -- travelled down the pipeline in m_mbase because rt is both a
+                  -- source and the destination here, which is why these had to
+                  -- be added to the forwarding decode as readers of rt.
+                  if m_unal_dw = '0' then                       -- word forms
+                     if m_shift >= 4 then
+                        uw := unsigned(d_rdata(63 downto 32));
+                     else
+                        uw := unsigned(d_rdata(31 downto 0));
+                     end if;
+                     ku := m_shift mod 4;
+                     if m_unal_l = '1' then                     -- LWL
+                        shu := 8 * (3 - ku);
+                        um  := shift_left(to_unsigned(1, 32), shu) - 1;
+                        uv  := (shift_left(uw, shu) or (unsigned(m_mbase(31 downto 0)) and um));
+                     else                                       -- LWR
+                        shu := 8 * ku;
+                        um  := not shift_right(unsigned'(x"FFFFFFFF"), shu);
+                        uv  := (shift_right(uw, shu) or (unsigned(m_mbase(31 downto 0)) and um));
+                     end if;
+                     ldw := sext32(std_logic_vector(uv));
+                  else                                          -- doubleword forms
+                     ku := m_shift;
+                     if m_unal_l = '1' then                     -- LDL
+                        shu := 8 * (7 - ku);
+                        uv64 := (shift_left(unsigned(d_rdata), shu)
+                                 or (unsigned(m_mbase)
+                                     and (shift_left(to_unsigned(1, 64), shu) - 1)));
+                     else                                       -- LDR
+                        shu := 8 * ku;
+                        uv64 := (shift_right(unsigned(d_rdata), shu)
+                                 or (unsigned(m_mbase)
+                                     and not shift_right(unsigned'(x"FFFFFFFFFFFFFFFF"), shu)));
+                     end if;
+                     ldw := std_logic_vector(uv64);
+                  end if;
+                  w_val <= ldw;
+               elsif m_isload = '1' then
                   -- The port answers with the whole 64-bit word that contains
                   -- the address, so the bytes the instruction asked for have to
                   -- be selected out of it and then extended.  Getting the
@@ -731,6 +845,10 @@ begin
                   m_hi     <= ex_hi;
                   m_lo     <= ex_lo;
                   m_ismem  <= ex_ismem and d_valid;
+                  m_unal    <= ex_unal;
+                  m_unal_dw <= ex_unal_dw;
+                  m_unal_l  <= ex_unal_l;
+                  m_mbase   <= ex_mbase;
                   if ex_take and d_valid = '1' then
                      m_take <= '1';
                   else
@@ -757,6 +875,7 @@ begin
                else
                   m_valid <= '0';
                   m_ismem <= '0';
+                  m_unal  <= '0';
                   m_we    <= '0';
                   m_hi_we <= '0';
                   m_lo_we <= '0';

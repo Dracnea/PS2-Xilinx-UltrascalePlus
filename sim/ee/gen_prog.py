@@ -40,9 +40,18 @@ def gen(rng, n, branches):
             op = rng.choice([40, 41, 43, 63])
             off = SCRATCH + rng.randrange(0, 0x400, 8)
             out.append((op << 26) | (0 << 21) | (rt << 16) | (off & 0xFFFF))
-        elif pick < 0.96:                                  # loads from scratch
+        elif pick < 0.92:                                  # loads from scratch
             op = rng.choice([32, 33, 35, 36, 37, 39, 55])
             off = SCRATCH + rng.randrange(0, 0x400, 8)
+            out.append((op << 26) | (0 << 21) | (rd << 16) | (off & 0xFFFF))
+        elif pick < 0.96:                                  # unaligned accesses
+            # These are the only instructions here whose behaviour depends on
+            # the low bits of the address, so the offset is deliberately not
+            # aligned -- every other memory operation above is on an eight-byte
+            # boundary, and an unaligned form at an aligned address exercises
+            # exactly one of its four or eight cases.
+            op = rng.choice([34, 38, 42, 46, 26, 27, 44, 45])
+            off = SCRATCH + rng.randrange(0, 0x400)
             out.append((op << 26) | (0 << 21) | (rd << 16) | (off & 0xFFFF))
         elif branches:
             # only ever forward, only ever a couple of instructions, so the

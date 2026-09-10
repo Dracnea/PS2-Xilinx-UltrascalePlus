@@ -243,6 +243,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("packets")
     ap.add_argument("--dump-mem", nargs=2, type=lambda s: int(s, 0), default=None)
+    ap.add_argument("--raw", action="store_true",
+                    help="print every address 0x00-0x7f without names, for diffing "
+                         "against the RTL -- the undefined ones are part of the test, "
+                         "since a write to one must leave it alone")
     a = ap.parse_args()
 
     qwords = []
@@ -259,8 +263,12 @@ def main():
             break
         at = nxt
 
-    for addr in sorted(REG_ADDR):
-        print("REG %02x %-11s %016x" % (addr, REG_ADDR[addr], gs.reg[addr]))
+    if a.raw:
+        for addr in range(0x80):
+            print("REG %02x %016x" % (addr, gs.reg.get(addr, 0)))
+    else:
+        for addr in sorted(REG_ADDR):
+            print("REG %02x %-11s %016x" % (addr, REG_ADDR[addr], gs.reg[addr]))
     if a.dump_mem:
         base, ln = a.dump_mem
         for off in range(0, ln, 16):

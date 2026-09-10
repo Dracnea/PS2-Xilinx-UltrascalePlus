@@ -162,6 +162,56 @@ class R5900:
             a = (s64(self.r(rs)) + simm) & M64
             n = {40: 1, 41: 2, 43: 4, 63: 8}[op]
             self.mem.store(a, n, self.r(rt))
+        elif op in (34, 38, 42, 46, 26, 27, 44, 45):    # unaligned
+            # LWL/LWR and their doubleword and store counterparts.  A compiler
+            # emits these in pairs to move a word that is not aligned, and each
+            # one touches only part of the aligned unit that contains the
+            # address, merging with whatever is already in the register or in
+            # memory.  These are little-endian forms: on a big-endian machine
+            # "left" and "right" swap, which is the classic way to get them
+            # subtly wrong.
+            a = (s64(self.r(rs)) + simm) & M64
+            if op in (34, 38, 42, 46):                  # word forms
+                base, k, mask = a & ~3, a & 3, M32
+                word = self.mem.load(base, 4)
+                if op == 34:                            # LWL
+                    sh = 8 * (3 - k)
+                    v = ((word << sh) | (self.r(rt) & ((1 << sh) - 1))) & mask
+                    self.w(rt, sext32(v))
+                elif op == 38:                          # LWR
+                    sh = 8 * k
+                    keep = (mask << (32 - sh)) & mask if sh else 0
+                    v = ((word >> sh) | (self.r(rt) & keep)) & mask
+                    self.w(rt, sext32(v))
+                elif op == 42:                          # SWL
+                    sh = 8 * (3 - k)
+                    cur = word
+                    nb = k + 1                          # bytes written, at the low end
+                    bm = (1 << (8 * nb)) - 1
+                    self.mem.store(base, 4, (cur & ~bm | ((self.r(rt) >> sh) & bm)) & mask)
+                else:                                   # SWR
+                    sh = 8 * k
+                    cur = word
+                    bm = (mask << sh) & mask
+                    self.mem.store(base, 4, (cur & ~bm | ((self.r(rt) << sh) & bm)) & mask)
+            else:                                       # doubleword forms
+                base, k, mask = a & ~7, a & 7, M64
+                dw = self.mem.load(base, 8)
+                if op == 26:                            # LDL
+                    sh = 8 * (7 - k)
+                    self.w(rt, ((dw << sh) | (self.r(rt) & ((1 << sh) - 1))) & mask)
+                elif op == 27:                          # LDR
+                    sh = 8 * k
+                    keep = (mask << (64 - sh)) & mask if sh else 0
+                    self.w(rt, ((dw >> sh) | (self.r(rt) & keep)) & mask)
+                elif op == 44:                          # SDL
+                    sh = 8 * (7 - k)
+                    bm = (1 << (8 * (k + 1))) - 1
+                    self.mem.store(base, 8, (dw & ~bm | ((self.r(rt) >> sh) & bm)) & mask)
+                else:                                   # SDR
+                    sh = 8 * k
+                    bm = (mask << sh) & mask
+                    self.mem.store(base, 8, (dw & ~bm | ((self.r(rt) << sh) & bm)) & mask)
         else:
             self.traps.append(("unimplemented op %d" % op, self.pc - 4))
 

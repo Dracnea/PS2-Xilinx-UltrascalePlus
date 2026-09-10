@@ -78,7 +78,47 @@ game rendered wrongly, and since every field has to be checked against the
 manual anyway, generating them first saves nothing and risks a great deal. The
 division is: mechanical and checkable, yes; authoritative, never.
 
+## Steps 1 to 3 run — 2026-09-10
+
+`rtl/gs/gs_gif.vhd` decodes GIFtags, holds the general registers and runs
+host-to-local transfers, and agrees with the reference across **40 random
+packet streams** plus directed cases. `sim/gs/run_diff.sh` generates a stream,
+runs both, and diffs all 128 register addresses, the framebuffer, and the count
+of writes to undefined addresses.
+
+The swizzle is the part worth reading. In hardware it is not arithmetic at all:
+
+    word address = page(8:0) & x5 & y4 & x4 & y3 & x3 & y2 & y1 & x2 & x1 & y0 & x0
+
+The low eleven bits are the low bits of x and y interleaved in a fixed order.
+The manual presents this as three tables and PCSX2 stores two of them as
+literal arrays, but it is a wire permutation and costs nothing. Only the page
+number needs an adder.
+
+### Two bugs, and what found them
+
+**REGLIST with a one-entry descriptor list.** The list is walked once per
+register, not once per quadword, so with `NREG = 1` the second half of a
+quadword is the *next loop iteration* and uses descriptor 0 again. Indexing it
+as descriptor 1 reads past the end of the list and writes whatever register is
+named there — in the failing case, `PRIM`. It is invisible until a packet uses a
+short list, and a short list is the common case, since that is what REGLIST is
+for. Directed tests with `NREG = 2` passed; a random stream found it on the 23rd
+tag.
+
+**Every transfer was writing to page zero.** The generator was putting the
+buffer pointer in `BITBLTBUF`'s *source* field rather than `DBP` at bits 45:32,
+so the base-pointer arithmetic in the address was never exercised at all. Once
+corrected, 29 of 40 seeds failed — and the cause was not the RTL but the
+harness, which filtered the undefined-write counter out of the RTL's output
+while still comparing it from the reference's. That counter is how "a write to
+an address the manual does not define must leave every register alone" gets
+checked, so it belongs in the diff.
+
+Both are the same shape as the EE work: the test was weaker than it looked, and
+what it did not reach stayed broken.
+
 ## What is not started
 
-Everything in steps 1 to 5. The reference model exists for step 1 and the
-addressing of step 2.
+Steps 4 and 5 — the rasteriser and PCRTC. Local-to-host and local-to-local
+transfers, and pixel formats other than PSMCT32.
