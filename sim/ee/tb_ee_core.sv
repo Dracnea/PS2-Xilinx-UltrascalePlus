@@ -21,8 +21,10 @@ module tb_ee_core;
    logic clk = 0, reset = 1;
    always #5 clk = ~clk;
 
-   logic [31:0] i_addr, i_data;
-   logic        i_read, i_ready;
+   logic [31:0] i_addr;
+   wire  [31:0] i_data;
+   logic        i_read;
+   wire         i_ready;
    logic [31:0] d_addr;
    logic        d_read, d_write, d_ready;
    logic [7:0]  d_be;
@@ -31,6 +33,8 @@ module tb_ee_core;
    logic [63:0] retire_pc, dbg_gpr, dbg_hi, dbg_lo;
    logic [4:0]  dbg_sel = 0;
    logic [15:0] dbg_traps;
+   logic [2:0]  dbg_stall;
+   integer      stallcnt [0:5];
 
    ee_core dut (
       .clk(clk), .reset(reset), .pc_reset(32'h0000_0000),
@@ -39,7 +43,7 @@ module tb_ee_core;
       .d_wdata(d_wdata), .d_rdata(d_rdata), .d_ready(d_ready),
       .retire(retire), .retire_pc(retire_pc),
       .dbg_sel(dbg_sel), .dbg_gpr(dbg_gpr), .dbg_hi(dbg_hi), .dbg_lo(dbg_lo),
-      .dbg_traps(dbg_traps));
+      .dbg_traps(dbg_traps), .dbg_stall(dbg_stall));
 
    localparam MEMBYTES = 1 << 16;
    logic [7:0]  mem      [0:MEMBYTES-1];
@@ -48,29 +52,23 @@ module tb_ee_core;
    integer ilat = 1, dlat = 1;
 
    // ---- instruction port: pipelined, ilat cycles of latency ----------------
-   logic        ipend = 0;
-   integer      icnt  = 0;
-   logic [31:0] iaddr_l;
+   // A delay line rather than a single pending request, because the core now
+   // keeps several requests in flight and a model that tracks one would quietly
+   // drop the rest -- which would look exactly like a core that cannot fetch.
+   localparam MAXL = 16;
+   logic [31:0] ipd [0:MAXL-1];
+   logic        ipv [0:MAXL-1];
+   integer      k;
    always_ff @(posedge clk) begin
-      i_ready <= 1'b0;
-      if (i_read) begin
-         if (ilat <= 1) begin
-            i_data  <= {mem[i_addr+3], mem[i_addr+2], mem[i_addr+1], mem[i_addr]};
-            i_ready <= 1'b1;
-         end else begin
-            ipend   <= 1'b1;
-            iaddr_l <= i_addr;
-            icnt    <= ilat - 1;
-         end
-      end else if (ipend) begin
-         if (icnt > 1) icnt <= icnt - 1;
-         else begin
-            i_data  <= {mem[iaddr_l+3], mem[iaddr_l+2], mem[iaddr_l+1], mem[iaddr_l]};
-            i_ready <= 1'b1;
-            ipend   <= 1'b0;
-         end
+      for (k = MAXL-1; k > 0; k = k - 1) begin
+         ipd[k] <= ipd[k-1];
+         ipv[k] <= ipv[k-1];
       end
+      ipd[0] <= {mem[i_addr+3], mem[i_addr+2], mem[i_addr+1], mem[i_addr]};
+      ipv[0] <= i_read;
    end
+   assign i_data  = ipd[ilat-1];
+   assign i_ready = ipv[ilat-1];
 
    // ---- data port: 64 bits with byte enables, dlat cycles of latency -------
    integer      bi;
@@ -127,6 +125,7 @@ module tb_ee_core;
       void'($value$plusargs("ilat=%d", ilat));
       void'($value$plusargs("dlat=%d", dlat));
       for (n = 0; n < MEMBYTES; n = n + 1) mem[n] = 8'h00;
+      for (n = 0; n < MAXL; n = n + 1) begin ipd[n] = 32'h0; ipv[n] = 1'b0; end
       $readmemh(progfile, memwords);
       // $readmemh fills 32-bit words; spread them into the byte array
       for (n = 0; n < 4096; n = n + 1) begin
@@ -145,6 +144,8 @@ module tb_ee_core;
       // by a core that is merely slow.
       budget = steps * 200 + 1000;
       cycles = 0;
+      for (n = 0; n <= 5; n = n + 1) stallcnt[n] = 0;
+      n = 0;
       while (n < steps && budget > 0) begin
          // Sample a short way past the edge, not on it: retire and retire_pc
          // are driven by the same edge that would be read here, and reading
@@ -155,6 +156,7 @@ module tb_ee_core;
          #0.1;
          budget = budget - 1;
          cycles = cycles + 1;
+         stallcnt[dbg_stall] = stallcnt[dbg_stall] + 1;
          if (retire) begin
             // dbg_gpr is combinational from dbg_sel, so all 31 can be read
             // between edges; 31 x 0.1ns stays well inside a 10ns period.
@@ -176,6 +178,8 @@ module tb_ee_core;
       // The line starts with '#' so it stays out of the diffed trace.
       $display("# cycles: %0d for %0d instructions (CPI %0d.%02d)",
                cycles, n, cycles / n, (cycles * 100 / n) % 100);
+      $display("# where the cycles went: issued=%0d dport=%0d muldiv=%0d loaduse=%0d fetch=%0d flush=%0d",
+               stallcnt[0], stallcnt[1], stallcnt[2], stallcnt[3], stallcnt[4], stallcnt[5]);
       // The same region the reference dumps: a store to the wrong address is
       // invisible in the registers until something loads it back.
       for (n = 'h2000; n < 'h2400; n = n + 8)

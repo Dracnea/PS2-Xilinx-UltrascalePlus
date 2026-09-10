@@ -20,6 +20,18 @@ W="$HERE/work/$$"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
 
 if [[ -n $PROG ]]; then cp "$PROG" prog.hex
 else python3 "$HERE/gen_prog.py" --seed "$SEED" --count "$COUNT" $BR > prog.hex; fi
+# The trace window has to cover the whole program, because the RTL keeps
+# instructions in flight past the last one it reports.  A store commits to
+# memory in A2, one stage before it retires in WB, so the instruction *after*
+# the last traced one can already have written memory when the dump is taken --
+# and the reference, which stops cleanly, has not.  The registers still agree;
+# only the memory image differs, which reads exactly like a store to a wrong
+# address.  Padding beyond the program is all NOPs, so covering it costs
+# nothing and removes the whole class of false failure.
+if [[ -z $PROG && $STEPS -lt $COUNT ]]; then
+    echo "note: raising --steps from $STEPS to $COUNT so the trace covers the program" >&2
+    STEPS=$COUNT
+fi
 python3 "$HERE/r5900_ref.py" prog.hex --steps "$STEPS" --dump-mem 0x2000 0x400 > ref.txt 2> ref.traps
 
 xvhdl -2008 "$ROOT/rtl/ee/ee_core.vhd"      > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }

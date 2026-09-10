@@ -209,10 +209,11 @@ change to the datapath.
 | 32-cycle iterative divider | 126.2 MHz | 6,059 | `gpr` → `gpr`, unregistered DSP48E2 cascade — the multiplier |
 | Pipelined multiplier | 185.9 MHz | 6,043 | `instr` → `gpr`, 12 levels, 64% routing — decode, regfile and writeback in one cycle |
 | Five-stage pipeline, one EX | 212.0 MHz | 6,859 | `w_rd` → forwarding mux → 64-bit branch compare → `fetch_pc` adder |
-| Execution split into A1/A2 | **242.8 MHz** | 7,081 | `m_rd` → forwarding mux → 64-bit ALU → result register |
+| Execution split into A1/A2 | 242.8 MHz | 7,081 | `m_rd` → forwarding mux → 64-bit ALU → result register |
+| Fetch unit with 3 requests in flight | **251.9 MHz** | 6,424 | `w_we` → forwarding mux → 64-bit ALU → result register |
 
-Target is 294.912 MHz. The core is 10x faster than the first measurement and
-needs 1.21x more.
+Target is 294.912 MHz. The core is 10.4x faster than the first measurement and
+needs 1.17x more.
 
 **A note on how much these numbers can be trusted.** The core occupies 0.8% of
 this device, and a module that small placed loose on a die this large can spread
@@ -453,6 +454,73 @@ stage was never going to be cycle-accurate to it, so the split was required for
 accuracy on exactly the same schedule that timing wanted it, which is the second
 time in this project that those two demands have pointed the same way.
 
+### The fetch unit — 2026-09-10
+
+The A1/A2 split ended with the observation that the fetch unit, not the branch
+redirect, was what limited IPC. Profiling said how much: the core now counts
+why no instruction entered A1 on each cycle (`dbg_stall`, printed by the
+testbench as a breakdown), and on a program with **no memory operations in it at
+all**, fetch starvation was 322 of 483 cycles — 67%.
+
+The cause was a design error, not a tuning problem. The unit allowed **one**
+outstanding request, on the stated reasoning that a two-entry queue would absorb
+replies and keep the rate up. That reasoning was wrong. A reply is observed two
+edges after its request is issued, and with one request in flight the next
+cannot go out until the previous comes back — so the unit issues on every
+*other* edge, and the core is pinned at CPI 2 no matter what the pipeline does.
+Sustaining one instruction per cycle needs as many requests in flight as there
+are cycles of latency to cover. That is Little's law, and no amount of buffering
+substitutes for it: a queue smooths bursts, it does not create throughput.
+
+Three requests in flight and a four-entry queue:
+
+| program | CPI before | CPI after | fetch cycles before | after |
+|---|---|---|---|---|
+| ordinary | 2.45 | **1.78** | 114 | 3 |
+| branch-heavy | 2.68 | **2.15** | 93 | 5 |
+| taken branches only, no memory | 3.01 | **2.51** | 322 | 162 |
+
+It also cost nothing in area or clock — 251.9 MHz against 242.8, and slightly
+fewer LUTs, because the per-request PC no longer has to be carried alongside the
+request. Replies come back in order, so `resp_pc` — the PC of the next reply
+that will be kept — advances by four each time one is kept and is reloaded with
+the target on a redirect, since the first reply kept after a redirect is by
+definition the first request issued after it.
+
+What remains in each bucket says where the next work is, and it is no longer
+fetch: **72 to 108 cycles of multiply/divide** (a divide is 34 cycles, against
+37 on the real R5900 — inherent), and **45 to 66 cycles of data port**, which is
+one stall per memory access because the request is issued at the A1→A2 edge and
+answered a cycle later. The branch-only program is the exception and still ends
+up fetch-bound, because every taken branch flushes the queue and pays the full
+refill: that is the cost of having no branch predictor, which the R5900 has and
+this core does not.
+
+### A third instrument, and a false failure it produced
+
+Fixing fetch made four seeds fail, with every register matching for all 160
+traced instructions and only the memory image differing — which reads exactly
+like a store to a wrong address. It was neither.
+
+A store commits to memory in A2, one stage *before* it retires in WB. So at the
+moment the last traced instruction retires, the instruction after it is sitting
+in A2 with its store already performed. The reference, which stops cleanly, has
+not performed it. Instruction 160 of seed 1 is `SB r21, 0x23d8(r0)` and 0x23d8
+is precisely the address that differed.
+
+This was latent all along and only surfaced when fetch was fixed: with a starved
+front end the pipeline behind the retiring instruction was usually empty, and
+with a full one it never is. The harness now raises `--steps` to cover the whole
+generated program, so nothing but NOP padding is ever in flight past the trace
+window.
+
+The pattern is worth naming, because this is the third time in this file: **an
+instrument that was wrong in a way that made the core look right, or wrong, for
+reasons that had nothing to do with the core.** The instruction port that could
+not fetch two cycles running, the reference that halted on NOP, and now a trace
+window narrower than the pipeline is deep. Each was found only because something
+else changed and made it visible.
+
 ### The delay slot and the redirect
 
 The branch condition and target are decided in A1 and acted on in A2, so by the
@@ -483,6 +551,7 @@ The critical path is now `forwarding mux → 64-bit ALU → result register`, wh
 is the fundamental path of a single-cycle ALU and closes by splitting the ALU
 itself across A1 and A2 rather than by moving anything else around.
 
-IPC is not closed either, and is the larger of the two problems: CPI sits
-between 2.4 and 3.0 because the fetch unit allows one outstanding request. That
-is independent of the clock and is measured on every run now.
+IPC is better but not closed: CPI 1.78 on ordinary code, 2.15 on branch-heavy.
+What is left is multiply/divide latency (inherent), one stall per memory access,
+and the absence of a branch predictor — the R5900 has a BTAC and this core does
+not, so every taken branch pays a full fetch refill.

@@ -29,6 +29,7 @@ fit/ee/*.rpt
 # repo root, and Vivado writes these into the working directory.
 clockInfo.txt
 cong/
+iter_*_CongestedCLBsAndNets.txt
 .Xil/
 *.jou
 vivado*.log

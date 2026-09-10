@@ -93,7 +93,12 @@ entity ee_core is
       dbg_gpr    : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_hi     : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_lo     : out std_logic_vector(63 downto 0) := (others => '0');
-      dbg_traps  : out unsigned(15 downto 0) := (others => '0')
+      dbg_traps  : out unsigned(15 downto 0) := (others => '0');
+      -- why no instruction entered A1 on this edge, so that cycles lost to the
+      -- fetch unit can be told apart from cycles lost to the memory port or to
+      -- an interlock.  0 issued, 1 data port, 2 multiply/divide, 3 load-use,
+      -- 4 fetch starved, 5 killed by a branch redirect.
+      dbg_stall  : out unsigned(2 downto 0) := (others => '0')
    );
 end entity;
 
@@ -104,32 +109,45 @@ architecture arch of ee_core is
    signal traps  : unsigned(15 downto 0) := (others => '0');
 
    -- ---- IF -----------------------------------------------------------------
-   -- One request may be outstanding at a time and the queue holds two, which
-   -- is what it takes to deliver an instruction every cycle to a consumer that
-   -- can stall: the queue absorbs the reply that arrives while ID is held up.
-   -- Without that the pipeline runs at half rate, and -- far worse for a
-   -- differential test -- dependent instructions are never adjacent, so every
-   -- forwarding path goes untested.
+   -- Several requests may be outstanding at once, and the queue is deep enough
+   -- to hold every reply that could arrive.
+   --
+   -- The first version allowed exactly one outstanding request, on the reasoning
+   -- that a two-entry queue would absorb replies and keep the rate up.  That was
+   -- simply wrong, and profiling said so: a reply is observed two edges after
+   -- the request is issued, and with one request in flight the next cannot go
+   -- out until the previous comes back, so the unit issues on every *other*
+   -- edge and the whole core is stuck at CPI 2 no matter what the pipeline does.
+   -- Fetch starvation was 67% of all cycles on a program with no memory
+   -- operations in it at all.  Sustaining one instruction per cycle needs as
+   -- many requests in flight as there are cycles of latency to cover, which is
+   -- Little's law and not something a buffer can substitute for.
+   --
+   -- The PC of each reply does not have to be carried alongside the request.
+   -- Replies come back in order, so resp_pc -- the PC of the next reply that
+   -- will be kept -- simply advances by four each time one is kept, and is
+   -- reloaded with the target on a redirect, because the first reply kept after
+   -- a redirect is by definition the first request issued after it.
+   constant FQ_DEPTH : integer := 4;   -- queue entries
+   constant MAX_OUT  : integer := 3;   -- requests in flight
+
    -- The program counter is 32 bits, which is the width of the R5900's address
    -- bus and of this core's instruction port.  Carrying it as 64 doubled every
-   -- PC adder and every PC mux in the design, and the increment after a
-   -- redirect -- a 64-bit add sitting behind the operand-forwarding mux and the
-   -- branch decision, on the path from a JR's register operand to the fetch PC
-   -- -- was the critical path once the branch target moved into ID.  The link
-   -- value and the retired PC are sign-extended back to 64 bits at the two
-   -- points that need them, which is what the manual specifies anyway.
+   -- PC adder and every PC mux in the design.  The link value and the retired
+   -- PC are sign-extended back to 64 bits at the two points that need them,
+   -- which is what the manual specifies anyway.
    signal fetch_pc   : unsigned(31 downto 0) := (others => '0');
-   signal req_pc     : unsigned(31 downto 0) := (others => '0');
-   signal outst      : std_logic := '0';   -- a request is in flight
-   signal drop       : std_logic := '0';   -- and it is wrong-path: discard it
+   signal resp_pc    : unsigned(31 downto 0) := (others => '0');
+   signal outst      : integer range 0 to MAX_OUT := 0;   -- requests in flight
+   signal drop       : integer range 0 to MAX_OUT := 0;   -- of which wrong-path
    signal redir_pend : std_logic := '0';
    signal redir_tgt  : unsigned(31 downto 0) := (others => '0');
 
-   type q_pc_t is array (0 to 1) of unsigned(31 downto 0);
-   type q_ir_t is array (0 to 1) of std_logic_vector(31 downto 0);
+   type q_pc_t is array (0 to FQ_DEPTH - 1) of unsigned(31 downto 0);
+   type q_ir_t is array (0 to FQ_DEPTH - 1) of std_logic_vector(31 downto 0);
    signal q_pc  : q_pc_t := (others => (others => '0'));
    signal q_ir  : q_ir_t := (others => (others => '0'));
-   signal q_cnt : integer range 0 to 2 := 0;
+   signal q_cnt : integer range 0 to FQ_DEPTH := 0;
 
    -- ---- ID/A1 --------------------------------------------------------------
    signal d_valid   : std_logic := '0';
@@ -308,10 +326,12 @@ begin
       -- IF queue bookkeeping
       variable vq_pc   : q_pc_t;
       variable vq_ir   : q_ir_t;
-      variable vcnt    : integer range 0 to 2;
-      variable vouts   : std_logic;
-      variable vdrop   : std_logic;
+      variable vcnt    : integer range 0 to FQ_DEPTH;
+      variable vouts   : integer range 0 to MAX_OUT;
+      variable vdrop   : integer range 0 to MAX_OUT;
+      variable vresp   : unsigned(31 downto 0);
       variable push    : boolean;
+      variable push_pc : unsigned(31 downto 0);
       variable do_flush: boolean;
       variable new_pc  : unsigned(31 downto 0);
    begin
@@ -325,8 +345,9 @@ begin
             lo         <= (others => '0');
             traps      <= (others => '0');
             fetch_pc   <= unsigned(pc_reset);
-            outst      <= '0';
-            drop       <= '0';
+            outst      <= 0;
+            drop       <= 0;
+            resp_pc    <= unsigned(pc_reset);
             redir_pend <= '0';
             q_cnt      <= 0;
             d_valid    <= '0';
@@ -897,55 +918,69 @@ begin
             vcnt  := q_cnt;
             vouts := outst;
             vdrop := drop;
+            vresp := resp_pc;
             push  := false;
+            push_pc := resp_pc;
 
-            if outst = '1' and i_ready = '1' then
-               vouts := '0';
-               if drop = '1' then
-                  vdrop := '0';            -- wrong-path reply, discarded
+            if i_ready = '1' and vouts > 0 then
+               vouts := vouts - 1;
+               if vdrop > 0 then
+                  vdrop := vdrop - 1;         -- wrong-path reply, discarded
                else
-                  push := true;
+                  push    := true;
+                  push_pc := vresp;
+                  vresp   := vresp + 4;
                end if;
             end if;
 
             if id_adv then
-               vq_pc(0) := vq_pc(1);
-               vq_ir(0) := vq_ir(1);
-               vcnt     := vcnt - 1;
+               for k in 0 to FQ_DEPTH - 2 loop
+                  vq_pc(k) := vq_pc(k + 1);
+                  vq_ir(k) := vq_ir(k + 1);
+               end loop;
+               vcnt := vcnt - 1;
             end if;
             if push then
-               vq_pc(vcnt) := req_pc;
+               vq_pc(vcnt) := push_pc;
                vq_ir(vcnt) := i_data;
                vcnt        := vcnt + 1;
             end if;
             if do_flush then
                vcnt     := 0;
-               vdrop    := vouts;          -- whatever is in flight is wrong-path
+               vdrop    := vouts;          -- everything in flight is wrong-path
+               vresp    := new_pc;
                fetch_pc <= new_pc;
             end if;
 
-            -- One request outstanding at a time; the queue is what gives the
-            -- throughput.  i_read is a single-cycle pulse, so the port is free
-            -- to answer at whatever rate it likes.
-            if vouts = '0' and vcnt < 2 then
+            -- Issue while there is both a slot in flight and somewhere for the
+            -- reply to land.  i_read is a single-cycle pulse per request, so
+            -- back-to-back issues are back-to-back requests.
+            if vouts < MAX_OUT and vouts + vcnt < FQ_DEPTH then
                i_read <= '1';
                if do_flush then
-                  i_addr   <= std_logic_vector(new_pc(31 downto 0));
-                  req_pc   <= new_pc;
+                  i_addr   <= std_logic_vector(new_pc);
                   fetch_pc <= new_pc + 4;
                else
-                  i_addr   <= std_logic_vector(fetch_pc(31 downto 0));
-                  req_pc   <= fetch_pc;
+                  i_addr   <= std_logic_vector(fetch_pc);
                   fetch_pc <= fetch_pc + 4;
                end if;
-               vouts := '1';
+               vouts := vouts + 1;
+            end if;
+
+            if not a2_adv then           dbg_stall <= to_unsigned(1, 3);
+            elsif ex_busy then           dbg_stall <= to_unsigned(2, 3);
+            elsif load_use then          dbg_stall <= to_unsigned(3, 3);
+            elsif q_cnt = 0 then         dbg_stall <= to_unsigned(4, 3);
+            elsif kill_id then           dbg_stall <= to_unsigned(5, 3);
+            else                         dbg_stall <= to_unsigned(0, 3);
             end if;
 
             q_pc  <= vq_pc;
             q_ir  <= vq_ir;
             q_cnt <= vcnt;
-            outst <= vouts;
-            drop  <= vdrop;
+            outst   <= vouts;
+            drop    <= vdrop;
+            resp_pc <= vresp;
          end if;
       end if;
    end process;
