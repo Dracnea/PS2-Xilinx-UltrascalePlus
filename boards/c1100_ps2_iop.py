@@ -581,9 +581,17 @@ class IOPBringup(LiteXModule, AutoCSR):
             sif0_fifo.re.eq(self.sif0_pop.we),        # a read of the CSR pops one word
             self.sif0_stat.fields.readable.eq(sif0_fifo.readable),
         ]
+        # `writable` is the FIFO's *write* side, and this FIFO's write side is
+        # the IOP domain, so it is already in the domain the channel runs in.
+        # Synchronising it into its own domain added two cycles of staleness:
+        # the channel read "not full", issued a fetch, and pushed the returned
+        # word into a FIFO that had since filled, so it was dropped.  Nothing
+        # reports that -- the transfer simply arrives short, which is invisible
+        # until a transfer is bigger than the FIFO.  The status register is the
+        # crossing that genuinely needs one, in the other direction.
         sif0_full = Signal(name="iop_sif0_full")
-        self.specials += MultiReg(~sif0_fifo.writable, sif0_full, "iop")
-        self.comb += self.sif0_stat.fields.full.eq(sif0_full)
+        self.comb += sif0_full.eq(~sif0_fifo.writable)
+        self.specials += MultiReg(sif0_full, self.sif0_stat.fields.full, "sys")
         sif0_dbg = {n: Signal(w, name="iop_sif0_" + n) for n, w in (("addr", 24), ("len", 24), ("tags", 16))}
         for n, csr in (("addr", self.sif0_addr), ("len", self.sif0_len), ("tags", self.sif0_tags)):
             self.specials += MultiReg(sif0_dbg[n], csr.status, "sys")
