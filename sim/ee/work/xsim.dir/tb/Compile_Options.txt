@@ -1,0 +1,1 @@
+-debug "off" "tb_ee_core" -s "tb" 

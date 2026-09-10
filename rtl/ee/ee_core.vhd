@@ -117,6 +117,12 @@ begin
       variable sq, sr                 : signed(31 downto 0);
       variable uq, ur                 : unsigned(31 downto 0);
       variable ldv, ldw               : std_logic_vector(63 downto 0);
+      -- Whether this instruction goes to memory has to be a variable, not the
+      -- state signal: a signal assigned earlier in this process still reads as
+      -- the old state here, so testing `state /= S_WAIT_D` was always true and
+      -- the later `state <= S_FETCH` overrode it.  Loads and stores never
+      -- entered the wait state, and a load therefore never wrote its register.
+      variable mem_op                 : boolean;
    begin
       if rising_edge(clk) then
          retire <= '0';
@@ -163,6 +169,7 @@ begin
                   nxt := pc + 4;
                   take := false;
                   wb_en := false;
+                  mem_op := false;
                   wb_n := 0;
                   wb_v := (others => '0');
 
@@ -322,6 +329,7 @@ begin
                         end case;
                         ld_shift <= to_integer(ea(2 downto 0));
                         ld_pend  <= '1';
+                        mem_op := true;
                         state <= S_WAIT_D;
 
                      when 40 | 41 | 43 | 63 =>                     -- stores
@@ -336,6 +344,7 @@ begin
                            when others => d_be <= x"FF";
                         end case;
                         ld_pend <= '0';
+                        mem_op := true;
                         state <= S_WAIT_D;
 
                      when others => traps <= traps + 1;
@@ -347,7 +356,15 @@ begin
                   end if;
 
                   -- advance, honouring a branch that is one instruction old
-                  if state /= S_WAIT_D then
+                  -- Capture the PC of the instruction being executed now, not
+                  -- when it retires: a load retires from S_WAIT_D, by which time
+                  -- the PC has already advanced, and reporting the next
+                  -- instruction's address makes a divergence point at the wrong
+                  -- line.  retire_pc is only sampled when retire is high, so
+                  -- setting it here is safe for both paths.
+                  retire_pc <= std_logic_vector(pc);
+
+                  if not mem_op then
                      if br_pend = '1' then
                         pc <= br_target; br_pend <= '0';
                      else
@@ -357,7 +374,6 @@ begin
                         br_pend <= '1'; br_target <= tgt;
                      end if;
                      retire    <= '1';
-                     retire_pc <= std_logic_vector(pc);
                      state     <= S_FETCH;
                   else
                      -- the branch bookkeeping still has to happen for a
@@ -409,7 +425,6 @@ begin
                         end if;
                      end if;
                      retire    <= '1';
-                     retire_pc <= std_logic_vector(pc);
                      state     <= S_FETCH;
                   end if;
             end case;

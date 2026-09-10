@@ -238,10 +238,16 @@ class R5900:
         else: self.traps.append(("unimplemented special %d" % fn, self.pc - 4))
 
 
-def dump(cpu, step):
-    """One line per step, matching what the testbench prints."""
-    regs = " ".join("r%d=%016x" % (n, cpu.r(n)) for n in range(1, 32) if cpu.r(n))
-    return "%4d pc=%016x hi=%016x lo=%016x %s" % (step, cpu.pc, cpu.hi, cpu.lo, regs)
+def dump(cpu, step, pc):
+    """One line per retired instruction, matching what the testbench prints.
+
+    `pc` is the address of the instruction that just ran, not the next one: a
+    divergence should name the instruction responsible rather than the one after
+    it.  Every register is printed, not just the non-zero ones, so a diff cannot
+    be confused by a register merely becoming zero.
+    """
+    regs = " ".join("r%02d=%016x" % (n, cpu.r(n)) for n in range(1, 32))
+    return "%4d pc=%016x hi=%016x lo=%016x %s" % (step, pc, cpu.hi, cpu.lo, regs)
 
 
 def main():
@@ -250,6 +256,8 @@ def main():
     ap.add_argument("program")
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--base", type=lambda x: int(x, 0), default=0)
+    ap.add_argument("--dump-mem", nargs=2, type=lambda x: int(x, 0), metavar=("FROM", "LEN"),
+                    help="after the run, print this region as 64-bit words")
     a = ap.parse_args()
     mem = Mem()
     words = [int(l.split("//")[0].strip(), 16) for l in open(a.program)
@@ -260,8 +268,16 @@ def main():
     for n in range(a.steps):
         if not mem.load(cpu.pc, 4):
             break
+        here = cpu.pc
         cpu.step()
-        print(dump(cpu, n))
+        print(dump(cpu, n, here))
+    if a.dump_mem:
+        # Registers alone cannot show a store that went to the wrong address:
+        # the difference stays in memory until something loads it back, and by
+        # then the instruction responsible is long gone.
+        lo_, ln = a.dump_mem
+        for off in range(0, ln, 8):
+            print("MEM %08x %016x" % (lo_ + off, mem.load(lo_ + off, 8)))
     for t, pc in cpu.traps:
         print("# trap: %s at %016x" % (t, pc), file=sys.stderr)
 

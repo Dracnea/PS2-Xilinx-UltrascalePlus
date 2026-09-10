@@ -82,9 +82,37 @@ an authority, and where the two disagree the manual decides. The reference here
 is what makes that comparison cheap: both produce state per instruction, so
 disagreements are a diff rather than an investigation.
 
+## The first slice runs — 2026-09-10
+
+`rtl/ee/ee_core.vhd` executes the integer subset and agrees with the reference
+on **twenty random programs**, twelve without branches and eight with, about 160
+instructions each, covering ALU and shift operations, 64-bit forms, immediates,
+loads and stores of every width, multiply and divide, and branches with their
+delay slots. `sim/ee/run_diff.sh` generates a program, runs both, and diffs.
+
+Two faults it found, both of which would have been invisible without it:
+
+**Loads and stores never reached the memory state.** The advance logic tested
+`state /= S_WAIT_D` — but `state` is a signal, so it still read `S_EXEC` at that
+point, the branch was always taken, and the later `state <= S_FETCH` overrode
+the `state <= S_WAIT_D` assigned earlier in the same process. Stores appeared to
+work, because `d_write` was asserted for the one cycle the instruction spent in
+`S_EXEC` and the memory model accepted it; loads silently never wrote their
+register. The symptom was a single wrong memory word two hundred instructions
+later, which points nowhere near the cause.
+
+**Memory instructions reported the wrong PC.** They retire from `S_WAIT_D`, by
+which time the PC has advanced, so a divergence named the instruction after the
+one responsible.
+
+And one fault in the harness rather than the core: sampling `retire_pc` on the
+clock edge while reading the registers just after it took the two from different
+cycles, which looked exactly like a PC off by one instruction while every
+register matched. Worth recording because the harness is the instrument, and an
+instrument that lies is worse than none.
+
 ## What is not started
 
-The RTL. This page and the reference are the instrument; the core comes next,
-and the first slice is the integer datapath with no pipeline — correctness
-before it is made to go fast, and a hazard is easier to add to something that
-already gives right answers than to find in something that does not.
+Hazards and pipelining — the core is still one instruction at a time. MMI, the
+FPU, the VUs. And the integer subset itself is not complete: no COP0, no
+exceptions, no unaligned loads or stores, no `LQ`/`SQ`.
