@@ -157,7 +157,30 @@ and then fail on the one file that matters. `tools/ps2iop/mkiso.py --sectors`
 builds a sparse test image with that same shape — kilobytes on disk, far-end
 LBAs — so the failure can be found without a 4.7 GB image in the loop.
 
-**So: three blocks from now, loading a game image is a real and useful test.**
+### The BIOS opens a file on the disc — **done, 2026-09-10**
+
+The criterion this section set was *"when the hardware reads that same disc
+through `CDVDMAN`/`IOMAN` and answers `SLUS_212.40`, the disc path works"*. It
+does, on a **stock, unpatched BIOS**:
+
+```
+open('cdrom0:\SLUS_212.40;1', O_RDONLY) -> fd 2
+```
+
+and CDVDMAN gets there on its own, reading LBA 16 (the volume descriptor), LBA
+257 (the path table) and LBA 261 (the root directory) out of HBM. **LBA 261 is
+the same root directory this project's own ISO9660 walk finds independently** —
+two different implementations, ours in R3000 assembly and Sony's in the BIOS,
+arriving at the same place on the same disc.
+
+Getting there needed the whole SIF stack ([sif.md](sif.md)) and one DMA fix:
+block mode took BCR's low half as the entire word count, so a sector transfer
+stopped after a sixteenth of it with no error on either side.
+
+What is *not* done: `FIO_F_READ`. An fd means the console found the file. Reading
+its contents is the next call, and it moves data by a route the open never used.
+
+**So: loading a game image is now a real and useful test.**
 It is not playing the game. It is the console proving it can find one.
 
 ### 3. The Emotion Engine — 12 blocks

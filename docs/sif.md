@@ -365,12 +365,25 @@ SIFCMD → SIFRPC → FILEIO → IOMAN → CDVDMAN → the CDVD block → HBM �
 That is the BIOS's own file stack reading the game disc, which is what the
 roadmap asked for.
 
-**It does not complete yet.** The open stalls after that first sector: DMA
-channel 3 finished (`CHCR` bit 24 clear, 2048 bytes delivered to `0x24850`),
-INTC has CDROM unmasked with nothing pending, and `DICR` shows channel 3's
-completion *flag* set with its per-channel *enable* clear. No further N command
-follows. Locating that is the next piece of work, and it is in the CDVD block
-rather than anywhere in the SIF path.
+**And it returns.** `open` gives **fd 2**, and CDVDMAN walks there itself:
+LBA 16 for the volume descriptor, LBA 257 for the path table, LBA 261 for the
+root directory — the same root directory this project's own ISO9660 walk finds.
+
+It did not, at first. The open stalled after one sector, and the cause was in
+the DMA controller rather than the SIF path: **block mode**. CDVDMAN programs
+channel 3 with `CHCR` bit 9 set — SyncMode 1 — and `BCR = 0x00100020`, which in
+that mode is `BS = 0x20` words per block and `BA = 0x10` blocks: 512 words, one
+sector. `burst_words()` returned `BCR[15:0]`, so the DMA moved **32 words** and
+declared itself finished, leaving the CDVD block holding the other 480 with
+nobody to take them. It never reached the state that raises its interrupt, so
+CDVDMAN waited for a completion that could not arrive.
+
+Sampling INTC three million times over eight seconds and never seeing CDROM is
+what found it — the completion genuinely never happened, rather than being
+missed. Every disc test until then used `boot_test.s`, which programs burst mode
+with a plain word count, so the gap `iop_dma.vhd` had documented from the start
+("SyncMode 1/2 and chain mode not yet") went untouched until a real driver
+arrived.
 
 **One transfer bug worth keeping.** The first call went out with a 7-word
 argument block, and the SIF1 tag's word count has its low two bits dropped, so

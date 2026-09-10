@@ -229,8 +229,31 @@ architecture arch of iop_dma is
    end function;
 
    -- word count for SyncMode 0: BCR(15:0), with 0 meaning 0x10000
-   function burst_words(b : std_logic_vector(31 downto 0)) return unsigned is
+   -- How many words a transfer moves, which is not the same question in every
+   -- sync mode.  In burst mode (SyncMode 0) BCR is a single word count, and zero
+   -- means 65536.  In block mode (SyncMode 1, "sync blocks to DMA requests")
+   -- BCR is two fields -- BS in the low half, the words per block, and BA in the
+   -- high half, the number of blocks -- and the transfer is their product.
+   --
+   -- Reading only the low half is right for burst and silently short for block.
+   -- CDVDMAN reads a sector as BS=0x20, BA=0x10: 512 words, or 32 if the high
+   -- half is ignored.  The DMA then finishes after a sixteenth of the sector,
+   -- the CDVD block is left holding the other 480 words with nobody to take
+   -- them, it never reaches the state that raises its interrupt, and the BIOS
+   -- waits for a completion that cannot arrive.  Nothing reports an error: one
+   -- side thinks it finished and the other is still waiting.
+   function transfer_words(b    : std_logic_vector(31 downto 0);
+                           chcr : std_logic_vector(31 downto 0)) return unsigned is
+      variable bs : unsigned(31 downto 0);
+      variable ba : unsigned(31 downto 0);
    begin
+      bs := x"0000" & unsigned(b(15 downto 0));
+      ba := x"0000" & unsigned(b(31 downto 16));
+      if (chcr(10 downto 9) = "01") then          -- block mode: BS words x BA blocks
+         if (bs = 0) then bs := x"00010000"; end if;
+         if (ba = 0) then ba := x"00000001"; end if;
+         return resize(bs * ba, 24);
+      end if;
       if (b(15 downto 0) = x"0000") then return to_unsigned(16#10000#, 24); end if;
       return resize(unsigned(b(15 downto 0)), 24);
    end function;
@@ -425,7 +448,7 @@ begin
                   if (start >= 0) then
                      ch       <= start;
                      cur_addr <= unsigned(madr(start)(23 downto 0));
-                     words    <= burst_words(bcr(start));
+                     words    <= transfer_words(bcr(start), start_chcr);
                      decr     <= start_chcr(1);
                      if (start = 6 or start = 3) then
                         state <= RUN;                  -- channels with a data path
