@@ -228,20 +228,25 @@ says the earlier attribution was built on a comparison that did not hold.
 | the same RTL plus MMI pipeline-1 and COP0, re-measured | 233.2 MHz |
 | …plus exceptions (current) | 228.2 MHz |
 | current with only the exception redirect removed | 250.9 MHz |
+| **the redirect registered instead of removed** | **255.3 MHz** |
 
 The 252.1 figure was measured **before MMI and COP0 were added**, and neither of
 those was re-measured, so "252.1 → 228.2" spanned three changes rather than one.
 Most of the loss is not the exception path at all.
 
-The controlled comparison is the last row — the same RTL with one thing removed
-— and it says the exception **redirect** costs about 9%. That is worth fixing
-and the fix is known: register it. The redirect computes the vector or `EPC` and
-drives the fetch PC in the same cycle it commits, in front of the branch
-redirect that was already there; taking an extra cycle over it costs nothing,
-because exceptions are rare, and it is exactly what the branch redirect already
-does.
+The controlled comparison was the removal row — the same RTL with one thing
+taken out — and it said the exception **redirect** cost about 9%. It computed the
+vector or `EPC` and drove the fetch PC in the same cycle it committed, in front
+of the branch redirect that was already there.
 
-The fourth row also undercuts the second: a design with *more* logic in it
+**Registering it recovers all of that and more: 255.3 MHz**, which is above every
+earlier measurement including the ones taken before exceptions existed. The
+pipeline is still invalidated on the cycle the exception commits, so nothing
+younger can retire and precision is untouched; only the fetch redirect waits a
+cycle, which is free because exceptions are rare and the pipeline behind one is
+empty anyway. It is what the branch redirect already does, for the same reason.
+
+The removal row also undercuts the second: a design with *more* logic in it
 (250.9) measures faster than one with less (233.2). Both cannot be a property of
 the RTL, so placement variance here is worth about ±8%, which is wider than the
 ±5% estimated earlier and wide enough that no single-fit comparison of two

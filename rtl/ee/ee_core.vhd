@@ -166,6 +166,15 @@ architecture arch of ee_core is
    signal outst      : integer range 0 to MAX_OUT := 0;   -- requests in flight
    signal drop       : integer range 0 to MAX_OUT := 0;   -- of which wrong-path
    signal redir_pend : std_logic := '0';
+   -- An exception invalidates the pipeline on the cycle it commits, but the
+   -- fetch redirect waits one more.  Committing and redirecting together put
+   -- the vector-or-EPC mux in front of the branch redirect that was already
+   -- there, and an ablation costed that at about 9% of the clock.  Precision is
+   -- unaffected -- the latches are cleared immediately, so nothing younger can
+   -- commit in the intervening cycle -- and an extra cycle on an exception is
+   -- free, since exceptions are rare and the pipeline is empty anyway.
+   signal exc_redir  : std_logic := '0';
+   signal exc_pc     : unsigned(31 downto 0) := (others => '0');
    signal redir_tgt  : unsigned(31 downto 0) := (others => '0');
 
    type q_pc_t is array (0 to FQ_DEPTH - 1) of unsigned(31 downto 0);
@@ -467,6 +476,7 @@ begin
             w_c0_we    <= '0';
             m_exc      <= '0';
             w_exc      <= '0';
+            exc_redir  <= '0';
             m_eret     <= '0';
             w_eret     <= '0';
             d_bd       <= '0';
@@ -1208,11 +1218,19 @@ begin
             do_flush := false;
             kill_id  := false;
             new_pc   := (others => '0');
-            if exc_now or eret_now then
+            if exc_redir = '1' then
+               -- the redirect itself, one cycle after the commit
+               do_flush   := true;
+               kill_id    := true;
+               new_pc     := exc_pc;
+               exc_redir  <= '0';
+               d_valid    <= '0';
+            elsif exc_now or eret_now then
                -- Everything younger than the committing instruction is in a
                -- latch, so invalidating those latches is the whole flush; there
-               -- is nothing to undo because nothing younger has written.
-               do_flush := true;
+               -- is nothing to undo because nothing younger has written.  Only
+               -- the fetch redirect is deferred, and it is deferred by setting
+               -- exc_redir rather than driving fetch_pc from here.
                kill_id  := true;
                -- Everything younger dies, and that includes the instruction
                -- already moving from A2 into WB on this very edge: the A2 -> WB
@@ -1232,16 +1250,17 @@ begin
                m_c0_we  <= '0';
                redir_pend <= '0';
                bd_pend    <= '0';
+               exc_redir  <= '1';
                if exc_now then
                   -- BEV picks the vector base; the offset for a general
                   -- exception is 0x180 either way.
                   if cop0(C0_STATUS)(22) = '1' then
-                     new_pc := x"BFC00380";
+                     exc_pc <= x"BFC00380";
                   else
-                     new_pc := x"80000180";
+                     exc_pc <= x"80000180";
                   end if;
                else
-                  new_pc := unsigned(cop0(C0_EPC));
+                  exc_pc <= unsigned(cop0(C0_EPC));
                end if;
             elsif a2_adv and m_valid = '1' and m_take = '1' then
                -- The branch is leaving A2.  Whatever is in A1 is its delay slot
