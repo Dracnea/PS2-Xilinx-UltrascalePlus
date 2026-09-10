@@ -54,6 +54,18 @@ def gen(rng, n, branches):
                 out.append((16 << 26) | (4 << 21) | (rt << 16) | (cr << 11))
             else:
                 out.append((16 << 26) | (0 << 21) | (rd << 16) | (cr << 11))
+        elif pick < 0.92:                                  # MMI SIMD
+            # PAND, PXOR, PCPYLD (MMI2) and POR, PNOR, PCPYUD (MMI3): the only
+            # instructions here that write the upper 64 bits of a register.  The
+            # copies matter most -- they are what moves data into the upper half
+            # in the first place, so without them every other MMI operation
+            # would only ever see zeroes up there.
+            if rng.randrange(2):
+                out.append((28 << 26) | (rs << 21) | (rt << 16) | (rd << 11)
+                           | (rng.choice([0x12, 0x13, 0x0E]) << 6) | 0x09)
+            else:
+                out.append((28 << 26) | (rs << 21) | (rt << 16) | (rd << 11)
+                           | (rng.choice([0x12, 0x13, 0x0E]) << 6) | 0x29)
         elif pick < 0.94:                                  # MMI pipeline-1
             # MULT1, MULTU1, DIV1, DIVU1, MFHI1, MFLO1, MTHI1, MTLO1: the same
             # operations as their SPECIAL counterparts, on the second HI/LO

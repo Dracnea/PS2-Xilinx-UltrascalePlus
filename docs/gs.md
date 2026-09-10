@@ -347,10 +347,23 @@ write applied first. That is a modelling artifact rather than hardware, but it
 would have made the two disagree in exactly the case blending exists for:
 drawing over something already there.
 
+### PSMCT24
+
+Added alongside the blender. It shares PSMCT32's addressing exactly — same page,
+block and column — and differs only in that the top byte of the word is not part
+of the pixel and has to survive the write. That is what `FBMSK` already means, so
+it is expressed as one rather than as a second write path.
+
+`PSMCT16` is derived and ready but not implemented: its tables are bit
+interleaves like the 32-bit ones, `blk = by2·bx1·by1·bx0·by0` and
+`column16(cy,cx) = (column32(cy, cx&7) << 1) | cx3`, with a page of 64×64 pixels
+and a block of 16×8. It needs the 16-bit pixel packing (RGBA5551) to go with it,
+and dither needs *it*, since dither is inert on a 32-bit format.
+
 ### What the rasteriser does not do yet
 
 No Gouraud interpolation — flat shading only, the colour of the last vertex. No
-Z test or Z buffer, no texture, no dither, and PSMCT32 only.
+Z test or Z buffer, no texture, no dither, and no 16-bit formats.
 
 Gouraud and Z are the same problem twice: both need a value interpolated across
 the primitive, and the interpolation rule has to be established the way the fill

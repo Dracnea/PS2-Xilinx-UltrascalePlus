@@ -35,6 +35,7 @@ import argparse, sys
 
 M64 = (1 << 64) - 1
 M32 = (1 << 32) - 1
+M128 = (1 << 128) - 1
 # The R5900's processor identifier, which the BIOS reads to tell an EE from an
 # IOP.  Implementation 0x2E, revision 0x20.
 PRID = 0x00002E20
@@ -111,6 +112,16 @@ class R5900:
     # -- register access: r0 is hardwired zero, and writes to it vanish -------
     def r(self, n):
         return self.gpr[n] & M64
+
+    def r128(self, n):
+        """The whole register.  Integer instructions define only the low 64 and
+        leave the upper half alone; MMI is what finally reads and writes it."""
+        return self.gpr[n] & M128
+
+    def w128(self, n, v):
+        if n == 0:
+            return
+        self.gpr[n] = v & M128
 
     def w(self, n, v):
         if n == 0:
@@ -266,6 +277,26 @@ class R5900:
             else:
                 # the remaining CO forms are the TLB instructions
                 self.traps.append(("unimplemented COP0 rs %d" % rs, self.pc - 4))
+        elif op == 28 and fn in (0x09, 0x29):            # MMI2 / MMI3
+            # These are the SIMD half of MMI and the first instructions to touch
+            # the upper 64 bits of a register.  The sub-opcode is in the sa
+            # field, not in fn, which is why they cannot share the dispatch
+            # above.
+            a128, b128 = self.r128(rs), self.r128(rt)
+            if fn == 0x09:                              # MMI2
+                if   sa == 0x12: self.w128(rd, a128 & b128)             # PAND
+                elif sa == 0x13: self.w128(rd, a128 ^ b128)             # PXOR
+                elif sa == 0x0E:                                        # PCPYLD
+                    self.w128(rd, ((a128 & M64) << 64) | (b128 & M64))
+                else:
+                    self.traps.append(("unimplemented MMI2 sa %d" % sa, self.pc - 4))
+            else:                                       # MMI3
+                if   sa == 0x12: self.w128(rd, a128 | b128)             # POR
+                elif sa == 0x13: self.w128(rd, ~(a128 | b128) & M128)   # PNOR
+                elif sa == 0x0E:                                        # PCPYUD
+                    self.w128(rd, ((b128 >> 64) << 64) | (a128 >> 64))
+                else:
+                    self.traps.append(("unimplemented MMI3 sa %d" % sa, self.pc - 4))
         elif op == 28:                                  # MMI
             if fn in (16, 17, 18, 19, 24, 25, 26, 27):
                 # the same operations as SPECIAL, on the second HI/LO pair
@@ -432,7 +463,9 @@ def dump(cpu, step, pc):
     it.  Every register is printed, not just the non-zero ones, so a diff cannot
     be confused by a register merely becoming zero.
     """
-    regs = " ".join("r%02d=%016x" % (n, cpu.r(n)) for n in range(1, 32))
+    # All 128 bits, because MMI writes the upper half and a trace that printed
+    # only the low 64 would call two different machine states identical.
+    regs = " ".join("r%02d=%032x" % (n, cpu.r128(n)) for n in range(1, 32))
     return "%4d pc=%016x hi=%016x lo=%016x hi1=%016x lo1=%016x %s" % (
         step, pc, cpu.hi, cpu.lo, cpu.hi1, cpu.lo1, regs)
 

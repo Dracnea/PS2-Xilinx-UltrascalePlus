@@ -30,7 +30,8 @@ module tb_ee_core;
    logic [7:0]  d_be;
    logic [63:0] d_wdata, d_rdata;
    logic        retire;
-   logic [63:0] retire_pc, dbg_gpr, dbg_hi, dbg_lo, dbg_hi1, dbg_lo1;
+   logic [63:0] retire_pc, dbg_hi, dbg_lo, dbg_hi1, dbg_lo1;
+   logic [127:0] dbg_gpr;
    logic [4:0]  dbg_sel = 0;
    logic [15:0] dbg_traps;
    logic [2:0]  dbg_stall;
@@ -124,7 +125,7 @@ module tb_ee_core;
    // ---- run and report -----------------------------------------------------
    string  progfile;   // 'program' is a SystemVerilog keyword
    integer steps, n, r, budget, cycles;
-   logic [63:0] regs [1:31];
+   logic [127:0] regs [1:31];
 
    initial begin
       if (!$value$plusargs("program=%s", progfile)) progfile = "prog.hex";
@@ -173,7 +174,7 @@ module tb_ee_core;
             end
             $write("%4d pc=%016x hi=%016x lo=%016x hi1=%016x lo1=%016x",
                    n, retire_pc, dbg_hi, dbg_lo, dbg_hi1, dbg_lo1);
-            for (r = 1; r <= 31; r = r + 1) $write(" r%02d=%016x", r, regs[r]);
+            for (r = 1; r <= 31; r = r + 1) $write(" r%02d=%032x", r, regs[r]);
             $write("\n");
             n = n + 1;
          end

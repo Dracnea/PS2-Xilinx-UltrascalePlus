@@ -229,6 +229,7 @@ says the earlier attribution was built on a comparison that did not hold.
 | …plus exceptions (current) | 228.2 MHz |
 | current with only the exception redirect removed | 250.9 MHz |
 | **the redirect registered instead of removed** | **255.3 MHz** |
+| MMI SIMD, and the datapath widened to 128 bits | **234.5 MHz** |
 
 The 252.1 figure was measured **before MMI and COP0 were added**, and neither of
 those was re-measured, so "252.1 → 228.2" spanned three changes rather than one.
@@ -732,6 +733,43 @@ instruction of the run rather than the one just written. A model comparison is
 only as good as the agreement about what was executed.
 
 208 differential runs pass, and the cross-check is clean again.
+
+## MMI SIMD, and the upper 64 bits — 2026-09-10
+
+`PAND`, `PXOR`, `PCPYLD` (MMI2) and `POR`, `PNOR`, `PCPYUD` (MMI3) — **the first
+instructions in this core to write the upper half of a register.** The register
+file has been 128 bits wide since the first commit, on the stated reasoning that
+widening it afterwards would touch every path that carries a register. That
+reasoning holds up: the widening that just happened touched the operand latches,
+the forwarding network, the writeback and the trace, and none of it touched the
+register file.
+
+The sub-opcode for these lives in `sa` rather than `fn`, which is why they
+cannot share the decode that maps MMI's HI/LO forms onto the SPECIAL arms.
+
+Two decisions worth recording. **The ALU's result stays 64 bits** and MMI
+supplies the upper half separately, rather than widening every assignment in a
+decode that is almost entirely 64-bit. And **the writeback distinguishes the two
+widths**: an MMI result writes all 128 bits, everything else leaves the upper
+half alone, which is what "integer instructions do not define the upper half"
+means in practice. The forwarding paths carry the same distinction, or an MMI
+result forwarded at any distance would lose its top half to a 64-bit writer that
+never touched it.
+
+The trace now prints all 128 bits. It had to: a trace showing only the low 64
+would call two different machine states identical, which is precisely the bug
+this instruction group could introduce.
+
+**It cost 8% of the clock — 255.3 down to 234.5 MHz** — and that is the
+forwarding mux doubling in width on the path that was already critical. The
+mitigation is known but not applied: only MMI consumes the upper half, so the
+upper 64 bits do not need the same single-cycle forwarding network as the lower.
+A separate, slower path for them would leave the critical path at its old width.
+That is the same shape as the exception redirect, which also cost about 9% until
+it was given a cycle it did not need to save.
+
+208 differential runs pass, and the cross-check against birdybro/PS2_fpga is
+clean.
 
 ## What is not started
 

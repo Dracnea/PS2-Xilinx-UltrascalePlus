@@ -82,7 +82,7 @@ def gen(rng, ntags):
             sc  = (rng.randrange(0, 8), rng.randrange(40, 64),
                    rng.randrange(0, 4), rng.randrange(20, 32))
             abe, alpha, clamp = blend_regs(rng)
-            items = [(0x4C, fbp | (1 << 16) | (msk << 32)),
+            items = [(0x4C, fbp | (1 << 16) | (rng.choice([0, 0, 1]) << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x40 + 1, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
@@ -110,7 +110,7 @@ def gen(rng, ntags):
             sc  = (rng.randrange(0, 4), rng.randrange(40, 64),
                    rng.randrange(0, 4), rng.randrange(20, 32))
             abe, alpha, clamp = blend_regs(rng)
-            items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (msk << 32)),
+            items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (rng.choice([0, 0, 1]) << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x42, alpha), (0x46, clamp),

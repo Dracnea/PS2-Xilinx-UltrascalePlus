@@ -483,7 +483,15 @@ begin
 
                         dr_fbp   <= unsigned(reg(16#4C# + ctxi)(8 downto 0));
                         dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
-                        dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
+                        -- PSMCT24 is 24 bits inside a 32-bit word, addressed
+                        -- exactly as PSMCT32 is; its top byte is not part of the
+                        -- pixel and survives the write, which is what FBMSK
+                        -- already means, so it is expressed as one.
+                        if reg(16#4C# + ctxi)(29 downto 24) = "000001" then
+                           dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32) or x"FF000000";
+                        else
+                           dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
+                        end if;
                         dr_rgba  <= reg(1)(31 downto 0);
                         dr_abe   <= reg(0)(6);
                         dr_alpha <= reg(16#42# + ctxi)(7 downto 0);
@@ -495,7 +503,8 @@ begin
                         dr_y     <= to_unsigned(ay, 11);
                         dr_y1    <= to_unsigned(by, 11);
                         if ax > bx or ay > by or ax < 0 or ay < 0
-                           or reg(16#4C# + ctxi)(29 downto 24) /= "000000" then
+                           or (reg(16#4C# + ctxi)(29 downto 24) /= "000000"
+                               and reg(16#4C# + ctxi)(29 downto 24) /= "000001") then
                            dr_empty <= '1';       -- nothing to draw, or not PSMCT32
                         else
                            dr_empty <= '0';
@@ -524,14 +533,23 @@ begin
                         t_y(2) <= to_signed(to_integer(unsigned(w_data(31 downto 16))) - ofy, 18);
                         dr_fbp   <= unsigned(reg(16#4C# + ctxi)(8 downto 0));
                         dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
-                        dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
+                        -- PSMCT24 is 24 bits inside a 32-bit word, addressed
+                        -- exactly as PSMCT32 is; its top byte is not part of the
+                        -- pixel and survives the write, which is what FBMSK
+                        -- already means, so it is expressed as one.
+                        if reg(16#4C# + ctxi)(29 downto 24) = "000001" then
+                           dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32) or x"FF000000";
+                        else
+                           dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
+                        end if;
                         dr_rgba  <= reg(1)(31 downto 0);
                         dr_abe   <= reg(0)(6);
                         dr_alpha <= reg(16#42# + ctxi)(7 downto 0);
                         dr_fix   <= unsigned(reg(16#42# + ctxi)(39 downto 32));
                         dr_clamp <= reg(16#46#)(0);
-                        if reg(16#4C# + ctxi)(29 downto 24) /= "000000" then
-                           dr_empty <= '1';            -- not PSMCT32
+                        if reg(16#4C# + ctxi)(29 downto 24) /= "000000"
+                           and reg(16#4C# + ctxi)(29 downto 24) /= "000001" then
+                           dr_empty <= '1';            -- neither PSMCT32 nor 24
                         else
                            dr_empty <= '0';
                         end if;

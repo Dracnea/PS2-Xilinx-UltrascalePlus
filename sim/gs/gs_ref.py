@@ -235,11 +235,14 @@ class GS:
         frame = self.reg[0x4C + c]
         xyoff = self.reg[0x18 + c]
         sciss = self.reg[0x40 + c]
-        if bits(frame, 29, 24) != 0:
+        psm = bits(frame, 29, 24)
+        if psm not in (0, 1):
             return
         fbp   = bits(frame, 8, 0)
         fbw   = bits(frame, 21, 16)
         fbmsk = bits(frame, 63, 32)
+        if psm == 1:
+            fbmsk |= 0xFF000000
         ofx, ofy = bits(xyoff, 15, 0), bits(xyoff, 47, 32)
 
         # Pixel space, as exact rationals.  The hardware coordinates are 12.4
@@ -295,11 +298,18 @@ class GS:
         frame  = self.reg[0x4C + c]
         xyoff  = self.reg[0x18 + c]
         sciss  = self.reg[0x40 + c]
-        if bits(frame, 29, 24) != 0:               # PSMCT32 only for now
+        psm = bits(frame, 29, 24)
+        if psm not in (0, 1):                      # PSMCT32 and PSMCT24
             return
         fbp  = bits(frame, 8, 0)                   # in 8 KB pages
         fbw  = bits(frame, 21, 16)                 # in 64-pixel units
         fbmsk = bits(frame, 63, 32)
+        if psm == 1:
+            # PSMCT24 is 24 bits inside a 32-bit word, addressed exactly as
+            # PSMCT32 is.  The top byte is not part of the pixel, so it survives
+            # the write -- which is the same thing FBMSK does, and is therefore
+            # expressed as one.
+            fbmsk |= 0xFF000000
         ofx, ofy = bits(xyoff, 15, 0), bits(xyoff, 47, 32)
 
         x0 = (v0[0] - ofx) >> 4

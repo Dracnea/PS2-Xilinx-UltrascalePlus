@@ -90,7 +90,9 @@ entity ee_core is
       retire     : out std_logic := '0';
       retire_pc  : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_sel    : in  unsigned(4 downto 0) := (others => '0');
-      dbg_gpr    : out std_logic_vector(63 downto 0) := (others => '0');
+      -- All 128 bits: MMI writes the upper half, and a trace that showed only
+      -- the low 64 would call two different machine states identical.
+      dbg_gpr    : out std_logic_vector(127 downto 0) := (others => '0');
       dbg_hi     : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_lo     : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_hi1    : out std_logic_vector(63 downto 0) := (others => '0');
@@ -187,7 +189,7 @@ architecture arch of ee_core is
    signal d_valid   : std_logic := '0';
    signal d_pc      : unsigned(31 downto 0) := (others => '0');
    signal d_ir      : std_logic_vector(31 downto 0) := (others => '0');
-   signal d_a, d_b  : std_logic_vector(63 downto 0) := (others => '0');
+   signal d_a, d_b  : std_logic_vector(127 downto 0) := (others => '0');
    signal d_rs      : integer range 0 to 31 := 0;
    signal d_rt      : integer range 0 to 31 := 0;
    -- The branch target and the link address are computed in ID, not EX.  Both
@@ -215,7 +217,8 @@ architecture arch of ee_core is
    signal m_pc      : unsigned(31 downto 0) := (others => '0');
    signal m_we      : std_logic := '0';
    signal m_rd      : integer range 0 to 31 := 0;
-   signal m_val     : std_logic_vector(63 downto 0) := (others => '0');
+   signal m_val     : std_logic_vector(127 downto 0) := (others => '0');
+   signal m_w128    : std_logic := '0';
    signal m_p1      : std_logic := '0';
    -- An exception is raised in A1 and committed in WB.  WB is the in-order
    -- commit point, so raising it there is precise by construction: everything
@@ -252,7 +255,8 @@ architecture arch of ee_core is
    signal w_pc      : unsigned(31 downto 0) := (others => '0');
    signal w_we      : std_logic := '0';
    signal w_rd      : integer range 0 to 31 := 0;
-   signal w_val     : std_logic_vector(63 downto 0) := (others => '0');
+   signal w_val     : std_logic_vector(127 downto 0) := (others => '0');
+   signal w_w128    : std_logic := '0';
    signal w_p1      : std_logic := '0';
    signal w_exc     : std_logic := '0';
    signal w_exc_code: integer range 0 to 31 := 0;
@@ -289,8 +293,8 @@ architecture arch of ee_core is
 
    function rd_gpr(r : regfile_t; n : integer) return std_logic_vector is
    begin
-      if n = 0 then return (63 downto 0 => '0'); end if;
-      return r(n)(63 downto 0);
+      if n = 0 then return (127 downto 0 => '0'); end if;
+      return r(n);
    end function;
 
    -- Does this opcode read rs / rt?  Getting these wrong in the safe direction
@@ -389,6 +393,7 @@ begin
    process (clk)
       -- EX decode and result
       variable op, rs, rt, rd, sa, fn : integer;
+      variable a128, b128             : std_logic_vector(127 downto 0);
       variable a, b                   : std_logic_vector(63 downto 0);
       variable simm                   : signed(63 downto 0);
       variable imm                    : std_logic_vector(15 downto 0);
@@ -408,7 +413,12 @@ begin
       variable op_eff                 : integer;
       variable ex_we                  : std_logic;
       variable ex_rd                  : integer range 0 to 31;
+      -- The ALU's result stays 64 bits, because every instruction but MMI
+      -- defines only that much.  MMI supplies the upper half separately rather
+      -- than widening every assignment in the decode below.
       variable ex_val                 : std_logic_vector(63 downto 0);
+      variable ex_valhi               : std_logic_vector(63 downto 0);
+      variable ex_w128                : std_logic;
       variable ex_hi_we, ex_lo_we     : std_logic;
       variable ex_hi, ex_lo           : std_logic_vector(63 downto 0);
       variable ex_ismem, ex_isload    : std_logic;
@@ -439,12 +449,13 @@ begin
       variable id_ir             : std_logic_vector(31 downto 0);
       variable id_rs, id_rt      : integer range 0 to 31;
       variable id_op             : integer;
-      variable id_a, id_b        : std_logic_vector(63 downto 0);
+      variable id_a, id_b        : std_logic_vector(127 downto 0);
       variable id_nxt, id_tgt    : unsigned(31 downto 0);
       variable id_link           : std_logic_vector(63 downto 0);
 
       -- MEM
       variable ldv, ldw          : std_logic_vector(63 downto 0);
+      variable ldw128            : std_logic_vector(127 downto 0);
       variable uw, um, uv        : unsigned(31 downto 0);
       variable uv64              : unsigned(63 downto 0);
       variable ku, shu           : integer range 0 to 63;
@@ -544,16 +555,33 @@ begin
             -- so the younger writer wins.  A load sitting in A2 has no value
             -- yet, which is what the load-use interlock below exists to
             -- prevent ever needing.
-            a := d_a;
-            b := d_b;
+            a128 := d_a;
+            b128 := d_b;
             if w_valid = '1' and w_we = '1' and w_rd /= 0 then
-               if w_rd = d_rs then a := w_val; end if;
-               if w_rd = d_rt then b := w_val; end if;
+               if w_rd = d_rs then
+                  if w_w128 = '1' then a128 := w_val;
+                  else a128 := a128(127 downto 64) & w_val(63 downto 0); end if;
+               end if;
+               if w_rd = d_rt then
+                  if w_w128 = '1' then b128 := w_val;
+                  else b128 := b128(127 downto 64) & w_val(63 downto 0); end if;
+               end if;
             end if;
             if m_valid = '1' and m_we = '1' and m_rd /= 0 then
-               if m_rd = d_rs then a := m_val; end if;
-               if m_rd = d_rt then b := m_val; end if;
+               if m_rd = d_rs then
+                  if m_w128 = '1' then a128 := m_val;
+                  else a128 := a128(127 downto 64) & m_val(63 downto 0); end if;
+               end if;
+               if m_rd = d_rt then
+                  if m_w128 = '1' then b128 := m_val;
+                  else b128 := b128(127 downto 64) & m_val(63 downto 0); end if;
+               end if;
             end if;
+            -- Everything but MMI defines only the low 64 bits, so the ALU below
+            -- reads the halves it always did and the upper half travels
+            -- alongside for the instructions that want it.
+            a := a128(63 downto 0);
+            b := b128(63 downto 0);
 
             -- HI and LO are read in A1 and written in WB, so they need the
             -- same two forwarding steps and the same priority.
@@ -596,8 +624,10 @@ begin
             end if;
 
             ex_we     := '0';
+            ex_w128   := '0';
             ex_rd     := 0;
             ex_val    := (others => '0');
+            ex_valhi  := (others => '0');
             ex_hi_we  := '0';
             ex_lo_we  := '0';
             ex_hi     := (others => '0');
@@ -806,6 +836,44 @@ begin
                      when others => ex_trap := true;
                   end case;
 
+               when 28 =>                                    -- MMI2 / MMI3
+                  -- The SIMD half of MMI, and the first instructions to touch
+                  -- the upper 64 bits of a register.  The sub-opcode is in sa
+                  -- rather than fn, which is why these cannot share the decode
+                  -- that maps MMI's HI/LO forms onto the SPECIAL arms.
+                  ex_we   := '1';
+                  ex_rd   := rd;
+                  ex_w128 := '1';
+                  if fn = 16#09# then                        -- MMI2
+                     case sa is
+                        when 16#12# =>                       -- PAND
+                           ex_val   := a128(63 downto 0) and b128(63 downto 0);
+                           ex_valhi := a128(127 downto 64) and b128(127 downto 64);
+                        when 16#13# =>                       -- PXOR
+                           ex_val   := a128(63 downto 0) xor b128(63 downto 0);
+                           ex_valhi := a128(127 downto 64) xor b128(127 downto 64);
+                        when 16#0E# =>                       -- PCPYLD
+                           ex_val   := b128(63 downto 0);
+                           ex_valhi := a128(63 downto 0);
+                        when others =>
+                           ex_we := '0'; ex_w128 := '0'; ex_trap := true;
+                     end case;
+                  else                                       -- MMI3
+                     case sa is
+                        when 16#12# =>                       -- POR
+                           ex_val   := a128(63 downto 0) or b128(63 downto 0);
+                           ex_valhi := a128(127 downto 64) or b128(127 downto 64);
+                        when 16#13# =>                       -- PNOR
+                           ex_val   := not (a128(63 downto 0) or b128(63 downto 0));
+                           ex_valhi := not (a128(127 downto 64) or b128(127 downto 64));
+                        when 16#0E# =>                       -- PCPYUD
+                           ex_val   := a128(127 downto 64);
+                           ex_valhi := b128(127 downto 64);
+                        when others =>
+                           ex_we := '0'; ex_w128 := '0'; ex_trap := true;
+                     end case;
+                  end if;
+
                when 24 | 25 => ex_we := '1'; ex_rd := rt;    -- DADDI/DADDIU
                   ex_val := std_logic_vector(signed(a) + simm);
 
@@ -919,8 +987,16 @@ begin
             -- so a read issued now would miss it.  Bypass it here rather than
             -- adding a third forwarding input to EX.
             if w_valid = '1' and w_we = '1' and w_rd /= 0 then
-               if w_rd = id_rs then id_a := w_val; end if;
-               if w_rd = id_rt then id_b := w_val; end if;
+               -- the bypass has to carry the whole register, or an MMI result
+               -- forwarded at this distance would lose its upper half
+               if w_rd = id_rs then
+                  if w_w128 = '1' then id_a := w_val;
+                  else id_a := id_a(127 downto 64) & w_val(63 downto 0); end if;
+               end if;
+               if w_rd = id_rt then
+                  if w_w128 = '1' then id_b := w_val;
+                  else id_b := id_b(127 downto 64) & w_val(63 downto 0); end if;
+               end if;
             end if;
 
             -- The one hazard forwarding cannot cover: a load in A1 moves to
@@ -967,7 +1043,11 @@ begin
                cop0(C0_STATUS)(1) <= '0';          -- clear EXL and resume
             elsif w_valid = '1' then
                if w_we = '1' and w_rd /= 0 then
-                  gpr(w_rd)(63 downto 0) <= w_val;
+                  if w_w128 = '1' then
+                     gpr(w_rd) <= w_val;
+                  else
+                     gpr(w_rd)(63 downto 0) <= w_val(63 downto 0);
+                  end if;
                end if;
                if w_hi_we = '1' then
                   if w_p1 = '1' then hi1 <= w_hi; else hi <= w_hi; end if;
@@ -988,6 +1068,7 @@ begin
                w_pc     <= m_pc;
                w_we     <= m_we;
                w_rd     <= m_rd;
+               w_w128   <= m_w128;
                w_p1     <= m_p1;
                w_exc     <= m_exc;
                w_exc_code<= m_exc_code;
@@ -1038,7 +1119,7 @@ begin
                      end if;
                      ldw := std_logic_vector(uv64);
                   end if;
-                  w_val <= ldw;
+                  w_val <= x"0000000000000000" & ldw;
                elsif m_isload = '1' then
                   -- The port answers with the whole 64-bit word that contains
                   -- the address, so the bytes the instruction asked for have to
@@ -1068,7 +1149,7 @@ begin
                      when others =>
                         ldw := ldv;
                   end case;
-                  w_val <= ldw;
+                  w_val <= x"0000000000000000" & ldw;
                else
                   w_val <= m_val;
                end if;
@@ -1090,7 +1171,8 @@ begin
                   m_pc     <= d_pc;
                   m_we     <= ex_we;
                   m_rd     <= ex_rd;
-                  m_val    <= ex_val;
+                  m_val    <= ex_valhi & ex_val;
+                  m_w128   <= ex_w128;
                   m_p1     <= ex_p1;
                   m_exc     <= ex_exc and d_valid;
                   m_exc_code<= ex_code;
@@ -1343,8 +1425,8 @@ begin
                --
                -- Only older instructions can ever be in A2 or WB, so a
                -- capture can only ever move an operand forward in time.
-               d_a <= a;
-               d_b <= b;
+               d_a <= a128;
+               d_b <= b128;
             end if;
 
             -- ============================================================
