@@ -33,10 +33,16 @@
         bne     $k0, $zero, fail        # anything but an interrupt is a failure
         nop
         li      $k1, 0x1F801070
-        li      $k0, 0xFFFFBFFF         # acknowledge RTC3 (bit 14)
-        sw      $k0, 0($k1)
+        li      $k0, 0xFFFEBFFF         # acknowledge timer 3 (bit 14) and timer 5 (bit 16).
+        sw      $k0, 0($k1)             # Acknowledging only the source this handler was
+                                        # written for leaves any other one asserted, and a
+                                        # level-triggered source that is never cleared
+                                        # re-enters the handler forever -- which looks like
+                                        # a hung test rather than an unacknowledged interrupt.
         li      $k0, 0x1F801484
-        lw      $k1, 0($k0)             # read timer 3 MODE: clears the reached flags
+        lw      $k1, 0($k0)             # timer 3 MODE: reading clears the reached flags
+        li      $k0, 0x1F8014A4
+        lw      $k1, 0($k0)             # timer 5 MODE, likewise
         nop
         li      $k0, 0xA0001000
         li      $k1, 1
@@ -954,6 +960,64 @@ s0w:    lw      $t1, 8($t0)
         nop
 s0done:
         li      $t0, 0x13
+        sb      $t0, 0($s7)
+
+# ---- 14: timer 5 with each prescaler -----------------------------------------
+# The BIOS drives the IOP's thread scheduler from timer 5, and INTC bit 16 --
+# TIMER5 in intrman's numbering -- never fires on this design, so no module
+# thread ever runs and no RPC server is ever registered.  Timers 4 and 5 have a
+# prescaler in MODE bits 13-14 that timer 3 does not, and that prescaler is the
+# one part of iop_timer32.vhd taken from an emulator rather than measured.
+# Stage 06 proves timer 3's interrupt; this proves timer 5's, at each divisor.
+# $s4 counts the settings that worked, so the POST code says how far it got.
+        li      $s4, 0
+        li      $s5, 0                  # 00 = /1, then 01 = /8, 10 = /16, 11 = /256
+t5next:
+        li      $t0, 0xA0001000
+        sw      $zero, 0($t0)           # the handler's flag
+        li      $t1, 0x1F801070
+        li      $t2, 0x00010000         # I_MASK: TIMER5 is bit 16
+        sw      $t2, 4($t1)
+        sw      $zero, 0($t1)
+        li      $t2, 1
+        sw      $t2, 8($t1)
+
+        li      $t1, 0x1F8014A0         # timer 5: 0x1F801480 + 2*0x10
+        li      $t2, 4096               # reachable even at /256, and far enough away that
+                                        # the handler returns before the next one is due --
+                                        # 64 counts at /1 is 1.7 us, which re-enters faster
+                                        # than the handler can finish and looks like a hang
+        sw      $t2, 8($t1)
+        sll     $t3, $s5, 13            # the prescaler under test
+        li      $t2, 0x0018             # reset on target | IRQ on target, once only
+        or      $t2, $t2, $t3
+        sw      $t2, 4($t1)
+
+        li      $t2, 0x00400401         # SR: BEV | IM2 | IEc
+        mtc0    $t2, $12
+        nop
+        li      $t3, 3000000
+t5wait: lw      $t2, 0($t0)
+        addiu   $t3, $t3, -1
+        beq     $t3, $zero, t5done      # this divisor never interrupted
+        nop
+        beq     $t2, $zero, t5wait
+        nop
+        addiu   $s4, $s4, 1             # this one worked
+t5done:
+        li      $t2, 0x00400000
+        mtc0    $t2, $12
+        nop
+        addiu   $s5, $s5, 1
+        li      $t2, 4
+        bne     $s5, $t2, t5next
+        nop
+
+# POST 20 + however many of the four divisors raised their interrupt, so a
+# partial result is legible: 20 means none, 24 means all four.
+        li      $t1, 0xA0001010         # also in RAM: the POST register only holds the
+        sw      $s4, 0($t1)             # last value written, and AA follows immediately
+        addiu   $t0, $s4, 0x20
         sb      $t0, 0($s7)
 
 # ---- done -----------------------------------------------------------------

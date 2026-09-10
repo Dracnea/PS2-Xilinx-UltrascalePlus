@@ -187,6 +187,62 @@ one this design was looking for. The four candidate explanations at the time
 included a malformed packet, with `psize` as the favourite, and that would have
 been the next hour.
 
+### SIFRPC: the transport works, the services are absent — 2026-09-10
+
+`SIF_CMD_RPC_BIND` to the fileio service id `0x80000001` is received, dispatched
+and answered:
+
+```
+cmd=0x80000008 (SIF_CMD_RPC_END) psize=64
+echoed: cd=0x00abc200 pkt_addr=0x00abc100
+for cid=0x80000009 (SIF_CMD_RPC_BIND)
+server: sd=0x00000000 buf=0x00000000 cbuf=0x00000000
+```
+
+The echoed `cd` and `pkt_addr` are the host's own fictional EE addresses coming
+back, which is what confirms the 64-byte packet layout. But the server fields
+are null: **nothing is bound.**
+
+Twenty candidate service ids were tried — fileio, loadfile, mcserv, padman and
+others — and every one answered the same way. So the RPC layer is alive and
+answering correctly; the IOP simply has no registered servers. Searching a
+2 MB dump of IOP RAM agrees: no aligned `SifRpcServerData_t` holding
+`0x80000001` exists, and `0x80000006` and `0x80000592` never appear at all.
+
+> **NOTE (unverified): why no service is registered.** Every BIOS module that
+> would provide one is resident — FILEIO, CDVDFSV, LOADFILE are all in the
+> module map — and the RPC layer reports itself initialised (`SREG[0]` =
+> RPCINIT = 1). What has not been established is whether their server threads
+> ever run, or whether registration waits on something the EE has not yet done.
+> *Verify by:* finding the RPC service table the bind handler searches, which
+> is reachable from the same structures SIFCMD uses, and reading it directly
+> rather than inferring its contents from bind failures.
+
+**A theory that was wrong, recorded because the method matters.** The first
+explanation was that the IOP's thread scheduler never ticks: INTC bit 16 —
+TIMER5 in intrman's numbering — is unmasked by the BIOS and was never observed
+pending across three seconds of 1 ms sampling, and no scheduler tick would mean
+no module thread ever runs. It fitted the evidence exactly, including why
+interrupt-context work (SIFCMD) succeeds while thread-context work does not.
+
+It was wrong. Boot-test stage `14` programs timer 5 directly at each of its four
+prescaler settings and **all four raise their interrupt**. The bit was never
+observed pending because the BIOS's own handler acknowledges it faster than the
+host can sample — the same mistake as reading `CHCR` bit 24 on a channel whose
+completion was instant, twice now in one week: *sampling a bit that is cleared
+promptly and concluding the event never happens.*
+
+Stage `14` also chases down the note in `iop_timer32.vhd` that the prescaler
+bits came from PCSX2 rather than measurement. It settles less than it looks
+like: it proves each of the four settings interrupts, not that `/8` divides by
+eight. The ratios are still unmeasured.
+
+Writing it exposed two faults in the test rather than the design, both worth
+keeping: the shared exception handler acknowledged only timer 3, so a timer 5
+interrupt was never cleared and re-entered forever; and a target of 64 counts in
+repeat mode re-fires every 1.7 us at 36.864 MHz, which is faster than the
+handler returns. Both present as a hung test.
+
 ### What the channels must not do
 
 Both SIF channels sit armed for long stretches with nothing moving, and the
@@ -209,7 +265,8 @@ the ISO9660 walk with SIF1 armed and starved.
    **Done 2026-09-10.**
 5. **SIFRPC on the host**: bind, then call, then the FILEIO service — which is
    the point of all of it, because `CDVDMAN` and `IOMAN` are invoked through
-   an RPC and in no other way.
+   an RPC and in no other way. *Transport done 2026-09-10; blocked on the IOP
+   registering a service to bind to.*
 
 Steps 1-3 are also exactly what the Emotion Engine needs later, so none of it
 is spent solely on closing out the disc path.
