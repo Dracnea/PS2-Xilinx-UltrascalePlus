@@ -48,6 +48,8 @@ EE_BUF      = 0x00ABC000
 EE_PKT_ADDR = 0x00ABC100
 EE_CLIENT   = 0x00ABC200
 EE_RECV     = 0x00ABC300
+EE_RDATA    = 0x00ABC400          # the read's fragment struct
+EE_BUFFER   = 0x00AC0000          # where a read's bulk data is asked to land
 
 
 def bind_packet(sid, rpc_id, cd=EE_CLIENT, pkt_addr=EE_PKT_ADDR):
@@ -66,6 +68,16 @@ def call_packet(sd, buf, rpc_number, send_size, recvbuf, recv_size, rpc_id,
     w += [REC_ID_RPC | PACKET_F_ALLOC, pkt_addr, rpc_id, cd,
           rpc_number, send_size, recvbuf, recv_size, 1, sd]
     return w + [0] * (RPC_PACKET_SIZE // 4 - len(w))
+
+
+def read_arg(fd, ptr, size, rdata=EE_RDATA):
+    """struct _fio_read_arg { int fd; void *ptr; int size; struct *read_data; }.
+
+    `ptr` is an address in EE memory, and the IOP sends the bulk data there
+    itself over SIF0 rather than returning it -- so a read produces two things:
+    a transfer to `ptr`, and a return value saying how many bytes it was.
+    """
+    return [fd, ptr, size, rdata], 16
 
 
 def open_arg(path, mode=FIO_O_RDONLY):
@@ -116,6 +128,9 @@ def main():
     p = sub.add_parser("open")
     p.add_argument("--path", default="cdrom0:\\SLUS_212.40;1")
     p.add_argument("--mode", type=lambda x: int(x, 0), default=FIO_O_RDONLY)
+    p = sub.add_parser("read")
+    p.add_argument("--path", default="cdrom0:\\SLUS_212.40;1")
+    p.add_argument("--size", type=lambda x: int(x, 0), default=128)
     a = ap.parse_args()
     c = Card(a.csr, a.dev)
 
@@ -129,7 +144,7 @@ def main():
     if stale:
         print(f"  (drained {len(stale)} stale words first)")
 
-    if a.cmd == "open":
+    if a.cmd in ("open", "read"):
         send(c, iopbuf, bind_packet(FILEIO_SID, 1), quiet=True)
         w = await_reply(c)
         out, text = decode_rend(w) if w else (None, "  no reply")
@@ -140,8 +155,9 @@ def main():
         sd, buf = out["sd"], out["buf"]
         print(f"bound: sd=0x{sd:08x} buf=0x{buf:08x}")
 
-        args, size = open_arg(a.path, a.mode)
-        print(f"open({a.path!r}, mode=0x{a.mode:x})  {size} bytes of argument")
+        mode = getattr(a, "mode", FIO_O_RDONLY)
+        args, size = open_arg(a.path, mode)
+        print(f"open({a.path!r}, mode=0x{mode:x})  {size} bytes of argument")
         # Arguments to the server's buffer first, then the packet that points at
         # them: the other order races the handler against its own data.
         #
@@ -155,14 +171,50 @@ def main():
         c.push(padded)
         send(c, iopbuf, call_packet(sd, buf, FIO_F_OPEN, size, EE_RECV, 4, 2), quiet=True)
 
-        w = await_reply(c, 3.0)
+        w = await_reply(c, 5.0)
         if not w:
-            print("\nno reply to the call")
+            print("\nno reply to the open")
             return 1
-        print(f"\nreply, {len(w)} words:")
-        out, text = decode_rend(w)
-        print(text)
-        print("\nraw: " + " ".join("%08x" % x for x in w))
+        fdv = w[4] if len(w) > 4 else None
+        print(f"open returned {fdv}" if fdv is not None else "open: short reply")
+        print("  raw: " + " ".join("%08x" % x for x in w))
+        if a.cmd == "open" or fdv is None:
+            return 0
+        if fdv & 0x80000000:
+            print(f"\nopen failed with {fdv - (1 << 32)}; not reading")
+            return 1
+
+        # ---- the read ---------------------------------------------------
+        args, size = read_arg(fdv, EE_BUFFER, a.size)
+        print(f"\nread(fd={fdv}, ptr=0x{EE_BUFFER:08x}, size={a.size})")
+        padded = args + [0] * (-len(args) % 4)
+        c.push(tag(buf, len(padded)))
+        c.push(padded)
+        send(c, iopbuf, call_packet(sd, buf, FIO_F_READ, size, EE_RECV, 4, 3), quiet=True)
+
+        w = await_reply(c, 8.0)
+        time.sleep(0.4)
+        w += drain(c)
+        if not w:
+            print("no reply to the read")
+            return 1
+        print(f"reply, {len(w)} words")
+        # The stream holds one or more SIF0 transfers, each a 4-word EE tag then
+        # its payload.  Walk them rather than assuming there is only one.
+        i = 0
+        while i + 4 <= len(w):
+            dest, qwc = w[i+1], w[i] & 0xFFFF
+            n = min(qwc * 4, len(w) - i - 4) if qwc else len(w) - i - 4
+            body = w[i+4:i+4+n]
+            print(f"  -> EE 0x{dest:08x}, {len(body)} words")
+            if body:
+                raw = struct.pack("<%dI" % len(body), *body)
+                print("     " + " ".join("%08x" % x for x in body[:8]))
+                printable = bytes(ch if 32 <= ch < 127 else 46 for ch in raw[:32])
+                print("     %r" % printable.decode())
+                if raw[:4] == b"\x7fELF":
+                    print("     ^ ELF magic: this is the game's executable")
+            i += 4 + len(body)
         return 0
 
     pkt = bind_packet(a.sid, a.rpc_id)

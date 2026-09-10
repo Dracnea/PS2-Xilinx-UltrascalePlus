@@ -392,6 +392,27 @@ filename — as the next tag, which showed up as `addr=0x31325f len=13356`, ASCI
 misread as a header. Argument blocks are padded to a quadword now. The header's
 `dsize` stays the true size; only the transfer is rounded.
 
+### And it reads the file — 2026-09-10
+
+`FIO_F_READ` is 2, and a read is shaped differently from an open: the argument
+carries an **EE address** for the data, and the IOP sends the bytes there itself
+over SIF0 rather than returning them. So one call produces three transfers, and
+the host has to walk them rather than expect a single reply:
+
+```
+-> EE 0x00ac0000, 32 words   464c457f 00010101 ...   the file's contents
+-> EE 0x00abc400, 12 words                            the fragment struct
+-> EE 0x00abc300,  1 word    00000080                 the return value, 128
+```
+
+The 128 bytes are **byte-identical to `SLUS_212.40` on the disc**, and decode as
+a valid ELF: 32-bit, little-endian, type EXEC, machine MIPS, entry
+`0x00100008` — the address the Emotion Engine loads a PS2 executable at.
+
+That closes the SIF work. Everything from `docs/sif.md`'s original order of work
+is done, and the console can find, open and read a file on a game disc using the
+BIOS's own file stack.
+
 ### The BIOS patch changes nothing that matters
 
 Everything above was then repeated on the **stock, unpatched** BIOS, and the

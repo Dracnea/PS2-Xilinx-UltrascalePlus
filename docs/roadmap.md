@@ -177,8 +177,21 @@ Getting there needed the whole SIF stack ([sif.md](sif.md)) and one DMA fix:
 block mode took BCR's low half as the entire word count, so a sector transfer
 stopped after a sixteenth of it with no error on either side.
 
-What is *not* done: `FIO_F_READ`. An fd means the console found the file. Reading
-its contents is the next call, and it moves data by a route the open never used.
+And it reads it. `read(fd, ptr, 128)` returns 128 and delivers, to the EE address
+the call named:
+
+```
+464c457f 00010101 00000000 00000000 00080002 00000001 00100008 00000034
+'\x7fELF' ... class 32-bit, little-endian, type EXEC, machine MIPS,
+entry 0x00100008
+```
+
+**Byte-identical to the file on the disc**, and `0x00100008` is where the
+Emotion Engine would begin executing it. The console found the game's executable
+by name, opened it, and read it — through Sony's own `CDVDMAN` and `IOMAN`, on a
+stock BIOS, with the sectors coming out of the card's HBM.
+
+The next thing to do with those bytes is run them, and that needs the EE.
 
 **So: loading a game image is now a real and useful test.**
 It is not playing the game. It is the console proving it can find one.
