@@ -90,6 +90,26 @@ entity iop_dma is
       dev_data      : in  std_logic_vector(31 downto 0) := (others => '0');
       dev_ready     : out std_logic := '0';
 
+      -- device side for channel 10 (SIF1, EE -> IOP).  Unlike every other
+      -- channel the destination and the length are not in MADR and BCR: SIF1
+      -- takes a four-word tag from the head of the stream itself (PCSX2
+      -- Sif1.cpp), so the channel reads the tag before it knows where the data
+      -- goes.  See docs/sif.md.
+      -- Bring-up aid: start channel 10 without a CHCR write.  Whether the BIOS
+      -- ever arms SIF1 is an open question (docs/sif.md), and without this a
+      -- silent channel cannot be told apart from a broken data path.  It is a
+      -- host-driven pulse and nothing in the console uses it.
+      sif1_kick     : in  std_logic := '0';
+
+      sif1_valid    : in  std_logic := '0';
+      sif1_data     : in  std_logic_vector(31 downto 0) := (others => '0');
+      sif1_ready    : out std_logic := '0';
+
+      -- the tag as it was consumed, for the host to check its own framing
+      dbg_sif1_addr : out std_logic_vector(23 downto 0) := (others => '0');
+      dbg_sif1_len  : out std_logic_vector(23 downto 0) := (others => '0');
+      dbg_sif1_tags : out unsigned(15 downto 0) := (others => '0');
+
       -- to the INTC, bit 3
       irq           : out std_logic := '0';
 
@@ -124,12 +144,22 @@ architecture arch of iop_dma is
    signal dmacinten : std_logic_vector(31 downto 0) := (others => '0');
 
    -- transfer engine
-   type t_state is (IDLE, RUN, FINISH);
+   type t_state is (IDLE, SIF1RUN, RUN, FINISH);
    signal state    : t_state := IDLE;
    signal ch       : integer range 0 to 12 := 0;
    signal cur_addr : unsigned(23 downto 0) := (others => '0');
    signal words    : unsigned(23 downto 0) := (others => '0');
    signal decr     : std_logic := '0';
+   signal tagcount : unsigned(15 downto 0) := (others => '0');
+   -- Channel 10 keeps its own state rather than borrowing the engine's.  It is
+   -- armed for long stretches with nothing arriving, and the engine runs one
+   -- transfer at a time: parking it in the shared registers would stop CDVD and
+   -- OTC dead for as long as the EE stayed quiet.
+   signal s1_armed : std_logic := '0';
+   signal s1_phase : std_logic := '0';               -- 0 reading the tag, 1 moving data
+   signal s1_tagw  : integer range 0 to 3 := 0;
+   signal s1_addr  : unsigned(23 downto 0) := (others => '0');
+   signal s1_words : unsigned(23 downto 0) := (others => '0');
 
    function master_flag(en : std_logic_vector(7 downto 0);
                         fl : std_logic_vector(6 downto 0);
@@ -174,6 +204,13 @@ begin
    -- state alone let the device advance faster than the DMA consumed and the
    -- word count never reached zero -- a stall, not a data error.
    dev_ready   <= '1' when (state = RUN and ch = 3 and ram_gnt = '1') else '0';
+   -- "this word is taken", as with dev_ready.  Never asserted without a word
+   -- to take: an unconditional ready would pop the stream while it was empty
+   -- and make every idle cycle look like a transfer.
+   sif1_ready  <= '1' when (state = SIF1RUN and sif1_valid = '1'
+                            and not (s1_phase = '1' and s1_words = 0)
+                            and (s1_phase = '0' or ram_gnt = '1')) else '0';
+   dbg_sif1_tags <= tagcount;
 
    process (clk1x)
       variable idx   : integer range 0 to 12;
@@ -245,6 +282,15 @@ begin
             dicr2_lo <= (others => '0'); dicr2_en <= (others => '0'); dicr2_fl <= (others => '0');
             dmacen <= (others => '0'); dmacinten <= (others => '0');
             state <= IDLE;
+            -- Channel 10's state lives outside the shared engine, so it has to
+            -- be reset explicitly.  Left out, a reset returns every register to
+            -- zero while the channel stays armed mid-tag, and the next word the
+            -- EE sends is read as the middle of a transfer that no longer
+            -- exists.  tagcount is deliberately not cleared: it counts tags
+            -- since the bitstream was loaded, which is what makes it useful
+            -- across a reset.
+            s1_armed <= '0'; s1_phase <= '0'; s1_tagw <= 0;
+            s1_addr  <= (others => '0'); s1_words <= (others => '0');
          else
             -- ------------------------------------------------------- writes
             if (bus_write = '1') then
@@ -285,7 +331,13 @@ begin
                      when 2 =>
                         chcr(idx) <= lanes(chcr(idx), bus2_dataWrite, bus2_writeMask);
                         if (wr(24) = '1' and dpcr2((idx-7)*4+3) = '1') then
-                           start := idx; start_chcr := wr;
+                           if (idx = 10) then
+                              s1_armed <= '1';       -- wait for the EE, off the engine
+                              s1_phase <= '0';
+                              s1_tagw  <= 0;
+                           else
+                              start := idx; start_chcr := wr;
+                           end if;
                         end if;
                      when others => tadr(idx) <= lanes(tadr(idx), bus2_dataWrite, bus2_writeMask);
                   end case;
@@ -315,6 +367,56 @@ begin
                         state <= RUN;                  -- channels with a data path
                      else
                         state <= FINISH;               -- registers only, complete at once
+                     end if;
+                  elsif (sif1_kick = '1') then
+                     s1_armed <= '1';
+                     s1_phase <= '0';
+                     s1_tagw  <= 0;
+                  elsif (s1_armed = '1' and sif1_valid = '1') then
+                     state <= SIF1RUN;                 -- only once there is something
+                  end if;
+
+               when SIF1RUN =>
+                  -- Completion first: the transfer ends on its word count, not
+                  -- on the stream running dry, and the word that follows a
+                  -- finished transfer belongs to the next tag.
+                  if (s1_phase = '1' and s1_words = 0) then
+                     madr(10)    <= x"00" & std_logic_vector(s1_addr);
+                     chcr(10)    <= chcr(10) and x"FEFFFFFF";
+                     dicr2_fl(3) <= '1';               -- channel 10 -> DICR2 bit 3
+                     s1_armed    <= '0';
+                     s1_phase    <= '0';
+                     s1_tagw     <= 0;
+                     state       <= IDLE;
+                  elsif (sif1_valid = '0') then
+                     state <= IDLE;                    -- yield; keep what we have
+                  elsif (s1_phase = '0') then
+                     -- Four words: the IOP address, the length, then the EE's
+                     -- own DMA tag, which is the EE's business and not ours.
+                     -- The masks are PCSX2's: 24 bits of address, and a length
+                     -- whose low two bits are dropped.
+                     case s1_tagw is
+                        when 0 =>
+                           s1_addr       <= unsigned(sif1_data(23 downto 0));
+                           dbg_sif1_addr <= sif1_data(23 downto 0);
+                        when 1 =>
+                           s1_words     <= unsigned(sif1_data(23 downto 0)) and x"0FFFFC";
+                           dbg_sif1_len <= std_logic_vector(unsigned(sif1_data(23 downto 0)) and x"0FFFFC");
+                        when others => null;
+                     end case;
+                     if (s1_tagw = 3) then
+                        tagcount <= tagcount + 1;
+                        s1_phase <= '1';
+                     else
+                        s1_tagw <= s1_tagw + 1;
+                     end if;
+                  else
+                     ram_req   <= '1';
+                     ram_addr  <= std_logic_vector(s1_addr);
+                     ram_wdata <= sif1_data;
+                     if (ram_gnt = '1') then
+                        s1_words <= s1_words - 1;
+                        s1_addr  <= s1_addr + 4;       -- a tag address only counts up
                      end if;
                   end if;
 

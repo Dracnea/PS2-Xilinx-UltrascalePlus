@@ -85,6 +85,15 @@ entity iop_top is
       dma_dbg_bcr   : out std_logic_vector(31 downto 0);
       dma_dbg_chcr  : out std_logic_vector(31 downto 0);
       dma_dbg_tadr  : out std_logic_vector(31 downto 0);
+
+      -- SIF1: the EE's half of the stream, driven by the host
+      sif1_kick     : in  std_logic := '0';
+      sif1_valid    : in  std_logic := '0';
+      sif1_data     : in  std_logic_vector(31 downto 0) := (others => '0');
+      sif1_ready    : out std_logic;
+      sif1_dbg_addr : out std_logic_vector(23 downto 0);
+      sif1_dbg_len  : out std_logic_vector(23 downto 0);
+      sif1_dbg_tags : out unsigned(15 downto 0);
       -- POST register (0x1F802070): what the boot code says about its progress
       post_code  : out std_logic_vector(7 downto 0) := (others => '0');
       post_wr    : out std_logic := '0';
@@ -851,6 +860,13 @@ begin
       dbg_channel    => open,
       dbg_words      => open,
       dbg_running    => open,
+      sif1_kick      => sif1_kick,
+      sif1_valid     => sif1_valid,
+      sif1_data      => sif1_data,
+      sif1_ready     => sif1_ready,
+      dbg_sif1_addr  => sif1_dbg_addr,
+      dbg_sif1_len   => sif1_dbg_len,
+      dbg_sif1_tags  => sif1_dbg_tags,
       dbg_sel        => dma_dbg_sel,
       dbg_madr       => dma_dbg_madr,
       dbg_bcr        => dma_dbg_bcr,
