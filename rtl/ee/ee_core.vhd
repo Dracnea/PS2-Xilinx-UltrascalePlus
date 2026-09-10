@@ -255,6 +255,17 @@ architecture arch of ee_core is
    signal w_pc      : unsigned(31 downto 0) := (others => '0');
    signal w_we      : std_logic := '0';
    signal w_rd      : integer range 0 to 31 := 0;
+
+   -- Forward selects, decided a cycle early.  "Does A2 write the register A1
+   -- is about to read" compares two register outputs, so it does not have to
+   -- be asked in A1: both operands of the compare are known at the end of the
+   -- previous cycle, once the stage advances have been decided.  Resolving it
+   -- there and registering the answer takes the comparator, and the wide
+   -- fan-out of its output, off the path that runs mux -> ALU -> A1/A2 latch.
+   -- fa_* selects the A operand, fb_* the B; _m from the A1/A2 latch, _w from
+   -- the A2/WB latch.  Each already folds in valid, write-enable and rd /= 0.
+   signal fa_m, fb_m : std_logic := '0';
+   signal fa_w, fb_w : std_logic := '0';
    signal w_val     : std_logic_vector(127 downto 0) := (others => '0');
    signal w_w128    : std_logic := '0';
    signal w_p1      : std_logic := '0';
@@ -440,6 +451,14 @@ begin
 
       -- stage handshakes
       variable a2_adv, a1_adv, id_adv  : boolean;
+      -- Shadows of the latch fields the forward selects compare.  Each is
+      -- written wherever its signal is, in the same order, so that at the end
+      -- of the process it holds exactly what the signal will hold next cycle.
+      variable n_d_rs, n_d_rt          : integer range 0 to 31;
+      variable n_m_valid, n_m_we       : std_logic;
+      variable n_m_rd                  : integer range 0 to 31;
+      variable n_w_valid, n_w_we       : std_logic;
+      variable n_w_rd                  : integer range 0 to 31;
       variable kill_id                 : boolean;
       variable exc_now, eret_now       : boolean;
       variable br_leaving              : boolean;
@@ -508,7 +527,22 @@ begin
             ex_cnt     <= 0;
             d_read     <= '0';
             d_write    <= '0';
+            fa_m       <= '0';
+            fb_m       <= '0';
+            fa_w       <= '0';
+            fb_w       <= '0';
          else
+
+            -- The shadows start as "unchanged", and every assignment to one of
+            -- the real latch fields below is mirrored onto its shadow.
+            n_d_rs    := d_rs;
+            n_d_rt    := d_rt;
+            n_m_valid := m_valid;
+            n_m_we    := m_we;
+            n_m_rd    := m_rd;
+            n_w_valid := w_valid;
+            n_w_we    := w_we;
+            n_w_rd    := w_rd;
 
             -- ============================================================
             -- A2: can the instruction in the A1/A2 latch leave this cycle?
@@ -557,25 +591,21 @@ begin
             -- prevent ever needing.
             a128 := d_a;
             b128 := d_b;
-            if w_valid = '1' and w_we = '1' and w_rd /= 0 then
-               if w_rd = d_rs then
-                  if w_w128 = '1' then a128 := w_val;
-                  else a128 := a128(127 downto 64) & w_val(63 downto 0); end if;
-               end if;
-               if w_rd = d_rt then
-                  if w_w128 = '1' then b128 := w_val;
-                  else b128 := b128(127 downto 64) & w_val(63 downto 0); end if;
-               end if;
+            if fa_w = '1' then
+               if w_w128 = '1' then a128 := w_val;
+               else a128 := a128(127 downto 64) & w_val(63 downto 0); end if;
             end if;
-            if m_valid = '1' and m_we = '1' and m_rd /= 0 then
-               if m_rd = d_rs then
-                  if m_w128 = '1' then a128 := m_val;
-                  else a128 := a128(127 downto 64) & m_val(63 downto 0); end if;
-               end if;
-               if m_rd = d_rt then
-                  if m_w128 = '1' then b128 := m_val;
-                  else b128 := b128(127 downto 64) & m_val(63 downto 0); end if;
-               end if;
+            if fb_w = '1' then
+               if w_w128 = '1' then b128 := w_val;
+               else b128 := b128(127 downto 64) & w_val(63 downto 0); end if;
+            end if;
+            if fa_m = '1' then
+               if m_w128 = '1' then a128 := m_val;
+               else a128 := a128(127 downto 64) & m_val(63 downto 0); end if;
+            end if;
+            if fb_m = '1' then
+               if m_w128 = '1' then b128 := m_val;
+               else b128 := b128(127 downto 64) & m_val(63 downto 0); end if;
             end if;
             -- Everything but MMI defines only the low 64 bits, so the ALU below
             -- reads the halves it always did and the upper half travels
@@ -1064,10 +1094,10 @@ begin
             -- A2 -> WB
             -- ============================================================
             if a2_adv then
-               w_valid  <= m_valid;
+               w_valid  <= m_valid;   n_w_valid := m_valid;
                w_pc     <= m_pc;
-               w_we     <= m_we;
-               w_rd     <= m_rd;
+               w_we     <= m_we;      n_w_we    := m_we;
+               w_rd     <= m_rd;      n_w_rd    := m_rd;
                w_w128   <= m_w128;
                w_p1     <= m_p1;
                w_exc     <= m_exc;
@@ -1157,7 +1187,7 @@ begin
                d_read  <= '0';
                d_write <= '0';
             else
-               w_valid <= '0';
+               w_valid <= '0';        n_w_valid := '0';
                w_exc   <= '0';
                w_eret  <= '0';
             end if;
@@ -1167,10 +1197,10 @@ begin
             -- ============================================================
             if a2_adv then
                if a1_adv then
-                  m_valid  <= d_valid;
+                  m_valid  <= d_valid;   n_m_valid := d_valid;
                   m_pc     <= d_pc;
-                  m_we     <= ex_we;
-                  m_rd     <= ex_rd;
+                  m_we     <= ex_we;     n_m_we    := ex_we;
+                  m_rd     <= ex_rd;     n_m_rd    := ex_rd;
                   m_val    <= ex_valhi & ex_val;
                   m_w128   <= ex_w128;
                   m_p1     <= ex_p1;
@@ -1229,10 +1259,10 @@ begin
                      traps <= traps + 1;
                   end if;
                else
-                  m_valid <= '0';
+                  m_valid <= '0';        n_m_valid := '0';
                   m_ismem <= '0';
                   m_unal  <= '0';
-                  m_we    <= '0';
+                  m_we    <= '0';        n_m_we    := '0';
                   m_hi_we <= '0';
                   m_lo_we <= '0';
                   m_take  <= '0';
@@ -1335,11 +1365,11 @@ begin
                -- alone stops the *next* one and lets this one retire behind the
                -- exception.  Precise means nothing younger commits, so w_valid
                -- has to be cancelled here as well.
-               w_valid  <= '0';
+               w_valid  <= '0';       n_w_valid := '0';
                w_exc    <= '0';
                w_eret   <= '0';
                d_valid  <= '0';
-               m_valid  <= '0';
+               m_valid  <= '0';       n_m_valid := '0';
                m_ismem  <= '0';
                m_exc    <= '0';
                m_eret   <= '0';
@@ -1408,8 +1438,8 @@ begin
                   d_ir    <= id_ir;
                   d_a     <= id_a;
                   d_b     <= id_b;
-                  d_rs    <= id_rs;
-                  d_rt    <= id_rt;
+                  d_rs    <= id_rs;      n_d_rs := id_rs;
+                  d_rt    <= id_rt;      n_d_rt := id_rt;
                   -- a delay slot either follows the branch immediately, or the
                   -- branch left earlier and bubbles have been going in since
                   if br_leaving or bd_pend = '1' then
@@ -1515,6 +1545,22 @@ begin
             outst   <= vouts;
             drop    <= vdrop;
             resp_pc <= vresp;
+
+            -- Every latch field the forward selects depend on has now been
+            -- decided, so the comparisons A1 would otherwise make next cycle
+            -- can be made here instead and handed over already resolved.  A2
+            -- is checked after WB so that the younger writer still wins: an
+            -- fa_m of '1' overrides fa_w in A1 exactly as the nested ifs did.
+            fa_m <= '0';  fb_m <= '0';
+            fa_w <= '0';  fb_w <= '0';
+            if n_w_valid = '1' and n_w_we = '1' and n_w_rd /= 0 then
+               if n_w_rd = n_d_rs then fa_w <= '1'; end if;
+               if n_w_rd = n_d_rt then fb_w <= '1'; end if;
+            end if;
+            if n_m_valid = '1' and n_m_we = '1' and n_m_rd /= 0 then
+               if n_m_rd = n_d_rs then fa_m <= '1'; end if;
+               if n_m_rd = n_d_rt then fb_m <= '1'; end if;
+            end if;
          end if;
       end if;
    end process;

@@ -229,7 +229,8 @@ says the earlier attribution was built on a comparison that did not hold.
 | …plus exceptions (current) | 228.2 MHz |
 | current with only the exception redirect removed | 250.9 MHz |
 | **the redirect registered instead of removed** | **255.3 MHz** |
-| MMI SIMD, and the datapath widened to 128 bits | **234.5 MHz** |
+| MMI SIMD, and the datapath widened to 128 bits | 234.5 MHz |
+| **forward selects precomputed a cycle early** | **283.5 MHz** |
 
 The 252.1 figure was measured **before MMI and COP0 were added**, and neither of
 those was re-measured, so "252.1 → 228.2" spanned three changes rather than one.
@@ -760,16 +761,73 @@ The trace now prints all 128 bits. It had to: a trace showing only the low 64
 would call two different machine states identical, which is precisely the bug
 this instruction group could introduce.
 
-**It cost 8% of the clock — 255.3 down to 234.5 MHz** — and that is the
-forwarding mux doubling in width on the path that was already critical. The
-mitigation is known but not applied: only MMI consumes the upper half, so the
-upper 64 bits do not need the same single-cycle forwarding network as the lower.
-A separate, slower path for them would leave the critical path at its old width.
-That is the same shape as the exception redirect, which also cost about 9% until
-it was given a cycle it did not need to save.
+**It cost 8% of the clock — 255.3 down to 234.5 MHz.** The obvious explanation
+was that the forwarding mux had doubled in width on the path that was already
+critical, and the obvious mitigation followed: only MMI consumes the upper half,
+so the upper 64 bits do not need the lower half's single-cycle forwarding
+network. That reasoning was recorded here as the next thing to do.
+
+**It was wrong, and the timing report said so.** See below.
 
 208 differential runs pass, and the cross-check against birdybro/PS2_fpga is
 clean.
+
+### The forward select, decided a cycle early — 283.5 MHz
+
+Before implementing the mitigation above, the critical path was read rather than
+assumed — the second time in this file that a plausible hypothesis about timing
+has not survived contact with the report, and the second time that reading it
+first would have saved the work:
+
+```
+Slack (VIOLATED): -0.875ns
+  Source:       m_rd_reg[2]/C
+  Destination:  m_val_reg[51]/D
+  Data Path Delay: 4.260ns  (logic 1.449ns 34%   route 2.811ns 66%)
+  Logic Levels: 11
+```
+
+The destination is `m_val[51]` — in the **lower** half. The upper half is not on
+the critical path at all, so the recorded mitigation would have bought nothing.
+What the widening actually cost is *routing*: two thirds of the delay is wire,
+on nets with fan-outs of 102 and 79. Those are the forward-select comparators,
+and doubling the datapath doubled how far their outputs have to travel.
+
+The path begins at `m_rd` — the A1/A2 latch's destination register number — and
+runs through a comparator against `d_rs`/`d_rt` before it even reaches the mux
+that the ALU is waiting on. **Both operands of that comparison are register
+outputs.** "Does the instruction in A2 write the register A1 is about to read"
+therefore does not have to be asked in A1: it can be answered at the end of the
+previous cycle, once the stage advances are decided, and handed over already
+resolved.
+
+That is what `fa_m`, `fb_m`, `fa_w` and `fb_w` are. Each folds in valid,
+write-enable and `rd /= 0`, so A1's forwarding is four `if`s on a registered bit
+instead of two nested comparisons. The comparator and its fan-out leave the
+critical path entirely.
+
+Keeping it correct is a bookkeeping problem, because the selects must compare
+what the latches will hold *next* cycle, and the latch fields are written from
+half a dozen places — the normal advance, the bubble, the exception flush, the
+redirect. Each of those now mirrors its assignment onto a shadow variable, in
+program order. Signals and variables both take last-write-wins in program order,
+so the shadow ends the process holding exactly what the signal will hold, and
+the selects are computed from the shadows as the last thing the process does.
+
+| build | Fmax |
+| --- | --- |
+| MMI SIMD, datapath widened to 128 bits | 234.5 MHz |
+| **forward selects precomputed** | **283.5 MHz** |
+
+**+21%, and above the 255.3 MHz the core managed before it was ever widened.**
+The 128-bit datapath is now free. 72 differential runs pass across the latency
+matrix and every directed suite.
+
+The lesson is the same one the divider and the exception redirect both taught,
+and it is worth stating plainly because I have now got it wrong twice: *read the
+timing report before forming a hypothesis about timing.* Both wrong guesses were
+plausible, both concerned the right general area, and both would have cost a day
+of work for nothing.
 
 ### A store an exception could not take back
 

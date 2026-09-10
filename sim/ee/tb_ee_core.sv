@@ -132,6 +132,18 @@ module tb_ee_core;
       if (!$value$plusargs("steps=%d", steps))     steps = 64;
       void'($value$plusargs("ilat=%d", ilat));
       void'($value$plusargs("dlat=%d", dlat));
+      // The delay lines below are read at [lat-1], so a latency of zero indexes
+      // off the end and quietly delivers X -- which reaches the core as an
+      // instruction that never decodes and presents as "STALLED after 0 of N",
+      // exactly like a fetch unit that cannot start.  It is a limit of this
+      // harness and not of the core: a memory that answers combinationally is
+      // not a thing the fetch unit is asked to talk to.  Say so rather than let
+      // the next reader spend an afternoon on it.
+      if (ilat < 1 || dlat < 1) begin
+         $display("# tb_ee_core: ilat and dlat must be at least 1 (got %0d, %0d)",
+                  ilat, dlat);
+         $finish;
+      end
       for (n = 0; n < MEMBYTES; n = n + 1) mem[n] = 8'h00;
       for (n = 0; n < MAXL; n = n + 1) begin ipd[n] = 32'h0; ipv[n] = 1'b0; end
       $readmemh(progfile, memwords);

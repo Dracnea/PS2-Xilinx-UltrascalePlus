@@ -15,6 +15,17 @@ while [[ $# -gt 0 ]]; do case $1 in
   --ilat) ILAT=$2; shift 2;; --dlat) DLAT=$2; shift 2;;
   *) echo "unknown: $1" >&2; exit 2;; esac; done
 
+# The testbench's memories are delay lines read at [lat-1], so a latency of zero
+# is not a faster memory but an out-of-range index: the core is handed an
+# instruction of X, never decodes it, and reports "STALLED after 0 of N" --
+# which is indistinguishable from a fetch unit that cannot start.  Refuse it
+# here so that the run says what is wrong instead of blaming the core.
+if [[ ${ILAT:-1} -lt 1 || ${DLAT:-1} -lt 1 ]]; then
+  echo "ilat and dlat must be at least 1: a memory that answers in the same" >&2
+  echo "cycle is not something the fetch unit is built to talk to" >&2
+  exit 2
+fi
+
 command -v xvhdl >/dev/null 2>&1 || . "$HOME/Xilinx/2026.1/Vivado/settings64.sh"
 W="$HERE/work/$$"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
 
