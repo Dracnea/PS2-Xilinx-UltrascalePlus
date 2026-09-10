@@ -35,6 +35,9 @@ import argparse, sys
 
 M64 = (1 << 64) - 1
 M32 = (1 << 32) - 1
+# The R5900's processor identifier, which the BIOS reads to tell an EE from an
+# IOP.  Implementation 0x2E, revision 0x20.
+PRID = 0x00002E20
 
 
 def s64(x):
@@ -77,6 +80,15 @@ class R5900:
         # relatives are the ordinary multiply and divide aimed at HI1/LO1, so a
         # compiler can keep two multiply chains in flight without spilling.
         self.hi1 = self.lo1 = 0
+        # COP0, the system control coprocessor: 32 registers of 32 bits.  This
+        # slice is the register file and MFC0/MTC0 only.  Count is deliberately
+        # *not* free-running here, because this model has no notion of time and
+        # a counter that advanced would make every trace disagree with the RTL
+        # for a reason that has nothing to do with either being wrong.  The
+        # timer behaviour belongs with the exception path, which is where a
+        # cycle count starts to mean something.
+        self.cop0 = [0] * 32
+        self.cop0[15] = PRID          # PRId is read-only and identifies the core
         self.mem = mem
         self.traps = []
         self.delay = None            # (target_pc,) pending after the delay slot
@@ -167,6 +179,16 @@ class R5900:
             a = (s64(self.r(rs)) + simm) & M64
             n = {40: 1, 41: 2, 43: 4, 63: 8}[op]
             self.mem.store(a, n, self.r(rt))
+        elif op == 16:                                  # COP0
+            if rs == 0:                                 # MFC0
+                self.w(rt, sext32(self.cop0[rd] & M32))
+            elif rs == 4:                               # MTC0
+                if rd != 15:                            # PRId is read-only
+                    self.cop0[rd] = self.r(rt) & M32
+            else:
+                # rs == 16 is the CO forms -- TLBR, TLBWI, ERET and the rest --
+                # which belong with the exception path, not here.
+                self.traps.append(("unimplemented COP0 rs %d" % rs, self.pc - 4))
         elif op == 28:                                  # MMI
             if fn in (16, 17, 18, 19, 24, 25, 26, 27):
                 # the same operations as SPECIAL, on the second HI/LO pair

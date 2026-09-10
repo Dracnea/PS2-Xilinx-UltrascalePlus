@@ -191,6 +191,37 @@ for y in range(0, 8):
 check("shared edge drawn twice", both, 0)
 check("shared edge left a gap", missed, 0)
 
+# Sub-pixel edges pin the sampling convention down.  These vertices are given
+# in raw 12.4 fixed point so an edge can sit at half a pixel: with the ceil rule
+# the left edge at x = 0.5 starts the span at pixel 1, and pixel 0 is not
+# covered.  Sampling at pixel centres instead would put the centre of pixel 0 at
+# exactly 0.5, on the edge, and a rule that included it would paint a column the
+# hardware does not.  No self-consistency test can tell those apart -- a rule
+# shifted by half a pixel still tiles perfectly -- so it takes a case like this.
+def tri_raw(fx_verts, colour):
+    setup = [ad(0x4C, 0 | (1 << 16)), ad(0x18, 0),
+             ad(0x40, 0 | (639 << 16) | (0 << 32) | (447 << 48)),
+             ad(0x00, 3), ad(0x01, colour)]
+    regs = 0
+    for i in range(len(setup)):
+        regs |= 0xE << (4 * i)
+    out = [giftag(1, 0, regs, len(setup))] + setup
+    vregs = 0
+    for i in range(3):
+        vregs |= 0xE << (4 * i)
+    out += [giftag(1, 1, vregs, 3)]
+    out += [ad(0x05, (x & 0xFFFF) | ((y & 0xFFFF) << 16)) for x, y in fx_verts]
+    return out
+
+# left edge at x = 0.5 px (fixed 8), spanning y = 0..4 px
+g = run(tri_raw([(8, 0), (8 + 4 * 16, 0), (8, 4 * 16)], 0x55555555))
+a = gs_ref.addr32p(0, 1, 0, 0)
+if int.from_bytes(g.vm[a * 4:a * 4 + 4], "little") != 0:
+    fails.append("half-pixel left edge painted pixel 0: sampling at centres, not origins")
+a = gs_ref.addr32p(0, 1, 1, 0)
+if int.from_bytes(g.vm[a * 4:a * 4 + 4], "little") == 0:
+    fails.append("half-pixel left edge missed pixel 1")
+
 # a degenerate triangle has no area and must draw nothing
 g = run(tri_prog([(2, 2), (6, 2), (4, 2)], 0x33333333))
 check("degenerate triangle", g.pixels, 0)

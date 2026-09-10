@@ -23,6 +23,12 @@ here rather than transcribed from somebody else's source.
 tools/gs/xcheck_swizzle.py checks it against PCSX2's tables exhaustively.
 """
 import argparse
+from fractions import Fraction
+
+def _ceil(q):
+    """ceil for an exact rational, without going through float."""
+    return -((-q.numerator) // q.denominator)
+
 
 VM_WORDS   = 4 * 1024 * 1024 // 4     # 4 MB of local memory, in 32-bit words
 PAGE_WORDS = 8192 // 4                # a page is 8 KB
@@ -156,23 +162,30 @@ class GS:
     def draw_triangle(self, v0, v1, v2):
         """A flat-shaded triangle in PSMCT32.
 
-        **The fill rule here is provisional.**  Which pixels a triangle covers
-        along a shared edge is decided by a rule, not by the geometry, and the
-        GS has its own -- it rasterises with a DDA rather than with edge
-        functions, and the two agree in the interior and can differ by a pixel
-        along an edge.  Getting that wrong shows up as seams between adjacent
-        triangles, which is exactly the kind of fault that looks like a texture
-        problem for a week.
+        The fill rule matters more than the geometry does.  Which pixels a
+        triangle covers along a shared edge is decided by a convention, and
+        getting it wrong shows up as seams between adjacent triangles, which is
+        the kind of fault that looks like a texture problem for a week.
 
-        So this implements the standard top-left rule on edge functions
-        evaluated at pixel centres, it is written down as an assumption rather
-        than a fact, and **no RTL is built against it** until it has been
-        checked against PCSX2's software renderer frame for frame.  The
-        interior is not in doubt; only the boundary is.
+        **Sample points are at pixel origins, not pixel centres.**  That was
+        settled by reading PCSX2's software rasteriser rather than by guessing:
+        it takes `ceil` of the scanline bounds and `ceil` of each scanline's x
+        span, and evaluates the edges *at* the integer scanline -- so a pixel
+        (x, y) is covered when ceil(left) <= x < ceil(right) and
+        ceil(top) <= y < ceil(bottom).  A half-open interval on ceil is exactly
+        sampling the point (x, y) itself, with the left and top edges inclusive
+        and the right and bottom edges exclusive.  The first version of this
+        function sampled at (x + 0.5, y + 0.5) and was therefore shifted half a
+        pixel against the hardware everywhere -- an error no self-consistency
+        test can find, because a shifted rule still tiles perfectly.
+
+        Frame-by-frame comparison against PCSX2 is still the stronger check and
+        is still owed; this settles the convention, not every corner of it.
 
         Flat shading takes the colour of the *last* vertex, which is what the
         manual specifies when IIP is 0.  Gouraud, Z, texture and alpha are all
         later blocks.
+
         """
         c = self.ctx()
         frame = self.reg[0x4C + c]
@@ -185,49 +198,38 @@ class GS:
         fbmsk = bits(frame, 63, 32)
         ofx, ofy = bits(xyoff, 15, 0), bits(xyoff, 47, 32)
 
-        # window coordinates, still in 12.4 so the edge tests keep the fraction
-        p = [((v[0] - ofx), (v[1] - ofy)) for v in (v0, v1, v2)]
-
-        def edge(a, b, x, y):
-            return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
-
-        area = edge(p[0], p[1], p[2][0], p[2][1])
-        if area == 0:
-            return                      # degenerate: no area, no pixels
-        if area < 0:                    # normalise the winding
-            p = [p[0], p[2], p[1]]
-            area = -area
+        # Pixel space, as exact rationals.  The hardware coordinates are 12.4
+        # fixed point and the rule below is stated in terms of ceil, so doing
+        # the arithmetic in floating point would put the answer at the mercy of
+        # rounding in exactly the cases the rule exists to settle.
+        P = [(Fraction(v[0] - ofx, 16), Fraction(v[1] - ofy, 16))
+             for v in (v0, v1, v2)]
+        ys = [q[1] for q in P]
+        if min(ys) == max(ys):
+            return                      # zero height: no scanline can be inside
 
         sx0, sx1 = bits(sciss, 10, 0), bits(sciss, 26, 16)
         sy0, sy1 = bits(sciss, 42, 32), bits(sciss, 58, 48)
-        xlo = max(min(q[0] for q in p) >> 4, sx0)
-        xhi = min(max(q[0] for q in p) >> 4, sx1)
-        ylo = max(min(q[1] for q in p) >> 4, sy0)
-        yhi = min(max(q[1] for q in p) >> 4, sy1)
-
-        def top_left(a, b):
-            """True if edge a->b is a top or a left edge, which are inclusive."""
-            if b[1] == a[1]:
-                return b[0] < a[0]      # a top edge runs right to left
-            return b[1] < a[1]          # a left edge runs upward
-
-        incl = [top_left(p[0], p[1]), top_left(p[1], p[2]), top_left(p[2], p[0])]
+        ytop = max(_ceil(min(ys)), sy0)
+        ybot = min(_ceil(max(ys)) - 1, sy1)
         rgba = v2[3] & 0xFFFFFFFF
 
-        for yy in range(ylo, yhi + 1):
-            cy = (yy << 4) + 8          # the pixel centre, in 12.4
-            for xx in range(xlo, xhi + 1):
-                cx = (xx << 4) + 8
-                e = (edge(p[0], p[1], cx, cy),
-                     edge(p[1], p[2], cx, cy),
-                     edge(p[2], p[0], cx, cy))
-                inside = True
-                for k in range(3):
-                    if e[k] < 0 or (e[k] == 0 and not incl[k]):
-                        inside = False
-                        break
-                if not inside:
-                    continue
+        for yy in range(ytop, ybot + 1):
+            y = Fraction(yy)
+            # An edge spans this scanline on a half-open interval, so a vertex
+            # belongs to exactly one of the two edges meeting there and the
+            # count below is always zero or two.
+            xs = []
+            for a, b in ((P[0], P[1]), (P[1], P[2]), (P[0], P[2])):
+                lo, hi = (a, b) if a[1] < b[1] else (b, a)
+                if lo[1] <= y < hi[1]:
+                    xs.append(lo[0] + (hi[0] - lo[0]) * (y - lo[1])
+                              / (hi[1] - lo[1]))
+            if len(xs) < 2:
+                continue
+            left  = max(_ceil(min(xs)), sx0)
+            right = min(_ceil(max(xs)) - 1, sx1)
+            for xx in range(left, right + 1):
                 a = addr32p(fbp, fbw, xx, yy)
                 if a >= VM_WORDS:
                     continue

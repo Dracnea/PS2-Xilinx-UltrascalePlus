@@ -151,26 +151,47 @@ Each of those is a later block, and drawing them wrongly now would be worse
 than not drawing them: a wrong pixel that appears is much harder to notice than
 one that never arrives.
 
-## The triangle, in the reference only — 2026-09-10
+## The triangle, and the fill rule — 2026-09-10
 
-`gs_ref.py` now rasterises flat-shaded triangles, including strips and fans.
-**No RTL is built against it yet, deliberately.**
+`gs_ref.py` rasterises flat-shaded triangles, including strips and fans.
 
-Which pixels a triangle covers *along a shared edge* is decided by a rule, not
-by the geometry, and the GS has its own: it rasterises with a DDA rather than
-with edge functions, and the two agree in the interior while differing by a
-pixel at the boundary. Getting that wrong produces seams between adjacent
-triangles, which is the kind of fault that looks like a texture problem for a
-week. So the reference implements the standard top-left rule on edge functions
-at pixel centres, that is written down as an assumption rather than a fact, and
-the RTL waits until it has been checked against PCSX2's software renderer.
+### The rule, settled
 
-What the tests can establish without knowing the GS's rule is that this one is
-*self-consistent*: two triangles sharing a diagonal tile a square exactly, every
-pixel covered once, none twice and none missed. A degenerate triangle draws
-nothing, a strip reuses its last two vertices, and no pixel lands outside the
-hypotenuse. Those hold whichever rule turns out to be right; the boundary
-against the real hardware is the open question.
+The first version was written as an explicit assumption — the standard top-left
+rule on edge functions sampled at **pixel centres** — and marked as needing
+verification before any RTL was built on it. That caution was justified: it was
+wrong, and wrong in a way no self-consistency test could ever have caught.
+
+PCSX2's software rasteriser settles it. It takes `ceil` of the scanline bounds
+(`y0011.xzxz(y1221).ceil()`) and `ceil` of each scanline's x span
+(`GSVector4 lrf = xy.ceil()`), and it evaluates the edges *at* the integer
+scanline. A half-open interval on `ceil` is exactly **sampling the point (x, y)
+itself** — the pixel origin, not its centre — with left and top edges inclusive
+and right and bottom exclusive:
+
+    covered  ⟺  ceil(left) ≤ x < ceil(right)  and  ceil(top) ≤ y < ceil(bottom)
+
+So the reference now walks scanlines with `ceil` bounds, in **exact rational
+arithmetic** rather than floating point: the rule is stated in terms of `ceil`,
+and doing the arithmetic in floats would put the answer at the mercy of rounding
+in precisely the cases the rule exists to settle.
+
+**A rule shifted by half a pixel still tiles perfectly.** The tiling test passed
+under the wrong convention and under the right one, and would have passed under
+any consistent rule. What distinguishes them is a sub-pixel edge, so there is
+now a test with a left edge at x = 0.5: the ceil rule starts the span at pixel 1
+and leaves pixel 0 alone, where centre sampling would have painted a column the
+hardware does not. That test is the one that fails if the convention drifts.
+
+Frame-by-frame comparison against PCSX2 is still the stronger check and is still
+owed — this settles the convention, not every corner of it. Synthesising a `.gs`
+dump to get golden frames was investigated and deferred: the format embeds a
+versioned GS freeze-state blob, and getting its layout subtly wrong would
+produce *wrong* reference frames, which is worse than having none.
+
+The other properties hold as before: two triangles sharing a diagonal tile a
+square exactly, a degenerate triangle draws nothing, a strip reuses its last two
+vertices, and nothing lands outside the hypotenuse.
 
 ## What is not started
 

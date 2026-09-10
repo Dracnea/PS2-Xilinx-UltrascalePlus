@@ -44,6 +44,16 @@ def gen(rng, n, branches):
             op = rng.choice([32, 33, 35, 36, 37, 39, 55])
             off = SCRATCH + rng.randrange(0, 0x400, 8)
             out.append((op << 26) | (0 << 21) | (rd << 16) | (off & 0xFFFF))
+        elif pick < 0.90:                                  # COP0 moves
+            # MTC0 then MFC0 on the same register are what make COP0 state
+            # observable at all, so both are generated and the distance between
+            # them is left to chance -- which is the point, since the forwarding
+            # distance is what a COP0 file without forwarding gets wrong.
+            cr = rng.randrange(32)
+            if rng.randrange(2):
+                out.append((16 << 26) | (4 << 21) | (rt << 16) | (cr << 11))
+            else:
+                out.append((16 << 26) | (0 << 21) | (rd << 16) | (cr << 11))
         elif pick < 0.94:                                  # MMI pipeline-1
             # MULT1, MULTU1, DIV1, DIVU1, MFHI1, MFLO1, MTHI1, MTLO1: the same
             # operations as their SPECIAL counterparts, on the second HI/LO

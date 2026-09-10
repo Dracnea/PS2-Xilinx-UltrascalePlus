@@ -599,11 +599,40 @@ value between invocations, so the read did not merely default — it used the
 before the operands, and the flag is assigned unconditionally rather than reset
 with the other defaults further down.
 
+## COP0, the register file — 2026-09-10
+
+`MFC0` and `MTC0`, and the 32 registers behind them. That is the whole slice:
+the exception path, the TLB and the `CO` forms — `TLBR`, `TLBWI`, `ERET` — are
+not here, and are counted as traps rather than guessed at.
+
+Two decisions worth recording.
+
+**`Count` does not run.** On hardware it is a free-running cycle counter, and
+that is exactly why it is absent: the reference models no timing, so a counter
+that advanced would make every trace disagree with the RTL for a reason that has
+nothing to do with either being wrong. It belongs with the exception path, which
+is where a cycle count starts to mean something.
+
+**`PRId` is read-only** and reads `0x00002E20`, which is how the BIOS tells an EE
+from an IOP. A write to it must not take, and the directed test checks that
+rather than assuming it.
+
+COP0 state is only observable through a GPR, so every test is `MTC0` followed by
+`MFC0` — which makes the *distance* between them the thing that matters, exactly
+as it does for HI and LO. At distance 1 the value comes from A2, at 2 from WB,
+and at 3 or more from the register file, so `sim/ee/gen_cop0.py` writes and reads
+back every register at each distance. A COP0 file without forwarding passes any
+test that spaces the pair apart, which is why the random generator emits the two
+independently and lets the distance fall where it may.
+
+200 differential runs pass.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. MMI, the
-FPU, the VUs. And the integer subset itself is not complete: no COP0, no
-exceptions, no `LQ`/`SQ`, and none of MMI's SIMD instructions — only the
+FPU, the VUs. And the integer subset itself is not complete: no
+exceptions, no TLB and no `ERET`, no `LQ`/`SQ`, and none of MMI's SIMD
+instructions — only the
 pipeline-1 forms that share the SPECIAL encodings. The unaligned group — `LWL`, `LWR`, `SWL`, `SWR`,
 `LDL`, `LDR`, `SDL`, `SDR` — is done.
 

@@ -115,6 +115,15 @@ architecture arch of ee_core is
    -- why the decode below reuses the same arms rather than duplicating them --
    -- duplicated arms are how the second pair would quietly drift from the first.
    signal hi1, lo1 : std_logic_vector(63 downto 0) := (others => '0');
+
+   -- COP0, the system control coprocessor: 32 registers of 32 bits.  This slice
+   -- is the register file and MFC0/MTC0 only.  Count is deliberately not
+   -- free-running: the reference has no notion of time, and a counter that
+   -- advanced would make every trace disagree for a reason unrelated to either
+   -- side being wrong.  The timer belongs with the exception path.
+   constant PRID : std_logic_vector(31 downto 0) := x"00002E20";
+   type cop0_t is array (0 to 31) of std_logic_vector(31 downto 0);
+   signal cop0 : cop0_t := (15 => PRID, others => (others => '0'));
    signal traps  : unsigned(15 downto 0) := (others => '0');
 
    -- ---- IF -----------------------------------------------------------------
@@ -181,6 +190,9 @@ architecture arch of ee_core is
    signal m_rd      : integer range 0 to 31 := 0;
    signal m_val     : std_logic_vector(63 downto 0) := (others => '0');
    signal m_p1      : std_logic := '0';
+   signal m_c0_we   : std_logic := '0';
+   signal m_c0_idx  : integer range 0 to 31 := 0;
+   signal m_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
    signal m_hi_we   : std_logic := '0';
    signal m_lo_we   : std_logic := '0';
    signal m_hi      : std_logic_vector(63 downto 0) := (others => '0');
@@ -207,6 +219,9 @@ architecture arch of ee_core is
    signal w_rd      : integer range 0 to 31 := 0;
    signal w_val     : std_logic_vector(63 downto 0) := (others => '0');
    signal w_p1      : std_logic := '0';
+   signal w_c0_we   : std_logic := '0';
+   signal w_c0_idx  : integer range 0 to 31 := 0;
+   signal w_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
    signal w_hi_we   : std_logic := '0';
    signal w_lo_we   : std_logic := '0';
    signal w_hi      : std_logic_vector(63 downto 0) := (others => '0');
@@ -247,6 +262,7 @@ architecture arch of ee_core is
    begin
       case op is
          when 2 | 3 | 15 => return false;                       -- J, JAL, LUI
+         when 16 => return false;                              -- COP0 reads no rs
          when 28 =>
             case fn is
                when 16 | 18 => return false;                     -- MFHI1, MFLO1
@@ -274,6 +290,8 @@ architecture arch of ee_core is
                when 17 | 19     => return false;                -- MTHI, MTLO
                when others      => return true;
             end case;
+         when 16 =>                                             -- COP0
+            return ir(25 downto 21) = "00100";                  -- only MTC0
          when 28 =>                                             -- MMI pipeline-1
             case fn is
                when 16 | 18 | 17 | 19 => return false;
@@ -330,6 +348,10 @@ begin
       variable hi1_f, lo1_f           : std_logic_vector(63 downto 0);
       variable hi_r, lo_r             : std_logic_vector(63 downto 0);
       variable ex_p1                  : std_logic;
+      variable c0_f                   : std_logic_vector(31 downto 0);
+      variable ex_c0_we               : std_logic;
+      variable ex_c0_idx              : integer range 0 to 31;
+      variable ex_c0_val              : std_logic_vector(31 downto 0);
       variable op_eff                 : integer;
       variable ex_we                  : std_logic;
       variable ex_rd                  : integer range 0 to 31;
@@ -394,6 +416,9 @@ begin
             lo         <= (others => '0');
             hi1        <= (others => '0');
             lo1        <= (others => '0');
+            cop0       <= (15 => PRID, others => (others => '0'));
+            m_c0_we    <= '0';
+            w_c0_we    <= '0';
             traps      <= (others => '0');
             fetch_pc   <= unsigned(pc_reset);
             outst      <= 0;
@@ -490,6 +515,16 @@ begin
                   if m_p1 = '1' then lo1_f := m_lo; else lo_f := m_lo; end if;
                end if;
             end if;
+            -- MFC0 reads a register MTC0 may have written two instructions
+            -- ago, so it needs the same two forwarding steps as HI and LO.
+            c0_f := cop0(rd);
+            if w_valid = '1' and w_c0_we = '1' and w_c0_idx = rd then
+               c0_f := w_c0_val;
+            end if;
+            if m_valid = '1' and m_c0_we = '1' and m_c0_idx = rd then
+               c0_f := m_c0_val;
+            end if;
+
             -- what the MFHI/MFLO arms below read, chosen by the same flag that
             -- decides where MTHI/MULT/DIV write
             if ex_p1 = '1' then
@@ -513,6 +548,9 @@ begin
             ex_addr   := (others => '0');
             ex_be     := (others => '0');
             ex_wdata  := (others => '0');
+            ex_c0_we   := '0';
+            ex_c0_idx  := 0;
+            ex_c0_val  := (others => '0');
             ex_unal    := '0';
             ex_unal_dw := '0';
             ex_unal_l  := '0';
@@ -661,6 +699,24 @@ begin
                when 14 => ex_we := '1'; ex_rd := rt; ex_val := a xor (std_logic_vector'(x"000000000000") & imm);
                when 15 => ex_we := '1'; ex_rd := rt;         -- LUI
                   ex_val := sext32(imm & std_logic_vector'(x"0000"));
+               when 16 =>                                    -- COP0
+                  case rs is
+                     when 0 =>                                 -- MFC0
+                        ex_we  := '1';
+                        ex_rd  := rt;
+                        ex_val := sext32(c0_f);
+                     when 4 =>                                 -- MTC0
+                        if rd /= 15 then                       -- PRId is read-only
+                           ex_c0_we  := '1';
+                           ex_c0_idx := rd;
+                           ex_c0_val := b(31 downto 0);
+                        end if;
+                     when others =>
+                        -- rs = 16 is the CO forms -- TLBR, TLBWI, ERET and the
+                        -- rest -- which belong with the exception path.
+                        ex_trap := true;
+                  end case;
+
                when 24 | 25 => ex_we := '1'; ex_rd := rt;    -- DADDI/DADDIU
                   ex_val := std_logic_vector(signed(a) + simm);
 
@@ -807,6 +863,9 @@ begin
                if w_lo_we = '1' then
                   if w_p1 = '1' then lo1 <= w_lo; else lo <= w_lo; end if;
                end if;
+               if w_c0_we = '1' then
+                  cop0(w_c0_idx) <= w_c0_val;
+               end if;
             end if;
 
             -- ============================================================
@@ -818,6 +877,9 @@ begin
                w_we     <= m_we;
                w_rd     <= m_rd;
                w_p1     <= m_p1;
+               w_c0_we  <= m_c0_we;
+               w_c0_idx <= m_c0_idx;
+               w_c0_val <= m_c0_val;
                w_hi_we  <= m_hi_we;
                w_lo_we  <= m_lo_we;
                w_hi     <= m_hi;
@@ -912,6 +974,9 @@ begin
                   m_rd     <= ex_rd;
                   m_val    <= ex_val;
                   m_p1     <= ex_p1;
+                  m_c0_we  <= ex_c0_we and d_valid;
+                  m_c0_idx <= ex_c0_idx;
+                  m_c0_val <= ex_c0_val;
                   m_hi_we  <= ex_hi_we;
                   m_lo_we  <= ex_lo_we;
                   m_hi     <= ex_hi;
@@ -952,6 +1017,7 @@ begin
                   m_hi_we <= '0';
                   m_lo_we <= '0';
                   m_take  <= '0';
+                  m_c0_we <= '0';
                end if;
             end if;
 
