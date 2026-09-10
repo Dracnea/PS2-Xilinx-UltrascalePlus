@@ -265,8 +265,15 @@ def main():
     for k, wv in enumerate(words):
         mem.store(a.base + k * 4, 4, wv)
     cpu = R5900(mem, a.base)
+    prog_end = a.base + 4 * len(words)
     for n in range(a.steps):
-        if not mem.load(cpu.pc, 4):
+        # Stop when the PC leaves the program that was loaded.  This used to
+        # test the instruction word for zero instead, which quietly made NOP a
+        # halt instruction: 0x00000000 is SLL r0, r0, 0 and is the natural way
+        # to space dependent instructions apart in a directed hazard test.  A
+        # test written that way stopped at its first gap, and the diff counted
+        # the handful of instructions before it as a pass.
+        if not (a.base <= cpu.pc < prog_end):
             break
         here = cpu.pc
         cpu.step()

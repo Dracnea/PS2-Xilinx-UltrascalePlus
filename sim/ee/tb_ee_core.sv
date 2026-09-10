@@ -2,10 +2,19 @@
 // architectural state after every retired instruction, in the format
 // sim/ee/r5900_ref.py prints, so the two can be diffed line for line.
 //
-// The memories answer with a cycle of latency rather than combinationally.  A
-// core that only works with zero-latency memory passes its testbench and fails
-// on the card, and the wait states are where a state machine gets its handshake
-// wrong.
+// The memories answer with latency rather than combinationally.  A core that
+// only works with zero-latency memory passes its testbench and fails on the
+// card, and the wait states are where a state machine gets its handshake
+// wrong.  Both ports take their latency from a plusarg:
+//
+//   +ilat=N  instruction port, cycles from request to reply (default 1)
+//   +dlat=N  data port, likewise (default 1)
+//
+// The instruction port is pipelined -- a request every cycle is answered every
+// cycle -- and that matters more than it looks.  The earlier model could only
+// answer every other cycle, which meant dependent instructions were never
+// adjacent in the pipeline, so not one forwarding path was ever exercised.  A
+// testbench that cannot produce the hazard cannot find the bug.
 `timescale 1ns/1ps
 
 module tb_ee_core;
@@ -36,37 +45,87 @@ module tb_ee_core;
    logic [7:0]  mem      [0:MEMBYTES-1];
    logic [31:0] memwords [0:4095];
 
-   // ---- instruction port: one cycle of latency -----------------------------
+   integer ilat = 1, dlat = 1;
+
+   // ---- instruction port: pipelined, ilat cycles of latency ----------------
+   logic        ipend = 0;
+   integer      icnt  = 0;
+   logic [31:0] iaddr_l;
    always_ff @(posedge clk) begin
       i_ready <= 1'b0;
-      if (i_read && !i_ready) begin
-         i_data  <= {mem[i_addr+3], mem[i_addr+2], mem[i_addr+1], mem[i_addr]};
-         i_ready <= 1'b1;
+      if (i_read) begin
+         if (ilat <= 1) begin
+            i_data  <= {mem[i_addr+3], mem[i_addr+2], mem[i_addr+1], mem[i_addr]};
+            i_ready <= 1'b1;
+         end else begin
+            ipend   <= 1'b1;
+            iaddr_l <= i_addr;
+            icnt    <= ilat - 1;
+         end
+      end else if (ipend) begin
+         if (icnt > 1) icnt <= icnt - 1;
+         else begin
+            i_data  <= {mem[iaddr_l+3], mem[iaddr_l+2], mem[iaddr_l+1], mem[iaddr_l]};
+            i_ready <= 1'b1;
+            ipend   <= 1'b0;
+         end
       end
    end
 
-   // ---- data port: 64 bits with byte enables, one cycle of latency ---------
-   integer bi;
+   // ---- data port: 64 bits with byte enables, dlat cycles of latency -------
+   integer      bi;
+   logic        dpend = 0;
+   integer      dcnt  = 0;
+   logic [31:0] daddr_l;
+   logic [63:0] dwdata_l;
+   logic [7:0]  dbe_l;
+   logic        dwr_l;
+
+   task automatic do_access(input [31:0] ad, input [63:0] wd,
+                            input [7:0] be, input wr);
+      begin
+         if (wr)
+            for (bi = 0; bi < 8; bi = bi + 1)
+               if (be[bi]) mem[(ad & ~32'h7) + bi] = wd[bi*8 +: 8];
+         for (bi = 0; bi < 8; bi = bi + 1)
+            d_rdata[bi*8 +: 8] <= mem[(ad & ~32'h7) + bi];
+      end
+   endtask
+
    always_ff @(posedge clk) begin
       d_ready <= 1'b0;
-      if ((d_read || d_write) && !d_ready) begin
-         if (d_write)
-            for (bi = 0; bi < 8; bi = bi + 1)
-               if (d_be[bi]) mem[(d_addr & ~32'h7) + bi] <= d_wdata[bi*8 +: 8];
-         for (bi = 0; bi < 8; bi = bi + 1)
-            d_rdata[bi*8 +: 8] <= mem[(d_addr & ~32'h7) + bi];
-         d_ready <= 1'b1;
+      if ((d_read || d_write) && !dpend && !d_ready) begin
+         if (dlat <= 1) begin
+            do_access(d_addr, d_wdata, d_be, d_write);
+            d_ready <= 1'b1;
+         end else begin
+            dpend    <= 1'b1;
+            dcnt     <= dlat - 1;
+            daddr_l  <= d_addr;
+            dwdata_l <= d_wdata;
+            dbe_l    <= d_be;
+            dwr_l    <= d_write;
+         end
+      end else if (dpend) begin
+         if (dcnt > 1) dcnt <= dcnt - 1;
+         else begin
+            do_access(daddr_l, dwdata_l, dbe_l, dwr_l);
+            d_ready <= 1'b1;
+            dpend   <= 1'b0;
+         end
       end
    end
 
    // ---- run and report -----------------------------------------------------
    string  progfile;   // 'program' is a SystemVerilog keyword
-   integer steps, n, r, fh;
+   integer steps, n, r, budget;
    logic [63:0] regs [1:31];
 
    initial begin
       if (!$value$plusargs("program=%s", progfile)) progfile = "prog.hex";
       if (!$value$plusargs("steps=%d", steps))     steps = 64;
+      void'($value$plusargs("ilat=%d", ilat));
+      void'($value$plusargs("dlat=%d", dlat));
       for (n = 0; n < MEMBYTES; n = n + 1) mem[n] = 8'h00;
       $readmemh(progfile, memwords);
       // $readmemh fills 32-bit words; spread them into the byte array
@@ -80,7 +139,12 @@ module tb_ee_core;
       reset <= 0;
 
       n = 0;
-      while (n < steps) begin
+      // A hang has to end as a report, not as a simulation that never returns.
+      // The bound is generous: a divide is ~35 cycles and a stalled memory
+      // access several more, so 200 cycles per instruction cannot be reached
+      // by a core that is merely slow.
+      budget = steps * 200 + 1000;
+      while (n < steps && budget > 0) begin
          // Sample a short way past the edge, not on it: retire and retire_pc
          // are driven by the same edge that would be read here, and reading
          // them on the edge while reading the registers after it takes the two
@@ -88,6 +152,7 @@ module tb_ee_core;
          // one instruction while every register still matches.
          @(posedge clk);
          #0.1;
+         budget = budget - 1;
          if (retire) begin
             // dbg_gpr is combinational from dbg_sel, so all 31 can be read
             // between edges; 31 x 0.1ns stays well inside a 10ns period.
@@ -101,6 +166,8 @@ module tb_ee_core;
             n = n + 1;
          end
       end
+      if (budget <= 0)
+         $display("# STALLED after %0d of %0d instructions", n, steps);
       // The same region the reference dumps: a store to the wrong address is
       // invisible in the registers until something loads it back.
       for (n = 'h2000; n < 'h2400; n = n + 8)

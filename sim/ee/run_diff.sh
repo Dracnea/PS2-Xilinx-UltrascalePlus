@@ -2,15 +2,17 @@
 # Run a program on the reference and on the RTL, and diff them.
 #   sim/ee/run_diff.sh [--seed N] [--count N] [--steps N] [--branches]
 #   sim/ee/run_diff.sh --prog FILE [--steps N]      # a pre-made program
+#   sim/ee/run_diff.sh --seed 1 --ilat 4 --dlat 3   # slower memories
 # A difference names the instruction that produced it, not the symptom.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-SEED=1; COUNT=200; STEPS=150; BR=""; PROG=""
+SEED=1; COUNT=200; STEPS=150; BR=""; PROG=""; ILAT=1; DLAT=1
 while [[ $# -gt 0 ]]; do case $1 in
   --seed) SEED=$2; shift 2;; --count) COUNT=$2; shift 2;;
   --steps) STEPS=$2; shift 2;; --branches) BR="--branches"; shift;;
   --prog) PROG=$(readlink -f "$2"); shift 2;;
+  --ilat) ILAT=$2; shift 2;; --dlat) DLAT=$2; shift 2;;
   *) echo "unknown: $1" >&2; exit 2;; esac; done
 
 command -v xvhdl >/dev/null 2>&1 || . "$HOME/Xilinx/2026.1/Vivado/settings64.sh"
@@ -24,14 +26,19 @@ xvhdl -2008 "$ROOT/rtl/ee/ee_core.vhd"      > xvhdl.log 2>&1 || { tail -20 xvhdl
 xvlog -sv   "$HERE/tb_ee_core.sv"           > xvlog.log 2>&1 || { tail -20 xvlog.log; exit 1; }
 xelab -debug off tb_ee_core -s tb           > xelab.log 2>&1 || { tail -30 xelab.log; exit 1; }
 xsim tb -R -testplusarg "program=prog.hex" -testplusarg "steps=$STEPS" \
+     -testplusarg "ilat=$ILAT" -testplusarg "dlat=$DLAT" \
      > xsim.log 2>&1 || { tail -30 xsim.log; exit 1; }
+if grep -q "STALLED" xsim.log; then
+    echo "FAIL  ${PROG:-seed $SEED} (ilat=$ILAT dlat=$DLAT): $(grep STALLED xsim.log)"
+    exit 1
+fi
 grep -E "^ *[0-9]+ pc=|^MEM " xsim.log > rtl.txt
 
 if diff -q ref.txt rtl.txt >/dev/null; then
-    echo "PASS  $(wc -l < ref.txt) instructions identical (${PROG:-seed $SEED})"
+    echo "PASS  $(wc -l < ref.txt) instructions identical (${PROG:-seed $SEED} ilat=$ILAT dlat=$DLAT)"
     exit 0
 fi
-echo "FAIL  ${PROG:-seed $SEED}"
+echo "FAIL  ${PROG:-seed $SEED} (ilat=$ILAT dlat=$DLAT)"
 echo "first difference:"
 diff ref.txt rtl.txt | head -6
 n=$(diff --unchanged-group-format='' --old-group-format='%dF

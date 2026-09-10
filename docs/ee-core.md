@@ -208,9 +208,21 @@ change to the datapath.
 | Combinational divide and multiply | 24.2 MHz | 10,314 | `gpr` → `hi`, 200 levels, 155 CARRY8 — the divider |
 | 32-cycle iterative divider | 126.2 MHz | 6,059 | `gpr` → `gpr`, unregistered DSP48E2 cascade — the multiplier |
 | Pipelined multiplier | 185.9 MHz | 6,043 | `instr` → `gpr`, 12 levels, 64% routing — decode, regfile and writeback in one cycle |
+| Five-stage pipeline | 212.0 MHz | 6,859 | `w_rd` → forwarding mux → 64-bit branch compare → `fetch_pc` adder |
+| …the same, floorplanned | **226.3 MHz** | 6,859 | as above |
 
-Target is 294.912 MHz. The core is 7.7x faster than the first measurement and
-needs 1.6x more.
+Target is 294.912 MHz. The core is 9.4x faster than the first measurement and
+needs 1.3x more.
+
+**The unconstrained number understates the core by about 7%.** Half the critical
+path was routing, which is the signature of a small module placed loose on a
+very large die: at 0.8% utilisation the placer has no reason to keep anything
+together, and the core pays wire delay it would never pay inside a real design.
+Confining it to two clock regions with a pblock (`fit/ee/fmax_pblock.tcl`) moved
+it from 212.0 to 226.3 MHz with no RTL change at all. Both numbers are kept
+above because the unconstrained one is the comparable series, but 226.3 MHz is
+the honest figure for the core as it stands, and future measurements should
+carry the floorplan.
 
 ### Directed tests for the arithmetic units
 
@@ -229,6 +241,162 @@ against the manual, since agreeing with a wrong model proves nothing: `DIV` of
 computes the quotient as `abs(x) // abs(y)` with the sign applied and the
 remainder as `x - q*y`, which is truncation toward zero with the remainder
 taking the dividend's sign — what the manual requires.
+
+## The pipeline — 2026-09-10
+
+The core is now five stages, single issue, in order: IF with a two-entry fetch
+queue, ID for decode and register read, EX for the ALU and the multi-cycle
+multiply and divide, MEM for the data port, and WB where every piece of
+architectural state is written. It agrees with the reference across **184 runs
+— eight memory-latency configurations by twenty-three programs each**, with no
+change to the reference's answers, only to how many cycles the RTL takes to
+produce them.
+
+### Two rules about where state is written
+
+Both exist so the differential trace stays meaningful rather than for any
+architectural reason.
+
+**Nothing commits before WB.** HI and LO are computed in EX but carried down the
+pipeline and written in WB alongside the register file. Writing them in EX would
+be simpler and is architecturally harmless — the pipeline is in order, so no
+later reader could see them early — but the testbench samples all architectural
+state at each retire, and an EX write would make one instruction's HI visible
+while an *older* instruction was still retiring. The trace would diverge from
+the reference for a reason that has nothing to do with the answer being wrong.
+
+**Every read is forwarded.** ID bypasses the instruction sitting in WB as it
+reads the register file, because that instruction writes on the very edge ID's
+read would otherwise miss. EX forwards from MEM and from WB, MEM last so the
+younger writer wins. Between the three, every dependence distance is covered
+except one: a load whose value is still in flight, which is what the load-use
+interlock stalls a cycle for.
+
+### The bug that took the longest to find
+
+A pipelined core has a failure mode the unpipelined one could not have, and this
+one cost the most to track down, so it is worth recording in full.
+
+`ORI r30, r18, 0x80ed` read the *pre-load* value of `r18` two instructions after
+an `LB` wrote it — while `r18` itself ended up perfectly correct in the register
+file. Forwarding was not missing; it was **discarded**.
+
+The instructions around the dependence were themselves memory operations, so MEM
+was the bottleneck and the `ORI` sat in EX for two cycles:
+
+```
+EX ir=365E80ED rs=18 || MEM ismem=1 || WB v=1 we=1 rd=18 val=0   <- LB in WB, forwarding works
+EX ir=365E80ED rs=18 || MEM ismem=1 || WB v=0 ...                <- LB retired; EX advances now
+```
+
+Forwarding is recomputed every cycle, but only the value present on the cycle EX
+*finally advances* is the one latched into EX/MEM. The `LB` retired during the
+wait, left WB, and the correct operand went with it. The register file was no
+help either: ID read it cycles earlier and EX never reads it at all.
+
+The fix is to write the forwarded operands back into the ID/EX latch on every
+cycle EX is stalled, so a forwarded value survives a stall of any length. It is
+safe in general because only *older* instructions can ever occupy MEM and WB, so
+a capture can only move an operand forward in time, never backwards.
+
+What makes this worth writing down is how narrow the window was. The same
+dependence with NOPs between the instructions passes. The same program at
+`dlat=5` passes — it only fails at `dlat=1`, where the stall lands in exactly
+the wrong place. It was found because the harness runs every program at several
+memory latencies and requires all of them to produce identical architectural
+state, which is a much sharper instrument than any single configuration.
+
+### Two instruments that had to be fixed before they could find anything
+
+**The instruction memory could only answer every other cycle.** The old model
+gated on `i_read && !i_ready`, so the core could never fetch two cycles running.
+That looks like a harmless detail of a testbench and is not: with a bubble
+between every pair of instructions, **dependent instructions are never adjacent
+in the pipeline, and not one forwarding path is ever exercised**. A testbench
+that cannot produce the hazard cannot find the bug. The port is now pipelined
+with configurable latency (`+ilat`, `+dlat`), and the matrix runs every program
+at eight combinations.
+
+**The reference halted on NOP.** Its loop said `if not mem.load(cpu.pc, 4):
+break`, meaning a zero instruction word ended the program — but `0x00000000` is
+`SLL r0, r0, 0`, a perfectly ordinary NOP, and spacing dependent instructions
+apart with NOPs is exactly how a directed hazard test is written. The first such
+test stopped at its first gap and the diff counted the handful of instructions
+before it as a pass. The halt condition is now the PC leaving the loaded
+program, which is the thing that was actually meant. The random programs never
+contained a zero word in their body, which is why this survived twenty seeds.
+
+### Directed hazard tests
+
+`sim/ee/gen_hazard.py` emits 152 instructions of deliberate hazards, because a
+random program produces a dependence between adjacent instructions only by
+accident — with 32 registers the odds are about one in sixteen per pair — and
+essentially never produces the specific shapes that break a pipeline. Every
+pattern is emitted at distances 1, 2 and 3, since in this pipeline distance 1 is
+served from MEM, distance 2 from WB and distance 3 by the ID read bypass; a
+suite testing only distance 1 would leave two thirds of the forwarding logic
+unexercised. It covers:
+
+- ALU results forwarded at each distance, and the same across a congested MEM
+  stage, which is the shape described above
+- load-use at each distance, a load feeding the base register of the next load,
+  and a load feeding a store's data operand
+- narrow loads, where the sign extension is inside the forwarded value
+- HI/LO forwarded at each distance, two multiplies back to back so the younger
+  writer must win, and MTHI/MTLO as ordinary HI/LO writers
+- a write to `r0`, which must **not** be forwarded — a network that matches on
+  the register number without excluding `r0` turns the next read of `r0` into
+  the discarded result, and nothing in a random program would show it
+- branches whose condition was computed one instruction earlier, and a delay
+  slot that reads the register its own `JAL` just wrote
+- loads and multiplies sitting in delay slots
+
+The suite was checked against the unfixed core before being trusted: it fails
+there and passes on the fix. A test that does not catch the bug it was written
+for is worth nothing.
+
+### What the remaining 1.3x needs, and what it does not
+
+Three changes were made to the pipelined core chasing the critical path, and
+they are worth recording because two of them **did not work**: moving the branch
+target and link address out of EX into ID, where they belong (213.1 MHz), and
+narrowing the program counter from 64 bits to the 32 the address bus actually
+has (212.0 MHz). Both are real improvements to the RTL — the 64-bit PC was
+doubling every PC adder in the design for nothing — and neither moved the clock
+by more than placement noise.
+
+The reason is visible in the full path, which took reading cell by cell rather
+than trusting the summary line:
+
+```
+w_rd -> forwarding compare and mux -> 64-bit branch comparison (CARRY8)
+     -> do_flush -> fetch_pc adder (CARRY8) -> fetch_pc
+```
+
+Three structures in series, and removing any one of them leaves the other two.
+The forwarding mux cannot move — it is what makes the pipeline correct. The
+branch comparison cannot move earlier, because it needs the forwarded operand.
+So the answer is not to shorten the chain but to **cut it with a register**,
+which means splitting EX into two stages.
+
+That is also what the hardware being modelled does. The R5900's pipeline is
+Q, R, **A1, A2**, S — *two* execute stages, not one. A core with a single EX
+stage was never going to be cycle-accurate to it, so the split is required for
+accuracy on exactly the same schedule that timing wants it, which is the second
+time in this project that those two demands have pointed the same way.
+
+### The delay slot and the redirect
+
+Branches resolve in EX. By then the delay slot is the queue head, so the common
+case is simple: the delay slot moves into EX on the same edge the branch leaves
+it, and everything behind it is flushed.
+
+The case that needs care is when the delay slot has *not* arrived — the fetch
+queue is empty because the reply is still in flight. Flushing then would discard
+the delay slot itself, which must execute. So the redirect is held in
+`redir_pend` and applied on the edge the delay slot finally enters EX. The
+`ilat=9` column of the matrix exists to make the queue run dry often enough that
+this path is taken constantly rather than occasionally.
 
 ## What is not started
 
