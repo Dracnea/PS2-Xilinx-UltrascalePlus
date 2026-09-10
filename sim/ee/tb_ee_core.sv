@@ -30,7 +30,7 @@ module tb_ee_core;
    logic [7:0]  d_be;
    logic [63:0] d_wdata, d_rdata;
    logic        retire;
-   logic [63:0] retire_pc, dbg_gpr, dbg_hi, dbg_lo;
+   logic [63:0] retire_pc, dbg_gpr, dbg_hi, dbg_lo, dbg_hi1, dbg_lo1;
    logic [4:0]  dbg_sel = 0;
    logic [15:0] dbg_traps;
    logic [2:0]  dbg_stall;
@@ -43,6 +43,7 @@ module tb_ee_core;
       .d_wdata(d_wdata), .d_rdata(d_rdata), .d_ready(d_ready),
       .retire(retire), .retire_pc(retire_pc),
       .dbg_sel(dbg_sel), .dbg_gpr(dbg_gpr), .dbg_hi(dbg_hi), .dbg_lo(dbg_lo),
+      .dbg_hi1(dbg_hi1), .dbg_lo1(dbg_lo1),
       .dbg_traps(dbg_traps), .dbg_stall(dbg_stall));
 
    localparam MEMBYTES = 1 << 16;
@@ -164,7 +165,8 @@ module tb_ee_core;
                dbg_sel = r[4:0];
                #0.1 regs[r] = dbg_gpr;
             end
-            $write("%4d pc=%016x hi=%016x lo=%016x", n, retire_pc, dbg_hi, dbg_lo);
+            $write("%4d pc=%016x hi=%016x lo=%016x hi1=%016x lo1=%016x",
+                   n, retire_pc, dbg_hi, dbg_lo, dbg_hi1, dbg_lo1);
             for (r = 1; r <= 31; r = r + 1) $write(" r%02d=%016x", r, regs[r]);
             $write("\n");
             n = n + 1;

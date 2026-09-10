@@ -93,6 +93,8 @@ entity ee_core is
       dbg_gpr    : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_hi     : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_lo     : out std_logic_vector(63 downto 0) := (others => '0');
+      dbg_hi1    : out std_logic_vector(63 downto 0) := (others => '0');
+      dbg_lo1    : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_traps  : out unsigned(15 downto 0) := (others => '0');
       -- why no instruction entered A1 on this edge, so that cycles lost to the
       -- fetch unit can be told apart from cycles lost to the memory port or to
@@ -106,6 +108,13 @@ architecture arch of ee_core is
    type regfile_t is array (0 to 31) of std_logic_vector(127 downto 0);
    signal gpr    : regfile_t := (others => (others => '0'));
    signal hi, lo : std_logic_vector(63 downto 0) := (others => '0');
+   -- The R5900's second HI/LO pair, written by the MMI pipeline-1 forms.  MULT1
+   -- and its relatives are not SIMD: they are the ordinary multiply and divide
+   -- aimed at this pair, so two multiply chains can be in flight without
+   -- spilling.  Their function codes mirror the SPECIAL ones exactly, which is
+   -- why the decode below reuses the same arms rather than duplicating them --
+   -- duplicated arms are how the second pair would quietly drift from the first.
+   signal hi1, lo1 : std_logic_vector(63 downto 0) := (others => '0');
    signal traps  : unsigned(15 downto 0) := (others => '0');
 
    -- ---- IF -----------------------------------------------------------------
@@ -171,6 +180,7 @@ architecture arch of ee_core is
    signal m_we      : std_logic := '0';
    signal m_rd      : integer range 0 to 31 := 0;
    signal m_val     : std_logic_vector(63 downto 0) := (others => '0');
+   signal m_p1      : std_logic := '0';
    signal m_hi_we   : std_logic := '0';
    signal m_lo_we   : std_logic := '0';
    signal m_hi      : std_logic_vector(63 downto 0) := (others => '0');
@@ -196,6 +206,7 @@ architecture arch of ee_core is
    signal w_we      : std_logic := '0';
    signal w_rd      : integer range 0 to 31 := 0;
    signal w_val     : std_logic_vector(63 downto 0) := (others => '0');
+   signal w_p1      : std_logic := '0';
    signal w_hi_we   : std_logic := '0';
    signal w_lo_we   : std_logic := '0';
    signal w_hi      : std_logic_vector(63 downto 0) := (others => '0');
@@ -236,6 +247,11 @@ architecture arch of ee_core is
    begin
       case op is
          when 2 | 3 | 15 => return false;                       -- J, JAL, LUI
+         when 28 =>
+            case fn is
+               when 16 | 18 => return false;                     -- MFHI1, MFLO1
+               when others  => return true;
+            end case;
          when 0 =>
             case fn is
                when 0 | 2 | 3   => return false;                -- shifts by sa
@@ -257,6 +273,11 @@ architecture arch of ee_core is
                when 16 | 18     => return false;                -- MFHI, MFLO
                when 17 | 19     => return false;                -- MTHI, MTLO
                when others      => return true;
+            end case;
+         when 28 =>                                             -- MMI pipeline-1
+            case fn is
+               when 16 | 18 | 17 | 19 => return false;
+               when others            => return true;
             end case;
          when 4 | 5 => return true;                             -- BEQ, BNE
          when 40 | 41 | 43 | 63 => return true;                 -- stores
@@ -282,9 +303,10 @@ architecture arch of ee_core is
    end function;
 
    function is_muldiv(ir : std_logic_vector(31 downto 0)) return boolean is
+      variable op : integer := to_integer(unsigned(ir(31 downto 26)));
       variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
    begin
-      if ir(31 downto 26) /= "000000" then return false; end if;
+      if op /= 0 and op /= 28 then return false; end if;
       return fn >= 24 and fn <= 27;
    end function;
 begin
@@ -292,6 +314,8 @@ begin
    dbg_gpr   <= rd_gpr(gpr, to_integer(dbg_sel));
    dbg_hi    <= hi;
    dbg_lo    <= lo;
+   dbg_hi1   <= hi1;
+   dbg_lo1   <= lo1;
    dbg_traps <= traps;
 
    process (clk)
@@ -303,6 +327,10 @@ begin
       variable tgt                    : unsigned(31 downto 0);
       variable ea                     : unsigned(63 downto 0);
       variable hi_f, lo_f             : std_logic_vector(63 downto 0);
+      variable hi1_f, lo1_f           : std_logic_vector(63 downto 0);
+      variable hi_r, lo_r             : std_logic_vector(63 downto 0);
+      variable ex_p1                  : std_logic;
+      variable op_eff                 : integer;
       variable ex_we                  : std_logic;
       variable ex_rd                  : integer range 0 to 31;
       variable ex_val                 : std_logic_vector(63 downto 0);
@@ -364,6 +392,8 @@ begin
             gpr        <= (others => (others => '0'));
             hi         <= (others => '0');
             lo         <= (others => '0');
+            hi1        <= (others => '0');
+            lo1        <= (others => '0');
             traps      <= (others => '0');
             fetch_pc   <= unsigned(pc_reset);
             outst      <= 0;
@@ -402,6 +432,25 @@ begin
             imm  := d_ir(15 downto 0);
             simm := resize(signed(imm), 64);
 
+            -- The MMI forms of MFHI/MTHI/MFLO/MTLO/MULT/MULTU/DIV/DIVU use the
+            -- same function codes as SPECIAL, so they are decoded by the same
+            -- arms with a flag saying which HI/LO pair they touch.  Only that
+            -- subset is redirected: the rest of MMI is SIMD and unrelated.
+            --
+            -- This has to be settled here, before the forwarding block below,
+            -- because that block picks which pair MFHI and MFLO will read.  It
+            -- is also why ex_p1 is assigned unconditionally rather than reset
+            -- with the other ex_* variables further down: a process variable
+            -- keeps its value between invocations, so leaving it to a later
+            -- default means one cycle reading the previous instruction's flag.
+            op_eff := op;
+            ex_p1  := '0';
+            if op = 28 and (fn = 16 or fn = 17 or fn = 18 or fn = 19
+                            or (fn >= 24 and fn <= 27)) then
+               op_eff := 0;
+               ex_p1  := '1';
+            end if;
+
             -- Operand forwarding.  ID already bypassed the instruction in WB
             -- as it read the register file, so what is left is the two closer
             -- ones: the A2/WB latch first as the older, then the A1/A2 latch
@@ -421,15 +470,32 @@ begin
 
             -- HI and LO are read in A1 and written in WB, so they need the
             -- same two forwarding steps and the same priority.
-            hi_f := hi;
-            lo_f := lo;
+            hi_f  := hi;
+            lo_f  := lo;
+            hi1_f := hi1;
+            lo1_f := lo1;
             if w_valid = '1' then
-               if w_hi_we = '1' then hi_f := w_hi; end if;
-               if w_lo_we = '1' then lo_f := w_lo; end if;
+               if w_hi_we = '1' then
+                  if w_p1 = '1' then hi1_f := w_hi; else hi_f := w_hi; end if;
+               end if;
+               if w_lo_we = '1' then
+                  if w_p1 = '1' then lo1_f := w_lo; else lo_f := w_lo; end if;
+               end if;
             end if;
             if m_valid = '1' then
-               if m_hi_we = '1' then hi_f := m_hi; end if;
-               if m_lo_we = '1' then lo_f := m_lo; end if;
+               if m_hi_we = '1' then
+                  if m_p1 = '1' then hi1_f := m_hi; else hi_f := m_hi; end if;
+               end if;
+               if m_lo_we = '1' then
+                  if m_p1 = '1' then lo1_f := m_lo; else lo_f := m_lo; end if;
+               end if;
+            end if;
+            -- what the MFHI/MFLO arms below read, chosen by the same flag that
+            -- decides where MTHI/MULT/DIV write
+            if ex_p1 = '1' then
+               hi_r := hi1_f; lo_r := lo1_f;
+            else
+               hi_r := hi_f;  lo_r := lo_f;
             end if;
 
             ex_we     := '0';
@@ -457,7 +523,7 @@ begin
             tgt       := (others => '0');
             ea        := (others => '0');
 
-            case op is
+            case op_eff is
                when 0 =>                               -- SPECIAL
                   case fn is
                      when 0  => ex_we := '1'; ex_rd := rd;   -- SLL
@@ -477,9 +543,9 @@ begin
                                 if rd = 0 then ex_rd := 31; else ex_rd := rd; end if;
                                 ex_val := d_link;
                                 ex_take := true; tgt := unsigned(a(31 downto 0));
-                     when 16 => ex_we := '1'; ex_rd := rd; ex_val := hi_f;         -- MFHI
+                     when 16 => ex_we := '1'; ex_rd := rd; ex_val := hi_r;         -- MFHI
                      when 17 => ex_hi_we := '1'; ex_hi := a;                       -- MTHI
-                     when 18 => ex_we := '1'; ex_rd := rd; ex_val := lo_f;         -- MFLO
+                     when 18 => ex_we := '1'; ex_rd := rd; ex_val := lo_r;         -- MFLO
                      when 19 => ex_lo_we := '1'; ex_lo := a;                       -- MTLO
                      when 20 => ex_we := '1'; ex_rd := rd;                         -- DSLLV
                                 ex_val := std_logic_vector(shift_left(unsigned(b), to_integer(unsigned(a(5 downto 0)))));
@@ -735,8 +801,12 @@ begin
                if w_we = '1' and w_rd /= 0 then
                   gpr(w_rd)(63 downto 0) <= w_val;
                end if;
-               if w_hi_we = '1' then hi <= w_hi; end if;
-               if w_lo_we = '1' then lo <= w_lo; end if;
+               if w_hi_we = '1' then
+                  if w_p1 = '1' then hi1 <= w_hi; else hi <= w_hi; end if;
+               end if;
+               if w_lo_we = '1' then
+                  if w_p1 = '1' then lo1 <= w_lo; else lo <= w_lo; end if;
+               end if;
             end if;
 
             -- ============================================================
@@ -747,6 +817,7 @@ begin
                w_pc     <= m_pc;
                w_we     <= m_we;
                w_rd     <= m_rd;
+               w_p1     <= m_p1;
                w_hi_we  <= m_hi_we;
                w_lo_we  <= m_lo_we;
                w_hi     <= m_hi;
@@ -840,6 +911,7 @@ begin
                   m_we     <= ex_we;
                   m_rd     <= ex_rd;
                   m_val    <= ex_val;
+                  m_p1     <= ex_p1;
                   m_hi_we  <= ex_hi_we;
                   m_lo_we  <= ex_lo_we;
                   m_hi     <= ex_hi;

@@ -72,6 +72,11 @@ class R5900:
         self.gpr = [0] * 32          # 128-bit each; integer ops touch the low 64
         self.pc = pc
         self.hi = self.lo = 0
+        # The R5900 has a *second* HI/LO pair, written by the MMI pipeline-1
+        # instructions.  It is not an MMI SIMD feature bolted on: MULT1 and its
+        # relatives are the ordinary multiply and divide aimed at HI1/LO1, so a
+        # compiler can keep two multiply chains in flight without spilling.
+        self.hi1 = self.lo1 = 0
         self.mem = mem
         self.traps = []
         self.delay = None            # (target_pc,) pending after the delay slot
@@ -162,6 +167,12 @@ class R5900:
             a = (s64(self.r(rs)) + simm) & M64
             n = {40: 1, 41: 2, 43: 4, 63: 8}[op]
             self.mem.store(a, n, self.r(rt))
+        elif op == 28:                                  # MMI
+            if fn in (16, 17, 18, 19, 24, 25, 26, 27):
+                # the same operations as SPECIAL, on the second HI/LO pair
+                self._hilo(fn, rs, rt, rd, pipe1=True)
+            else:
+                self.traps.append(("unimplemented MMI fn %d" % fn, self.pc - 4))
         elif op in (34, 38, 42, 46, 26, 27, 44, 45):    # unaligned
             # LWL/LWR and their doubleword and store counterparts.  A compiler
             # emits these in pairs to move a word that is not aligned, and each
@@ -215,6 +226,51 @@ class R5900:
         else:
             self.traps.append(("unimplemented op %d" % op, self.pc - 4))
 
+    def _hilo(self, fn, rs, rt, rd, pipe1):
+        """MFHI/MTHI/MFLO/MTLO/MULT/MULTU/DIV/DIVU, on either HI/LO pair.
+
+        The MMI pipeline-1 forms -- MULT1, MULTU1, DIV1, DIVU1, MFHI1, MFLO1,
+        MTHI1, MTLO1 -- are these same operations aimed at the R5900's second
+        HI/LO pair, and their function codes mirror the SPECIAL ones exactly.
+        Writing it once means the second pair cannot drift from the first, which
+        is the only way this could go wrong quietly.
+        """
+        a, b = self.r(rs), self.r(rt)
+        hi = self.hi1 if pipe1 else self.hi
+        lo = self.lo1 if pipe1 else self.lo
+
+        if fn == 16:                                                  # MFHI
+            self.w(rd, hi); return
+        if fn == 18:                                                  # MFLO
+            self.w(rd, lo); return
+        if fn == 17:                                                  # MTHI
+            hi = a
+        elif fn == 19:                                                # MTLO
+            lo = a
+        elif fn in (24, 25):                                          # MULT/MULTU
+            p = (s32(a) * s32(b)) if fn == 24 else ((a & M32) * (b & M32))
+            lo, hi = sext32(p & M32), sext32((p >> 32) & M32)
+            # The R5900 form also writes rd.  rd == 0 is the MIPS-compatible
+            # encoding and writes nothing, which is why this is easy to miss.
+            self.w(rd, lo)
+        else:                                                         # DIV/DIVU
+            if fn == 26:
+                x, y = s32(a), s32(b)
+                if y == 0:
+                    lo, hi = sext32(-1 if x >= 0 else 1), sext32(x)
+                else:
+                    q = abs(x) // abs(y) * (1 if (x < 0) == (y < 0) else -1)
+                    lo, hi = sext32(q), sext32(x - q * y)
+            else:
+                x, y = a & M32, b & M32
+                if y == 0: lo, hi = sext32(M32), sext32(x)
+                else: lo, hi = sext32(x // y), sext32(x % y)
+
+        if pipe1:
+            self.hi1, self.lo1 = hi, lo
+        else:
+            self.hi, self.lo = hi, lo
+
     def _regimm(self, rs, rt, simm, nxt):
         v = s64(self.r(rs))
         if rt == 0 and v < 0: self.branch(nxt + (simm << 2))          # BLTZ
@@ -236,31 +292,11 @@ class R5900:
         elif fn == 7:  self.w(rd, sext32(s32(b) >> (a & 31)))         # SRAV
         elif fn == 8:  self.branch(a)                                 # JR
         elif fn == 9:  self.w(rd or 31, (self.pc + 4) & M64); self.branch(a)   # JALR
-        elif fn == 16: self.w(rd, self.hi)                            # MFHI
-        elif fn == 17: self.hi = a                                    # MTHI
-        elif fn == 18: self.w(rd, self.lo)                            # MFLO
-        elif fn == 19: self.lo = a                                    # MTLO
+        elif fn in (16, 17, 18, 19, 24, 25, 26, 27):
+            self._hilo(fn, rs, rt, rd, pipe1=False)
         elif fn == 20: self.w(rd, b << (a & 63) & M64)                # DSLLV
         elif fn == 22: self.w(rd, b >> (a & 63))                      # DSRLV
         elif fn == 23: self.w(rd, s64(b) >> (a & 63) & M64)           # DSRAV
-        elif fn in (24, 25):                                          # MULT/MULTU
-            p = (s32(a) * s32(b)) if fn == 24 else ((a & M32) * (b & M32))
-            self.lo, self.hi = sext32(p & M32), sext32((p >> 32) & M32)
-            # The R5900 form also writes rd.  rd == 0 is the MIPS-compatible
-            # encoding and writes nothing, which is why this is easy to miss.
-            self.w(rd, self.lo)
-        elif fn in (26, 27):                                          # DIV/DIVU
-            if fn == 24 or fn == 26:
-                x, y = s32(a), s32(b)
-                if y == 0:
-                    self.lo, self.hi = sext32(-1 if x >= 0 else 1), sext32(x)
-                else:
-                    q = abs(x) // abs(y) * (1 if (x < 0) == (y < 0) else -1)
-                    self.lo, self.hi = sext32(q), sext32(x - q * y)
-            else:
-                x, y = a & M32, b & M32
-                if y == 0: self.lo, self.hi = sext32(M32), sext32(x)
-                else: self.lo, self.hi = sext32(x // y), sext32(x % y)
         elif fn == 32:                                                # ADD (traps)
             v = s32(a) + s32(b)
             if not (-(1 << 31) <= v < (1 << 31)):
@@ -297,7 +333,8 @@ def dump(cpu, step, pc):
     be confused by a register merely becoming zero.
     """
     regs = " ".join("r%02d=%016x" % (n, cpu.r(n)) for n in range(1, 32))
-    return "%4d pc=%016x hi=%016x lo=%016x %s" % (step, pc, cpu.hi, cpu.lo, regs)
+    return "%4d pc=%016x hi=%016x lo=%016x hi1=%016x lo1=%016x %s" % (
+        step, pc, cpu.hi, cpu.lo, cpu.hi1, cpu.lo1, regs)
 
 
 def main():

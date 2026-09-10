@@ -546,11 +546,65 @@ that case 3 is taken constantly rather than occasionally. Case 2 needs no such
 help — it is the common case at `ilat=1`, which is why every branch-heavy seed
 failed at once when it was missing.
 
+## A second opinion on the reference — 2026-09-10
+
+The reference the RTL is diffed against had been checked two ways: written from
+the EE Core User's Manual, and hand-computed at the corners. Neither is a second
+implementation, and **a reference that is wrong in the same way as the RTL it
+checks produces a green harness and a broken core**. That gap was worth closing.
+
+`birdybro/PS2_fpga` is a second R5900 model, MIT-licensed, written independently
+from the same manual, and in Python — so the two can be stepped side by side on
+the same instruction rather than compared as prose.
+`tools/ee/xcheck_r5900.py` does that: it loads their model from a checkout at
+run time, generates instructions from the set both implement, and diffs the
+architectural state after each one. **160,000 instructions across eight seeds,
+with no disagreements.**
+
+Three things had to be understood to make the comparison mean anything:
+
+- **Their model rejects instructions whose architecturally-unused encoding
+  fields are non-zero**, where hardware ignores them — MIPS calls those cases
+  UNPREDICTABLE and real silicon does not look. That is a defensible choice for
+  a verification model and not a disagreement about behaviour, but a generator
+  filling every field at random had three quarters of its output refused.
+  Emitting canonical encodings is what made the comparison cover the
+  instruction set rather than the encoding space.
+- Their module does not import on Python 3.12 as checked out — a forward
+  reference in a method annotation without `from __future__ import annotations`.
+  The tool inserts that line into a copy in memory rather than editing their
+  tree.
+- Nothing is copied. The tool needs a checkout to say anything, which is the
+  right dependency for something whose job is to disagree with us.
+
+### MMI pipeline-1
+
+The comparison also named a real gap. The R5900 has a **second HI/LO pair**,
+written by `MULT1`, `MULTU1`, `DIV1`, `DIVU1`, `MFHI1`, `MFLO1`, `MTHI1` and
+`MTLO1`. These are not SIMD: they are the ordinary multiply and divide aimed at
+that pair, so a compiler can keep two multiply chains in flight without
+spilling, and their function codes mirror the SPECIAL ones exactly.
+
+Both the model and the core now decode them through the *same* arms as the
+SPECIAL forms with a flag saying which pair they touch, rather than duplicating
+the arms — duplicated arms are how the second pair would quietly drift from the
+first. The trace carries `hi1` and `lo1`, the random generator emits the MMI
+forms interleaved with the ordinary ones, and 192 differential runs pass.
+
+The bug this introduced is worth recording because it is specific to a variable
+in a clocked process: the flag was computed *after* the forwarding block that
+decides which pair `MFHI` and `MFLO` read. A VHDL process variable keeps its
+value between invocations, so the read did not merely default — it used the
+*previous instruction's* flag. `MFLO1` returned `LO`. The decode now happens
+before the operands, and the flag is assigned unconditionally rather than reset
+with the other defaults further down.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. MMI, the
 FPU, the VUs. And the integer subset itself is not complete: no COP0, no
-exceptions, no `LQ`/`SQ`. The unaligned group — `LWL`, `LWR`, `SWL`, `SWR`,
+exceptions, no `LQ`/`SQ`, and none of MMI's SIMD instructions — only the
+pipeline-1 forms that share the SPECIAL encodings. The unaligned group — `LWL`, `LWR`, `SWL`, `SWR`,
 `LDL`, `LDR`, `SDL`, `SDR` — is done.
 
 Timing is not closed: 242.8 MHz against a 294.912 MHz target, a factor of 1.21.

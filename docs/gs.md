@@ -151,6 +151,27 @@ Each of those is a later block, and drawing them wrongly now would be worse
 than not drawing them: a wrong pixel that appears is much harder to notice than
 one that never arrives.
 
+## The triangle, in the reference only — 2026-09-10
+
+`gs_ref.py` now rasterises flat-shaded triangles, including strips and fans.
+**No RTL is built against it yet, deliberately.**
+
+Which pixels a triangle covers *along a shared edge* is decided by a rule, not
+by the geometry, and the GS has its own: it rasterises with a DDA rather than
+with edge functions, and the two agree in the interior while differing by a
+pixel at the boundary. Getting that wrong produces seams between adjacent
+triangles, which is the kind of fault that looks like a texture problem for a
+week. So the reference implements the standard top-left rule on edge functions
+at pixel centres, that is written down as an assumption rather than a fact, and
+the RTL waits until it has been checked against PCSX2's software renderer.
+
+What the tests can establish without knowing the GS's rule is that this one is
+*self-consistent*: two triangles sharing a diagonal tile a square exactly, every
+pixel covered once, none twice and none missed. A degenerate triangle draws
+nothing, a strip reuses its last two vertices, and no pixel lands outside the
+hypotenuse. Those hold whichever rule turns out to be right; the boundary
+against the real hardware is the open question.
+
 ## What is not started
 
 The rest of step 4 — triangles (flat, then Gouraud, then textured), lines and

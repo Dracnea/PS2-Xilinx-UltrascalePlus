@@ -44,6 +44,14 @@ def gen(rng, n, branches):
             op = rng.choice([32, 33, 35, 36, 37, 39, 55])
             off = SCRATCH + rng.randrange(0, 0x400, 8)
             out.append((op << 26) | (0 << 21) | (rd << 16) | (off & 0xFFFF))
+        elif pick < 0.94:                                  # MMI pipeline-1
+            # MULT1, MULTU1, DIV1, DIVU1, MFHI1, MFLO1, MTHI1, MTLO1: the same
+            # operations as their SPECIAL counterparts, on the second HI/LO
+            # pair.  Emitting them interleaved with the ordinary forms is the
+            # point -- the two pairs have to stay independent, and a program
+            # that used only one of them would never show it if they did not.
+            fn = rng.choice([16, 17, 18, 19, 24, 25, 26, 27])
+            out.append((28 << 26) | (rs << 21) | (rt << 16) | (rd << 11) | fn)
         elif pick < 0.96:                                  # unaligned accesses
             # These are the only instructions here whose behaviour depends on
             # the low bits of the address, so the offset is deliberately not

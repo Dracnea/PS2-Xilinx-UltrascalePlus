@@ -142,10 +142,99 @@ class GS:
         if prim == 6 and len(self.vq) >= 2:            # SPRITE
             self.draw_sprite(self.vq[-2], self.vq[-1])
             self.vq = []
-        elif prim in (3, 4, 5) and len(self.vq) >= 3:  # triangles: not yet drawn
-            self.vq = self.vq[-2:] if prim in (4, 5) else []
+        elif prim in (3, 4, 5) and len(self.vq) >= 3:  # TRIANGLE / STRIP / FAN
+            self.draw_triangle(self.vq[-3], self.vq[-2], self.vq[-1])
+            if prim == 3:
+                self.vq = []              # a list restarts every three vertices
+            elif prim == 4:
+                self.vq = self.vq[-2:]    # a strip keeps the last two
+            else:
+                self.vq = [self.vq[0], self.vq[-1]]   # a fan keeps the first
         elif len(self.vq) > 8:
             self.vq = self.vq[-2:]
+
+    def draw_triangle(self, v0, v1, v2):
+        """A flat-shaded triangle in PSMCT32.
+
+        **The fill rule here is provisional.**  Which pixels a triangle covers
+        along a shared edge is decided by a rule, not by the geometry, and the
+        GS has its own -- it rasterises with a DDA rather than with edge
+        functions, and the two agree in the interior and can differ by a pixel
+        along an edge.  Getting that wrong shows up as seams between adjacent
+        triangles, which is exactly the kind of fault that looks like a texture
+        problem for a week.
+
+        So this implements the standard top-left rule on edge functions
+        evaluated at pixel centres, it is written down as an assumption rather
+        than a fact, and **no RTL is built against it** until it has been
+        checked against PCSX2's software renderer frame for frame.  The
+        interior is not in doubt; only the boundary is.
+
+        Flat shading takes the colour of the *last* vertex, which is what the
+        manual specifies when IIP is 0.  Gouraud, Z, texture and alpha are all
+        later blocks.
+        """
+        c = self.ctx()
+        frame = self.reg[0x4C + c]
+        xyoff = self.reg[0x18 + c]
+        sciss = self.reg[0x40 + c]
+        if bits(frame, 29, 24) != 0:
+            return
+        fbp   = bits(frame, 8, 0)
+        fbw   = bits(frame, 21, 16)
+        fbmsk = bits(frame, 63, 32)
+        ofx, ofy = bits(xyoff, 15, 0), bits(xyoff, 47, 32)
+
+        # window coordinates, still in 12.4 so the edge tests keep the fraction
+        p = [((v[0] - ofx), (v[1] - ofy)) for v in (v0, v1, v2)]
+
+        def edge(a, b, x, y):
+            return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
+
+        area = edge(p[0], p[1], p[2][0], p[2][1])
+        if area == 0:
+            return                      # degenerate: no area, no pixels
+        if area < 0:                    # normalise the winding
+            p = [p[0], p[2], p[1]]
+            area = -area
+
+        sx0, sx1 = bits(sciss, 10, 0), bits(sciss, 26, 16)
+        sy0, sy1 = bits(sciss, 42, 32), bits(sciss, 58, 48)
+        xlo = max(min(q[0] for q in p) >> 4, sx0)
+        xhi = min(max(q[0] for q in p) >> 4, sx1)
+        ylo = max(min(q[1] for q in p) >> 4, sy0)
+        yhi = min(max(q[1] for q in p) >> 4, sy1)
+
+        def top_left(a, b):
+            """True if edge a->b is a top or a left edge, which are inclusive."""
+            if b[1] == a[1]:
+                return b[0] < a[0]      # a top edge runs right to left
+            return b[1] < a[1]          # a left edge runs upward
+
+        incl = [top_left(p[0], p[1]), top_left(p[1], p[2]), top_left(p[2], p[0])]
+        rgba = v2[3] & 0xFFFFFFFF
+
+        for yy in range(ylo, yhi + 1):
+            cy = (yy << 4) + 8          # the pixel centre, in 12.4
+            for xx in range(xlo, xhi + 1):
+                cx = (xx << 4) + 8
+                e = (edge(p[0], p[1], cx, cy),
+                     edge(p[1], p[2], cx, cy),
+                     edge(p[2], p[0], cx, cy))
+                inside = True
+                for k in range(3):
+                    if e[k] < 0 or (e[k] == 0 and not incl[k]):
+                        inside = False
+                        break
+                if not inside:
+                    continue
+                a = addr32p(fbp, fbw, xx, yy)
+                if a >= VM_WORDS:
+                    continue
+                old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
+                v = (old & fbmsk) | (rgba & ~fbmsk & 0xFFFFFFFF)
+                self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
+                self.pixels += 1
 
     def draw_sprite(self, v0, v1):
         """A flat-coloured, axis-aligned rectangle in PSMCT32.

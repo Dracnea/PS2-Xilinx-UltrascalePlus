@@ -145,6 +145,60 @@ a = gs_ref.addr32p(0, 1, 2, 2)
 if int.from_bytes(g.vm[a * 4:a * 4 + 4], "little") != 0x01020304:
     fails.append("XYOFFSET was not subtracted")
 
+# ---- a triangle covers its interior, and tiles with its neighbour --------
+def tri_prog(verts, colour, prim=3, scissor=(0, 639, 0, 447)):
+    setup = [ad(0x4C, 0 | (1 << 16)),
+             ad(0x18, 0),
+             ad(0x40, scissor[0] | (scissor[1] << 16)
+                      | (scissor[2] << 32) | (scissor[3] << 48)),
+             ad(0x00, prim),
+             ad(0x01, colour)]
+    regs = 0
+    for i in range(len(setup)):
+        regs |= 0xE << (4 * i)
+    out = [giftag(1, 0, regs, len(setup))] + setup
+    vregs = 0
+    for i in range(len(verts)):
+        vregs |= 0xE << (4 * i)
+    out += [giftag(1, 1, vregs, len(verts))]
+    out += [ad(0x05, (x << 4) | ((y << 4) << 16)) for x, y in verts]
+    return out
+
+# a right triangle with legs of 8: the interior is about half the bounding box,
+# and every covered pixel must lie inside it
+g = run(tri_prog([(0, 0), (8, 0), (0, 8)], 0x0000FF00))
+check("triangle drew something", g.pixels > 0, True)
+for y in range(0, 9):
+    for x in range(0, 9):
+        a = gs_ref.addr32p(0, 1, x, y)
+        painted = int.from_bytes(g.vm[a * 4:a * 4 + 4], "little") != 0
+        if painted and x + y > 8:
+            fails.append("triangle painted (%d,%d), outside its own hypotenuse" % (x, y))
+
+# Two triangles sharing the diagonal must tile the square exactly: every pixel
+# covered once, none twice and none missed.  That is what a fill rule is for,
+# and it holds whether or not this particular rule is the GS's.
+gA = run(tri_prog([(0, 0), (8, 0), (0, 8)], 0x11111111))
+gB = run(tri_prog([(8, 0), (8, 8), (0, 8)], 0x22222222))
+both = missed = 0
+for y in range(0, 8):
+    for x in range(0, 8):
+        a = gs_ref.addr32p(0, 1, x, y)
+        pa = int.from_bytes(gA.vm[a * 4:a * 4 + 4], "little") != 0
+        pb = int.from_bytes(gB.vm[a * 4:a * 4 + 4], "little") != 0
+        if pa and pb: both += 1
+        if not pa and not pb: missed += 1
+check("shared edge drawn twice", both, 0)
+check("shared edge left a gap", missed, 0)
+
+# a degenerate triangle has no area and must draw nothing
+g = run(tri_prog([(2, 2), (6, 2), (4, 2)], 0x33333333))
+check("degenerate triangle", g.pixels, 0)
+
+# a strip reuses the last two vertices, so four vertices make two triangles
+g4 = run(tri_prog([(0, 0), (8, 0), (0, 8), (8, 8)], 0x44444444, prim=4))
+check("strip drew two triangles", g4.pixels > gA.pixels, True)
+
 # ---- the swizzle is a bijection over a page ------------------------------
 seen = {addr32(0, 1, x, y) for y in range(32) for x in range(64)}
 check("page is a bijection", len(seen), 32 * 64)
