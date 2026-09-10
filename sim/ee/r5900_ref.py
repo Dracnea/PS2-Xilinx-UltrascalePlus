@@ -39,6 +39,19 @@ M32 = (1 << 32) - 1
 # IOP.  Implementation 0x2E, revision 0x20.
 PRID = 0x00002E20
 
+# COP0 register numbers used by the exception path
+C0_STATUS, C0_CAUSE, C0_EPC, C0_ERROREPC = 12, 13, 14, 30
+
+# Exception codes, as Cause.ExcCode
+EXC_INT, EXC_SYSCALL, EXC_BREAK, EXC_RI, EXC_OV = 0, 8, 9, 10, 12
+
+# The instruction address space is aliased to the size of the test image, so the
+# exception vector at 0x80000180 lands inside a program that can be loaded.  The
+# testbench does the same.  It is a harness convention and not architecture:
+# without it every exception test would need a megabyte of mostly-empty image,
+# and the handler could never be reached at all.
+IMEM_MASK = 0xFFFF
+
 
 def s64(x):
     x &= M64
@@ -89,6 +102,8 @@ class R5900:
         # cycle count starts to mean something.
         self.cop0 = [0] * 32
         self.cop0[15] = PRID          # PRId is read-only and identifies the core
+        self.exceptions = 0           # taken, for a test that would otherwise
+                                      # pass by never reaching the handler
         self.mem = mem
         self.traps = []
         self.delay = None            # (target_pc,) pending after the delay slot
@@ -105,13 +120,73 @@ class R5900:
         self.gpr[n] = (self.gpr[n] & ~M64) | (v & M64)
 
     def step(self):
-        instr = self.mem.load(self.pc, 4) & M32
+        # The instruction address space is aliased to the test image; see
+        # IMEM_MASK.  Data addresses are not, so a store still goes where it says.
+        instr = self.mem.load(self.pc & IMEM_MASK, 4) & M32
         taken = self.delay
         self.delay = None
+        # Whether *this* instruction is in a delay slot is not something exec can
+        # work out for itself: self.delay describes the instruction being
+        # executed, not the one before it.  An exception needs to know, because
+        # EPC has to name the branch rather than the slot.
+        self.in_delay = taken is not None
+        self.exc_taken = False
         self.exec(instr)
-        if taken is not None:
+        # An exception wins over a pending branch: the handler is where control
+        # goes, and the branch is what EPC remembers.
+        if taken is not None and not self.exc_taken:
             self.pc = taken
         return instr
+
+    def exception(self, code):
+        """Enter the general exception handler.
+
+        EPC records where to resume, which is the *branch* rather than the
+        instruction that faulted when the fault happened in a delay slot --
+        resuming at the delay slot alone would skip the branch and take the
+        wrong path.  Cause.BD says which it was.  Status.EXL is what makes the
+        handler non-reentrant, and it is also why an exception raised while EXL
+        is already set does not overwrite EPC: the first one is the one worth
+        keeping.
+        """
+        st = self.cop0[C0_STATUS]
+        in_delay = self.in_delay
+        if not (st >> 1) & 1:                       # Status.EXL
+            epc = (self.pc - 4) & M64               # the faulting instruction
+            if in_delay:
+                epc = (epc - 4) & M64               # the branch before it
+            self.cop0[C0_EPC] = epc & M32
+            self.cop0[C0_CAUSE] = ((self.cop0[C0_CAUSE] & ~0x8000007C)
+                                   | (code << 2)
+                                   | (0x80000000 if in_delay else 0))
+            self.cop0[C0_STATUS] = st | 2           # set EXL
+        # BEV picks which of the two vector bases is used; the offset for a
+        # general exception is 0x180 either way.
+        base = 0xBFC00200 if (st >> 22) & 1 else 0x80000000
+        # The PC is 32 bits and sign-extends into the 64-bit architectural view,
+        # so a KSEG0 vector reads as 0xFFFFFFFF80000180 rather than 0x80000180.
+        # The core does the same, because its PC really is 32 bits wide.
+        self.pc = sext32((base + 0x180) & M32)
+        self.delay = None                           # a pending branch is lost
+        self.exc_taken = True
+        self.exceptions += 1
+
+    def eret(self):
+        """Return from an exception, and clear the flag that got us here.
+
+        ERL is checked before EXL because an error-level exception is the more
+        serious of the two and returns through its own register.  ERET has no
+        delay slot: the instruction after it does not execute.
+        """
+        st = self.cop0[C0_STATUS]
+        if (st >> 2) & 1:                           # Status.ERL
+            self.pc = sext32(self.cop0[C0_ERROREPC] & M32)
+            self.cop0[C0_STATUS] = st & ~4
+        else:
+            self.pc = sext32(self.cop0[C0_EPC] & M32)
+            self.cop0[C0_STATUS] = st & ~2
+        self.delay = None
+        self.exc_taken = True
 
     def branch(self, target):
         self.delay = target & M64
@@ -142,11 +217,12 @@ class R5900:
             if s64(self.r(rs)) <= 0: self.branch(nxt + (simm << 2))
         elif op == 7:                                   # BGTZ
             if s64(self.r(rs)) > 0: self.branch(nxt + (simm << 2))
-        elif op == 8:                                   # ADDI (traps)
-            v = s64(self.r(rs)) + simm
-            if not (-(1 << 31) <= s32(v) == v < (1 << 31)):
-                self.traps.append(("ADDI overflow", self.pc - 4))
-            self.w(rt, sext32(v))
+        elif op == 8:                                   # ADDI
+            v = s32(self.r(rs)) + simm
+            if not (-(1 << 31) <= v < (1 << 31)):
+                self.exception(EXC_OV)     # and rt is left alone
+            else:
+                self.w(rt, sext32(v))
         elif op == 9:                                   # ADDIU
             self.w(rt, sext32(s64(self.r(rs)) + simm))
         elif op == 10:                                  # SLTI
@@ -185,9 +261,10 @@ class R5900:
             elif rs == 4:                               # MTC0
                 if rd != 15:                            # PRId is read-only
                     self.cop0[rd] = self.r(rt) & M32
+            elif rs == 16 and (i & 0x3F) == 24:         # ERET
+                self.eret()
             else:
-                # rs == 16 is the CO forms -- TLBR, TLBWI, ERET and the rest --
-                # which belong with the exception path, not here.
+                # the remaining CO forms are the TLB instructions
                 self.traps.append(("unimplemented COP0 rs %d" % rs, self.pc - 4))
         elif op == 28:                                  # MMI
             if fn in (16, 17, 18, 19, 24, 25, 26, 27):
@@ -316,14 +393,17 @@ class R5900:
         elif fn == 9:  self.w(rd or 31, (self.pc + 4) & M64); self.branch(a)   # JALR
         elif fn in (16, 17, 18, 19, 24, 25, 26, 27):
             self._hilo(fn, rs, rt, rd, pipe1=False)
+        elif fn == 12: self.exception(EXC_SYSCALL)                    # SYSCALL
+        elif fn == 13: self.exception(EXC_BREAK)                      # BREAK
         elif fn == 20: self.w(rd, b << (a & 63) & M64)                # DSLLV
         elif fn == 22: self.w(rd, b >> (a & 63))                      # DSRLV
         elif fn == 23: self.w(rd, s64(b) >> (a & 63) & M64)           # DSRAV
-        elif fn == 32:                                                # ADD (traps)
+        elif fn == 32:                                                # ADD
             v = s32(a) + s32(b)
             if not (-(1 << 31) <= v < (1 << 31)):
-                self.traps.append(("ADD overflow", self.pc - 4))
-            self.w(rd, sext32(v))
+                self.exception(EXC_OV)     # and rd is left alone
+            else:
+                self.w(rd, sext32(v))
         elif fn == 33: self.w(rd, sext32(s32(a) + s32(b)))            # ADDU
         elif fn == 34: self.w(rd, sext32(s32(a) - s32(b)))            # SUB
         elif fn == 35: self.w(rd, sext32(s32(a) - s32(b)))            # SUBU
@@ -341,8 +421,6 @@ class R5900:
         elif fn == 60: self.w(rd, (b << (sa + 32)) & M64)             # DSLL32
         elif fn == 62: self.w(rd, b >> (sa + 32))                     # DSRL32
         elif fn == 63: self.w(rd, s64(b) >> (sa + 32) & M64)          # DSRA32
-        elif fn == 12: self.traps.append(("SYSCALL", self.pc - 4))
-        elif fn == 13: self.traps.append(("BREAK", self.pc - 4))
         else: self.traps.append(("unimplemented special %d" % fn, self.pc - 4))
 
 
@@ -382,7 +460,7 @@ def main():
         # to space dependent instructions apart in a directed hazard test.  A
         # test written that way stopped at its first gap, and the diff counted
         # the handful of instructions before it as a pass.
-        if not (a.base <= cpu.pc < prog_end):
+        if not (a.base <= (cpu.pc & IMEM_MASK) < prog_end):
             break
         here = cpu.pc
         cpu.step()

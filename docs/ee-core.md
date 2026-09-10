@@ -627,11 +627,65 @@ independently and lets the distance fall where it may.
 
 200 differential runs pass.
 
+## Exceptions — 2026-09-10
+
+`SYSCALL`, `BREAK`, and `ADD`/`ADDI` overflow now raise for real, with `EPC`,
+`Cause` and `Status.EXL` set as the manual specifies and `ERET` returning. The
+TLB and its `CO` instructions are still counted as traps rather than guessed at.
+
+**WB is where an exception commits, and that makes it precise by construction.**
+WB is the in-order commit point: everything older has already written, the
+faulting instruction writes nothing, and everything younger is still sitting in
+a latch. So the flush is nothing more than invalidating those latches — there is
+no state to undo, because nothing younger has committed.
+
+`EPC` names the *branch* rather than the delay slot when the fault happened in
+one, because resuming at the slot alone would skip the branch and take the wrong
+path, and `Cause.BD` says which it was. An exception raised while `EXL` is
+already set does not overwrite `EPC`: the first one is the one worth keeping.
+
+The harness needed one convention to make any of this testable. The vector is at
+`0x80000180`, so the instruction address space is **aliased to the 64 KB test
+image** — the reference masks the fetch and the testbench masks `i_addr`
+identically. Without it, an exception test would need a megabyte of
+mostly-empty image and the handler could never be reached at all.
+
+### Two bugs, one of which only a slow memory could find
+
+**Instructions younger than the exception still retired.** Clearing `m_valid`
+stops the *next* instruction from entering WB, but the one already moving from
+A2 into WB on that same edge had been transferred earlier in the process and
+retired behind the exception. Precise means nothing younger commits, so
+`w_valid` has to be cancelled too.
+
+**`Cause.BD` was lost whenever the fetch queue ran dry.** The flag was derived
+from "is the instruction currently in A1 a branch", which is only true when the
+branch and its delay slot are adjacent. Let the queue run dry and a bubble sits
+between them: the derivation says no, `EPC` names the delay slot instead of the
+branch, and an exception in a delay slot then resumes *past* the branch and
+takes the wrong path. It passes at `ilat=1` and fails at `ilat=3`, which is
+exactly what the latency matrix exists to catch — 207 of 208 runs passed, and
+the one that did not was this. The flag is now set when a branch leaves A1 and
+held until its delay slot actually arrives.
+
+### A note on the reference's own test tooling
+
+Adding the address mask broke `tools/ee/xcheck_r5900.py` in a way worth
+recording, because the symptom pointed nowhere near the cause: after exactly
+16,384 instructions the two models disagreed about a register that the
+instruction in question does not write. The tool writes each generated
+instruction at an increasing PC, and at 16,384 steps that PC reaches `0x10000`,
+which the new mask folds back to `0x0000` — so the fetch returned the *first*
+instruction of the run rather than the one just written. A model comparison is
+only as good as the agreement about what was executed.
+
+208 differential runs pass, and the cross-check is clean again.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. MMI, the
 FPU, the VUs. And the integer subset itself is not complete: no
-exceptions, no TLB and no `ERET`, no `LQ`/`SQ`, and none of MMI's SIMD
+no TLB, no `LQ`/`SQ`, and none of MMI's SIMD
 instructions — only the
 pipeline-1 forms that share the SPECIAL encodings. The unaligned group — `LWL`, `LWR`, `SWL`, `SWR`,
 `LDL`, `LDR`, `SDL`, `SDR` — is done.

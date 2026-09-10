@@ -122,6 +122,13 @@ architecture arch of ee_core is
    -- advanced would make every trace disagree for a reason unrelated to either
    -- side being wrong.  The timer belongs with the exception path.
    constant PRID : std_logic_vector(31 downto 0) := x"00002E20";
+   -- COP0 register numbers and exception codes used by the exception path
+   constant C0_STATUS : integer := 12;
+   constant C0_CAUSE  : integer := 13;
+   constant C0_EPC    : integer := 14;
+   constant EXC_SYSCALL : integer := 8;
+   constant EXC_BREAK   : integer := 9;
+   constant EXC_OV      : integer := 12;
    type cop0_t is array (0 to 31) of std_logic_vector(31 downto 0);
    signal cop0 : cop0_t := (15 => PRID, others => (others => '0'));
    signal traps  : unsigned(15 downto 0) := (others => '0');
@@ -180,6 +187,17 @@ architecture arch of ee_core is
    -- and the fetch PC -- 11 of the 20 logic levels on the critical path, for
    -- arithmetic that had no reason to be there.  EX now only decides whether
    -- the branch is taken and, for JR and JALR, substitutes the register.
+   -- whether this instruction sits in a branch delay slot, which Cause.BD
+   -- reports and which decides whether EPC names it or the branch before it
+   signal d_bd      : std_logic := '0';
+   -- Set when a branch leaves A1 and cleared when its delay slot enters.  It
+   -- cannot be derived from "is the instruction in A1 a branch", because the
+   -- two are only adjacent when the fetch keeps up: let the queue run dry and a
+   -- bubble sits between them, the derivation says no, and EPC then names the
+   -- delay slot instead of the branch -- so an exception in a delay slot
+   -- resumes past the branch and takes the wrong path.  It shows up only at
+   -- slower instruction memories, which is what the latency matrix is for.
+   signal bd_pend   : std_logic := '0';
    signal d_tgt     : unsigned(31 downto 0) := (others => '0');
    signal d_link    : std_logic_vector(63 downto 0) := (others => '0');
 
@@ -190,6 +208,14 @@ architecture arch of ee_core is
    signal m_rd      : integer range 0 to 31 := 0;
    signal m_val     : std_logic_vector(63 downto 0) := (others => '0');
    signal m_p1      : std_logic := '0';
+   -- An exception is raised in A1 and committed in WB.  WB is the in-order
+   -- commit point, so raising it there is precise by construction: everything
+   -- older has already written, the faulting instruction writes nothing, and
+   -- everything younger is still in a latch that gets invalidated.
+   signal m_exc     : std_logic := '0';
+   signal m_exc_code: integer range 0 to 31 := 0;
+   signal m_eret    : std_logic := '0';
+   signal m_bd      : std_logic := '0';
    signal m_c0_we   : std_logic := '0';
    signal m_c0_idx  : integer range 0 to 31 := 0;
    signal m_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
@@ -219,6 +245,10 @@ architecture arch of ee_core is
    signal w_rd      : integer range 0 to 31 := 0;
    signal w_val     : std_logic_vector(63 downto 0) := (others => '0');
    signal w_p1      : std_logic := '0';
+   signal w_exc     : std_logic := '0';
+   signal w_exc_code: integer range 0 to 31 := 0;
+   signal w_eret    : std_logic := '0';
+   signal w_bd      : std_logic := '0';
    signal w_c0_we   : std_logic := '0';
    signal w_c0_idx  : integer range 0 to 31 := 0;
    signal w_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
@@ -320,6 +350,17 @@ architecture arch of ee_core is
       end case;
    end function;
 
+   function is_branch(ir : std_logic_vector(31 downto 0)) return boolean is
+      variable op : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
+   begin
+      case op is
+         when 1 | 2 | 3 | 4 | 5 | 6 | 7 => return true;
+         when 0 => return fn = 8 or fn = 9;                 -- JR, JALR
+         when others => return false;
+      end case;
+   end function;
+
    function is_muldiv(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
       variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
@@ -349,6 +390,9 @@ begin
       variable hi_r, lo_r             : std_logic_vector(63 downto 0);
       variable ex_p1                  : std_logic;
       variable c0_f                   : std_logic_vector(31 downto 0);
+      variable ex_exc, ex_eret        : std_logic;
+      variable ex_code                : integer range 0 to 31;
+      variable ovf                    : signed(32 downto 0);
       variable ex_c0_we               : std_logic;
       variable ex_c0_idx              : integer range 0 to 31;
       variable ex_c0_val              : std_logic_vector(31 downto 0);
@@ -378,6 +422,8 @@ begin
       -- stage handshakes
       variable a2_adv, a1_adv, id_adv  : boolean;
       variable kill_id                 : boolean;
+      variable exc_now, eret_now       : boolean;
+      variable br_leaving              : boolean;
       variable load_use                : boolean;
 
       -- ID
@@ -419,6 +465,12 @@ begin
             cop0       <= (15 => PRID, others => (others => '0'));
             m_c0_we    <= '0';
             w_c0_we    <= '0';
+            m_exc      <= '0';
+            w_exc      <= '0';
+            m_eret     <= '0';
+            w_eret     <= '0';
+            d_bd       <= '0';
+            bd_pend    <= '0';
             traps      <= (others => '0');
             fetch_pc   <= unsigned(pc_reset);
             outst      <= 0;
@@ -548,6 +600,10 @@ begin
             ex_addr   := (others => '0');
             ex_be     := (others => '0');
             ex_wdata  := (others => '0');
+            ex_exc     := '0';
+            ex_eret    := '0';
+            ex_code    := 0;
+            ovf        := (others => '0');
             ex_c0_we   := '0';
             ex_c0_idx  := 0;
             ex_c0_val  := (others => '0');
@@ -585,6 +641,8 @@ begin
                      when 17 => ex_hi_we := '1'; ex_hi := a;                       -- MTHI
                      when 18 => ex_we := '1'; ex_rd := rd; ex_val := lo_r;         -- MFLO
                      when 19 => ex_lo_we := '1'; ex_lo := a;                       -- MTLO
+                     when 12 => ex_exc := '1'; ex_code := EXC_SYSCALL;             -- SYSCALL
+                     when 13 => ex_exc := '1'; ex_code := EXC_BREAK;               -- BREAK
                      when 20 => ex_we := '1'; ex_rd := rd;                         -- DSLLV
                                 ex_val := std_logic_vector(shift_left(unsigned(b), to_integer(unsigned(a(5 downto 0)))));
                      when 22 => ex_we := '1'; ex_rd := rd;                         -- DSRLV
@@ -631,8 +689,15 @@ begin
                         ex_hi_we := '1';
                         ex_lo_we := '1';
 
-                     when 32 | 33 => ex_we := '1'; ex_rd := rd;                    -- ADD/ADDU
-                        ex_val := sext32(std_logic_vector(signed(a(31 downto 0)) + signed(b(31 downto 0))));
+                     when 32 | 33 =>                                               -- ADD/ADDU
+                        ovf := signed(resize(signed(a(31 downto 0)), 33)
+                                      + resize(signed(b(31 downto 0)), 33));
+                        if fn = 32 and ovf(32) /= ovf(31) then
+                           ex_exc := '1'; ex_code := EXC_OV;   -- and rd is left alone
+                        else
+                           ex_we := '1'; ex_rd := rd;
+                           ex_val := sext32(std_logic_vector(ovf(31 downto 0)));
+                        end if;
                      when 34 | 35 => ex_we := '1'; ex_rd := rd;                    -- SUB/SUBU
                         ex_val := sext32(std_logic_vector(signed(a(31 downto 0)) - signed(b(31 downto 0))));
                      when 36 => ex_we := '1'; ex_rd := rd; ex_val := a and b;      -- AND
@@ -686,8 +751,15 @@ begin
                when 6 => ex_take := signed(a) <= 0; tgt := d_tgt;
                when 7 => ex_take := signed(a) > 0;  tgt := d_tgt;
 
-               when 8 | 9 => ex_we := '1'; ex_rd := rt;      -- ADDI/ADDIU
-                  ex_val := sext32(std_logic_vector(signed(a(31 downto 0)) + signed(simm(31 downto 0))));
+               when 8 | 9 =>                                 -- ADDI/ADDIU
+                  ovf := signed(resize(signed(a(31 downto 0)), 33)
+                                + resize(signed(simm(31 downto 0)), 33));
+                  if op = 8 and ovf(32) /= ovf(31) then
+                     ex_exc := '1'; ex_code := EXC_OV;         -- and rt is left alone
+                  else
+                     ex_we := '1'; ex_rd := rt;
+                     ex_val := sext32(std_logic_vector(ovf(31 downto 0)));
+                  end if;
                when 10 => ex_we := '1'; ex_rd := rt;         -- SLTI
                   if signed(a) < simm then ex_val := (0 => '1', others => '0');
                   else ex_val := (others => '0'); end if;
@@ -705,16 +777,19 @@ begin
                         ex_we  := '1';
                         ex_rd  := rt;
                         ex_val := sext32(c0_f);
+                     when 16 =>                                -- the CO forms
+                        if fn = 24 then
+                           ex_eret := '1';                     -- ERET
+                        else
+                           ex_trap := true;                    -- TLB: not here
+                        end if;
                      when 4 =>                                 -- MTC0
                         if rd /= 15 then                       -- PRId is read-only
                            ex_c0_we  := '1';
                            ex_c0_idx := rd;
                            ex_c0_val := b(31 downto 0);
                         end if;
-                     when others =>
-                        -- rs = 16 is the CO forms -- TLBR, TLBWI, ERET and the
-                        -- rest -- which belong with the exception path.
-                        ex_trap := true;
+                     when others => ex_trap := true;
                   end case;
 
                when 24 | 25 => ex_we := '1'; ex_rd := rt;    -- DADDI/DADDIU
@@ -853,7 +928,30 @@ begin
             -- ============================================================
             retire    <= w_valid;
             retire_pc <= sext32(std_logic_vector(w_pc));
-            if w_valid = '1' then
+            exc_now   := (w_valid = '1' and w_exc = '1');
+            eret_now  := (w_valid = '1' and w_eret = '1');
+
+            if exc_now then
+               -- The faulting instruction writes nothing.  EPC names the branch
+               -- rather than the delay slot when the fault happened in one:
+               -- resuming at the slot alone would skip the branch and take the
+               -- wrong path.  An exception raised while EXL is already set does
+               -- not overwrite EPC -- the first one is the one worth keeping.
+               if cop0(C0_STATUS)(1) = '0' then
+                  if w_bd = '1' then
+                     cop0(C0_EPC) <= std_logic_vector(w_pc - 4);
+                  else
+                     cop0(C0_EPC) <= std_logic_vector(w_pc);
+                  end if;
+                  cop0(C0_CAUSE) <= (w_bd & "000000000000000000000000"
+                                     & std_logic_vector(to_unsigned(w_exc_code, 5))
+                                     & "00")
+                                    or (cop0(C0_CAUSE) and x"7FFFFF83");
+                  cop0(C0_STATUS)(1) <= '1';       -- EXL
+               end if;
+            elsif eret_now then
+               cop0(C0_STATUS)(1) <= '0';          -- clear EXL and resume
+            elsif w_valid = '1' then
                if w_we = '1' and w_rd /= 0 then
                   gpr(w_rd)(63 downto 0) <= w_val;
                end if;
@@ -877,6 +975,10 @@ begin
                w_we     <= m_we;
                w_rd     <= m_rd;
                w_p1     <= m_p1;
+               w_exc     <= m_exc;
+               w_exc_code<= m_exc_code;
+               w_eret    <= m_eret;
+               w_bd      <= m_bd;
                w_c0_we  <= m_c0_we;
                w_c0_idx <= m_c0_idx;
                w_c0_val <= m_c0_val;
@@ -961,6 +1063,8 @@ begin
                d_write <= '0';
             else
                w_valid <= '0';
+               w_exc   <= '0';
+               w_eret  <= '0';
             end if;
 
             -- ============================================================
@@ -974,6 +1078,10 @@ begin
                   m_rd     <= ex_rd;
                   m_val    <= ex_val;
                   m_p1     <= ex_p1;
+                  m_exc     <= ex_exc and d_valid;
+                  m_exc_code<= ex_code;
+                  m_eret    <= ex_eret and d_valid;
+                  m_bd      <= d_bd;
                   m_c0_we  <= ex_c0_we and d_valid;
                   m_c0_idx <= ex_c0_idx;
                   m_c0_val <= ex_c0_val;
@@ -1018,6 +1126,8 @@ begin
                   m_lo_we <= '0';
                   m_take  <= '0';
                   m_c0_we <= '0';
+                  m_exc   <= '0';
+                  m_eret  <= '0';
                end if;
             end if;
 
@@ -1094,7 +1204,42 @@ begin
             do_flush := false;
             kill_id  := false;
             new_pc   := (others => '0');
-            if a2_adv and m_valid = '1' and m_take = '1' then
+            if exc_now or eret_now then
+               -- Everything younger than the committing instruction is in a
+               -- latch, so invalidating those latches is the whole flush; there
+               -- is nothing to undo because nothing younger has written.
+               do_flush := true;
+               kill_id  := true;
+               -- Everything younger dies, and that includes the instruction
+               -- already moving from A2 into WB on this very edge: the A2 -> WB
+               -- transfer happens earlier in this process, so clearing m_valid
+               -- alone stops the *next* one and lets this one retire behind the
+               -- exception.  Precise means nothing younger commits, so w_valid
+               -- has to be cancelled here as well.
+               w_valid  <= '0';
+               w_exc    <= '0';
+               w_eret   <= '0';
+               d_valid  <= '0';
+               m_valid  <= '0';
+               m_ismem  <= '0';
+               m_exc    <= '0';
+               m_eret   <= '0';
+               m_take   <= '0';
+               m_c0_we  <= '0';
+               redir_pend <= '0';
+               bd_pend    <= '0';
+               if exc_now then
+                  -- BEV picks the vector base; the offset for a general
+                  -- exception is 0x180 either way.
+                  if cop0(C0_STATUS)(22) = '1' then
+                     new_pc := x"BFC00380";
+                  else
+                     new_pc := x"80000180";
+                  end if;
+               else
+                  new_pc := unsigned(cop0(C0_EPC));
+               end if;
+            elsif a2_adv and m_valid = '1' and m_take = '1' then
                -- The branch is leaving A2.  Whatever is in A1 is its delay slot
                -- and must run; everything behind that is wrong-path and dies --
                -- including the instruction ID is holding, which is one more
@@ -1136,6 +1281,7 @@ begin
             end if;
 
             if a1_adv then
+               br_leaving := (d_valid = '1' and is_branch(d_ir));
                if id_adv and not kill_id then
                   d_valid <= '1';
                   d_pc    <= q_pc(0);
@@ -1144,10 +1290,21 @@ begin
                   d_b     <= id_b;
                   d_rs    <= id_rs;
                   d_rt    <= id_rt;
+                  -- a delay slot either follows the branch immediately, or the
+                  -- branch left earlier and bubbles have been going in since
+                  if br_leaving or bd_pend = '1' then
+                     d_bd <= '1';
+                  else
+                     d_bd <= '0';
+                  end if;
+                  bd_pend <= '0';
                   d_tgt   <= id_tgt;
                   d_link  <= id_link;
                else
                   d_valid <= '0';
+                  if br_leaving then
+                     bd_pend <= '1';     -- remember it for whenever the slot arrives
+                  end if;
                end if;
             else
                -- A1 is held up, so capture the operands forwarding just

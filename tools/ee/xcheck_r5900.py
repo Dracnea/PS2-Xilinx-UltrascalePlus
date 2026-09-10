@@ -157,7 +157,12 @@ def main():
         except Exception as e:
             bad.append(("their model raised %r" % (e,), ir, None, None))
             continue
-        mem.store(mine.pc, 4, ir)
+        # The instruction address space is aliased to IMEM_MASK, so the
+        # instruction has to be written where the fetch will look for it.
+        # Without the mask this walks off the end after 16384 steps and starts
+        # re-executing the beginning of the program, which looks exactly like
+        # the two models disagreeing about a register neither one touched.
+        mem.store(mine.pc & MINE.IMEM_MASK, 4, ir)
         mine.step()
         checked += 1
         for r in range(1, 32):

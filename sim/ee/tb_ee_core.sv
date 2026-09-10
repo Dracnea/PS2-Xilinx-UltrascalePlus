@@ -65,7 +65,13 @@ module tb_ee_core;
          ipd[k] <= ipd[k-1];
          ipv[k] <= ipv[k-1];
       end
-      ipd[0] <= {mem[i_addr+3], mem[i_addr+2], mem[i_addr+1], mem[i_addr]};
+      // The instruction address space is aliased to the size of this image, so
+      // the exception vector at 0x80000180 lands inside a program that can be
+      // loaded.  sim/ee/r5900_ref.py masks identically.  A harness convention,
+      // not architecture: without it an exception test would need a megabyte of
+      // mostly-empty image and the handler could never be reached.
+      ipd[0] <= {mem[(i_addr & 32'hFFFF)+3], mem[(i_addr & 32'hFFFF)+2],
+                 mem[(i_addr & 32'hFFFF)+1], mem[(i_addr & 32'hFFFF)]};
       ipv[0] <= i_read;
    end
    assign i_data  = ipd[ilat-1];

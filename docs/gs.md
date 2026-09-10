@@ -193,6 +193,36 @@ The other properties hold as before: two triangles sharing a diagonal tile a
 square exactly, a degenerate triangle draws nothing, a strip reuses its last two
 vertices, and nothing lands outside the hypotenuse.
 
+## The DDA, proven before it is built — 2026-09-10
+
+The reference computes each scanline's span with exact rational arithmetic,
+which is the right shape for a specification and the wrong shape for hardware:
+it divides once per scanline per edge, in unbounded precision. Hardware divides
+once per *edge* and steps.
+
+Those are the same answer only if the stepping is exact, and "only if" is the
+whole problem — a DDA that accumulates with the wrong rounding is right in the
+middle of an edge and wrong at its ends, which is precisely where a fill rule
+matters. So `sim/gs/test_dda.py` checks the formulation the RTL will use against
+the reference on random edges, including deliberately sub-pixel ones, **before**
+any of it is committed to RTL: about 300,000 scanlines per seed, agreeing
+exactly. Finding a formulation error from a Python diff costs minutes; finding
+it from a waveform costs a day.
+
+The derivation, in pixel space with `y` an integer scanline:
+
+    x(y) = [ x0*dy + dx*(16*y - y0) ] / (16*dy)        (all terms integers)
+
+so with `num` stepping by `16*dx` each scanline and `den = 16*dy` constant, the
+span edge is `ceil(num/den)`. Dividing once at setup to get the per-scanline
+quotient and remainder steps turns that into an add and at most one correction
+per scanline, which is what the RTL will do.
+
+One implementation note for when it is written: the quotient step is a *floor*
+division, and VHDL's integer division truncates toward zero. For a leftward edge
+the two differ, and the remainder must stay in `[0, den)` for the single
+correction to be enough.
+
 ## What is not started
 
 The rest of step 4 — triangles (flat, then Gouraud, then textured), lines and
