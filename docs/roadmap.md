@@ -212,13 +212,21 @@ arbitration are part of this step, not a detail of it.
 `OSDSYS` — the PS2's own browser screen — which is the first moment the thing
 behaves like a console.
 
-### 4. The Graphics Synthesizer — 4 blocks
+### 4. The Graphics Synthesizer — 4 blocks — **started in parallel, 2026-09-10**
 
 Best specified of everything left (the GS manual documents the memory layout
 and every register) and a fixed-function pipeline, so it is large but not
 uncertain. It can be built and verified **standalone before the EE exists**,
 by feeding it GIF packets from the host and comparing its framebuffer against
 PCSX2's software renderer frame for frame.
+
+Because that independence is real, this milestone no longer waits for the EE:
+it runs alongside it. [gs.md](gs.md) has the plan and the order. The reference
+model (`sim/gs/gs_ref.py`) covers GIFtag decode, the general registers and the
+local-memory swizzle, and the addressing is cross-checked against PCSX2
+exhaustively by `tools/gs/xcheck_swizzle.py` — PCSX2 being a test oracle and a
+second implementation, never an authority, and never a source of code, since it
+is GPL-3 and this repository is GPL-2.
 
 *Milestone:* a picture, through the video path that already works.
 

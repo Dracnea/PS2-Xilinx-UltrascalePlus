@@ -1,0 +1,84 @@
+# The Graphics Synthesizer: how it gets built, and how it gets checked
+
+The GS is the best-specified thing left in this project and the only major block
+that can be built **before** the Emotion Engine exists. It takes GIF packets and
+produces pixels; nothing about that requires a working R5900, so the host can
+play the part of the EE by writing packets straight into the GIF, exactly as the
+host already plays the part of the EE for SIF RPC on the disc path.
+
+That independence is why it runs in parallel with the EE rather than after it.
+
+## What already exists
+
+`rtl/gs/gs_lmem.vhd` — the 4 MB of local memory, in UltraRAM. That file settles
+the physical question (128 URAM, 20% of the C1100's 640) and deliberately knows
+nothing about pixel formats: the page/block/column swizzle belongs to whatever
+decides *which* address to touch, which is the rasteriser and the texture unit.
+
+Everything else is unwritten.
+
+## The order, and why it is this order
+
+The EE core was built reference-model-first and it worked: a Python model that
+models no timing at all, random and directed programs, and a diff of
+architectural state per retired instruction. Three real bugs and three broken
+instruments came out of that harness, and none of them would have been found by
+looking at the RTL. The GS gets the same treatment, and the order is chosen so
+that every step produces something that can be diffed:
+
+1. **GIF packet decode and the register file.** A GIFtag names how many
+   quadwords follow, in which format, and which register each maps to. Nothing
+   is drawn. Verifiable on its own: feed packets, compare the 64 general
+   registers afterwards.
+2. **Local memory addressing.** The page/block/column swizzle, per pixel format.
+   Verifiable on its own and *exhaustively* — there are only 4 M addresses, so
+   every one can be checked rather than sampled.
+3. **Host-to-local transfers.** `BITBLTBUF`/`TRXPOS`/`TRXREG`/`TRXDIR` and the
+   `HWREG` data path. This is the first thing that puts pixels in memory, and it
+   needs no rasteriser at all — which makes it the first end-to-end test.
+4. **The rasteriser**, primitive by primitive: sprite first (axis-aligned, no
+   interpolation), then flat triangle, then Gouraud, then the scissor and the
+   Z and alpha tests, then texture.
+5. **PCRTC**, out through the video path that already works.
+
+Steps 1 to 3 are a complete, testable slice with no interpolation in them, which
+is the same reasoning that made the R5900 integer core the first EE slice.
+
+## Where PCSX2 comes in, and where it does not
+
+PCSX2 is checked out at `~/pcsx2-ref`, **outside this repository and staying
+there**. Two separate reasons:
+
+- **Licensing.** PCSX2 is GPL-3.0+; this repository is GPL-2. Those are not
+  compatible in the direction that matters, so no PCSX2 code, and nothing
+  derived from it, goes into this tree. What is written here is written from the
+  GS User's Manual.
+- **Authority.** The same rule the EE work uses: PCSX2 is a second
+  implementation, not an authority, and where the two disagree the manual
+  decides.
+
+What PCSX2 is genuinely good for is being a **test oracle**. Its swizzle tables
+encode facts about Sony's hardware, and a formula written independently from the
+manual can be checked against them mechanically, exhaustively, and in a way that
+produces a pass or a fail rather than a pile of data to eyeball.
+`tools/gs/xcheck_swizzle.py` does exactly that: it reads the tables out of the
+PCSX2 checkout at run time, compares all 4 M addresses against the formula in
+`sim/gs/gs_ref.py`, and reports agreement. The tables are never copied here; the
+tool is useless without a PCSX2 checkout, which is the correct dependency.
+
+There is also an embedding index over the PCSX2 GS sources at
+`~/pcsx2-ref/index`, built with `nomic-embed-code` on the local GPU, for finding
+the code that implements a behaviour when grep does not know the vocabulary. It
+is a search aid over someone else's tree, and its output is a file and a line
+number to go read.
+
+**What the local model is not used for is generating GS behaviour.** A
+hallucinated register field would be indistinguishable from a real one until a
+game rendered wrongly, and since every field has to be checked against the
+manual anyway, generating them first saves nothing and risks a great deal. The
+division is: mechanical and checkable, yes; authoritative, never.
+
+## What is not started
+
+Everything in steps 1 to 5. The reference model exists for step 1 and the
+addressing of step 2.
