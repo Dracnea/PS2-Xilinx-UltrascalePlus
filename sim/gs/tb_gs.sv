@@ -105,14 +105,24 @@ module tb_gs;
       reset <= 0;
       @(posedge clk);
 
-      budget = npkt * 64 + 4096;
+      // Sized for the slowest consumer, not the average one: a triangle holds
+      // ready low for a long divide per edge and then a pixel per clock -- or
+      // four per pixel when the write is masked -- so a budget scaled for
+      // register writes runs out mid-stream, the rest of the packets are never
+      // fed, and the result looks like the two models disagreeing about
+      // registers rather than a testbench giving up.
+      budget = npkt * 4096 + 65536;
       while (sent < npkt && budget > 0) begin
          @(posedge clk);
          budget = budget - 1;
       end
       n = sent;
-      // let any pixels still in flight land
-      repeat (64) @(posedge clk);
+      // Let everything still in flight land.  This has to be generous: a
+      // triangle's setup is two long divisions per edge before a single pixel
+      // is written, so a drain sized for a transfer ends the simulation in the
+      // middle of the setup and the framebuffer comes out empty -- which looks
+      // exactly like a rasteriser that does not work.
+      repeat (200000) @(posedge clk);
       if (budget <= 0) $display("# STALLED after %0d of %0d quadwords", n, npkt);
 
       for (r = 0; r < 128; r = r + 1) begin

@@ -260,6 +260,32 @@ for a leftward edge the quotient step is off by one and the remainder goes
 negative. Edge 1 of the very first seed was such an edge — `dx = -5433`, where
 floor gives `qstep = -29, rstep = 1232` and truncation gives `-28, -1808`.
 
+## The triangle rasteriser: attempted, reverted — 2026-09-10
+
+The rasteriser was built on top of `gs_edge_dda` — three edge units started
+together at the triangle's first scanline, two of them spanning any given
+scanline, the span between their `ceil(x)` values — and a directed triangle
+matched the reference exactly, 36 pixels for a right triangle with legs of
+eight. Two real bugs came out of it and are worth keeping even though the code
+is not:
+
+- The testbench drained only 64 cycles after the last packet. A triangle's setup
+  is two long divisions *per edge* before a single pixel is written, so the
+  simulation ended in the middle of the setup and the framebuffer came out
+  empty — which looks exactly like a rasteriser that does not work. The drain is
+  now sized for the slowest consumer, and that fix is kept.
+- Stepping the edges and reading them in the same cycle gives the *previous*
+  scanline's span, so the triangle came out one pixel too wide on every line but
+  the first. A shape that is still a triangle is the worst kind of wrong.
+
+It was **reverted** because it broke seven of ten random sprite streams that had
+been passing, and the cause was not found within the session. Committing a
+rasteriser that works on the one case it was aimed at while quietly breaking the
+primitive that already worked would be worse than having no rasteriser: the
+suite would stay green only because the failing case had been removed from it.
+`gs_edge_dda.vhd` stands on its own and is unaffected — it is verified against
+the reference independently, which is precisely why it survives the revert.
+
 ## What is not started
 
 The rest of step 4 — triangles (flat, then Gouraud, then textured), lines and

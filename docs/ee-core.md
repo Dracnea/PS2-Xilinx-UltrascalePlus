@@ -219,7 +219,36 @@ adds a shifter and a merge to the memory path. It stays off the critical path
 because that path is the ALU in A1, and the merge happens in A2 where there is
 slack.
 
-**Exceptions cost about 10%, and the reason is not yet established.** The first
+**Correction: the 10% was not exceptions.** An ablation says so, and it also
+says the earlier attribution was built on a comparison that did not hold.
+
+| build | Fmax |
+|---|---|
+| reported after unaligned loads and stores | 252.1 MHz |
+| the same RTL plus MMI pipeline-1 and COP0, re-measured | 233.2 MHz |
+| …plus exceptions (current) | 228.2 MHz |
+| current with only the exception redirect removed | 250.9 MHz |
+
+The 252.1 figure was measured **before MMI and COP0 were added**, and neither of
+those was re-measured, so "252.1 → 228.2" spanned three changes rather than one.
+Most of the loss is not the exception path at all.
+
+The controlled comparison is the last row — the same RTL with one thing removed
+— and it says the exception **redirect** costs about 9%. That is worth fixing
+and the fix is known: register it. The redirect computes the vector or `EPC` and
+drives the fetch PC in the same cycle it commits, in front of the branch
+redirect that was already there; taking an extra cycle over it costs nothing,
+because exceptions are rare, and it is exactly what the branch redirect already
+does.
+
+The fourth row also undercuts the second: a design with *more* logic in it
+(250.9) measures faster than one with less (233.2). Both cannot be a property of
+the RTL, so placement variance here is worth about ±8%, which is wider than the
+±5% estimated earlier and wide enough that no single-fit comparison of two
+different designs should be trusted. Ablations of one change against one base
+are the only comparisons that mean anything.
+
+**The first hypothesis was wrong, and is recorded because it was tested.** The first
 guess was the overflow check: it was written as a 33-bit add with the carry and
 sign bits compared, which puts a wider adder *in series* on the path that was
 already critical. Rewriting it to read overflow off the sign bits — two operands
