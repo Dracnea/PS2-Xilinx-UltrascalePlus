@@ -913,32 +913,264 @@ assumed. Making both arms live found no bug — COP0 and MMI SIMD pass in random
 programs at the first attempt — which is the good outcome and not the point.
 The point is that it was not known.
 
+## MMI's parallel ALU — 2026-09-11
+
+MMI0 (function `0x08`) and MMI1 (`0x28`) are the SIMD arithmetic: the same
+handful of operations over 4 × 32, 8 × 16 or 16 × 8 lanes, in wrapping,
+signed-saturating and unsigned-saturating forms. Thirty instructions —
+`PADDW`/`H`/`B`, `PSUB*`, `PCGT*`, `PCEQ*`, `PMAX*`, `PMIN*`, the `PADDS*` and
+`PSUBS*` signed-saturating forms, the `PADDU*` and `PSUBU*` unsigned ones, and
+`PABSW`/`PABSH`.
+
+They are written **once** and instantiated at three widths, in both models.
+That is not tidiness: a saturation bound that is right for halfwords and wrong
+for bytes is precisely the fault that survives a test suite, and here the bound
+is built from the lane's own width rather than written out three times. In the
+RTL, `par_lane` derives `SMAX` and `SMIN` from `a'length`, and `par128` wraps it
+in three static loops with the width chosen by a literal at each decode arm.
+
+**A decode bug this uncovered.** The RTL's MMI arm read `if fn = 0x09 then MMI2
+else MMI3`, so functions `0x08` and `0x28` — MMI0 and MMI1 — fell through and
+were decoded as `POR`, `PNOR` or `PCPYUD`. Nothing noticed, because nothing
+emitted them: the same blind spot that hid MMI2 and MMI3 themselves until the
+generator's dead arms were found earlier the same day.
+
+### The random programs are very weak here — measured
+
+`gen_prog.py` now emits MMI0 and MMI1 at about 7 % of instructions. That is
+enough to execute them and not nearly enough to check them. Mutating the RTL and
+re-running three seeds:
+
+| mutation | random seeds | `gen_mmi.py` |
+|---|---|---|
+| `PMAX` and `PMIN` swapped | 1 of 3 | caught |
+| `PCGT` compares unsigned | 1 of 3 | caught |
+| `PSUBU` wraps instead of clamping at zero | **0 of 3** | caught |
+| `PABS` does not saturate the most negative value | **0 of 3** | caught |
+| `PADDU` does not saturate | 1 of 3 | caught |
+| `PADDSB` built at 16-bit lanes instead of 8 | **0 of 3** | caught |
+| signed saturation bound off by one | **0 of 3** | caught |
+
+Four of seven are never caught. The reason is plain once stated: a random
+register holds a value that happens to compare one way, and **saturation needs
+operands that actually overflow their lane**, which random values built from
+`addiu` and `lui` rarely do.
+
+`sim/ee/gen_mmi.py` builds its operands from the corners and nothing else —
+`0x7F`, `0x80`, `0xFF`, `0x01` as bytes, which read as `0x7F7F`/`0x8080`-shaped
+halfwords and `0x7F80FF01`-shaped words, so one pair of registers puts every
+width against its own maximum, its own minimum, minus one and one. Saturation
+becomes the normal case rather than a rare one. Every defined sub-opcode of both
+tables is emitted against every operand pair and in both operand orders, since
+subtraction and the compares are not symmetric. All seven mutations are caught.
+
+The encodings are cross-checked against PCSX2's `tbl_MMI0` and `tbl_MMI1`, and
+the saturating and absolute-value corners against its `MMI.cpp` — `|0x80000000|`
+is `0x7FFFFFFF`, not itself.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
-and the VUs. The integer subset is not complete: no TLB, and MMI's SIMD set is
-only the six logical and copy forms (`PAND`, `PXOR`, `PCPYLD`, `POR`, `PNOR`,
-`PCPYUD`) — the parallel arithmetic of MMI0 and MMI1 is not started. The
+and the VUs. The integer subset is not complete: no TLB. MMI is the parallel
+ALU above plus the six logical and copy forms (`PAND`, `PXOR`, `PCPYLD`, `POR`,
+`PNOR`, `PCPYUD`); **the pack, extend and shuffle group is not started** —
+`PEXTL*`, `PEXTU*`, `PPAC*`, `PEXT5`, `PPAC5`, `QFSRV` and `PADSBH`. The
 unaligned group — `LWL`, `LWR`, `SWL`, `SWR`, `LDL`, `LDR`, `SDL`, `SDR` — is
 done, and so are `LQ` and `SQ`.
 
-Timing: **253.2 MHz** against a 294.912 MHz target, a factor of 1.16
-(`xcu55n-fsvh2892-2LV-e`, out of context, constrained at 3.39 ns, WNS
--0.559 ns, 2026-09-11). That is **down from 283.5 MHz**, so widening the data
-port to 128 bits cost about 30 MHz — a little over 10 %.
+### Where the clock went, and how much of that first answer was noise — 2026-09-11
 
-The critical path did not move to the load return path, which is where the
-change would be expected to hurt. It is `m_val_reg[17] → m_val_reg[49]`, ten
-logic levels and **64 % routing**, with the next two paths starting at `fb_m`,
-the forward-select shadow the previous timing work introduced. So the datapath
-registers are further apart than they were rather than deeper, which is what a
-128-bit-wide `m_val` and a 128-bit store alignment network would do to
-placement.
+The quadword port measured 283.5 → 253.2 MHz and the first note here attributed
+the 30 MHz to the port. **That number was one fit against one fit, and it was
+mostly wrong.** Placement on this design is not repeatable enough to support a
+comparison that fine: the same netlist under three different `place_design`
+directives spans 33 MHz. Every variant below was therefore fitted three times —
+`Default`, `Explore` and `ExtraNetDelay_high` — on `xcu55n-fsvh2892-2LV-e`, out
+of context, constrained at 3.39 ns.
 
-That diagnosis is from the timing report alone and is **not** confirmed by an
-experiment: no fit was run with the port widened and the alignment network left
-narrow, which is what would separate the two causes. Recorded as the next
-timing question rather than as a conclusion.
+| variant | Default | Explore | ExtraND | **mean** | spread | LUTs |
+|---|---|---|---|---|---|---|
+| **base** — before this change, 64-bit port | 283.5 | 278.5 | 274.2 | **278.7** | 9.3 | 10558 |
+| **head** — 128-bit port, `LQ`/`SQ`, 128-bit alignment networks | 253.2 | 258.2 | 286.5 | **266.0** | **33.3** | 10619 |
+| **narrow** — as head, alignment networks kept 64-bit | 271.7 | 278.4 | 268.1 | **272.7** | 10.3 | 10571 |
+| **final** — narrow plus MMI0/MMI1 | 208.6 | 207.9 | 220.3 | **212.3** | 12.4 | 16597 |
+| **shared** — final with one shared adder instead of thirty arrays | 177.2 | 173.8 | 177.8 | **176.3** | 4.0 | 12559\* |
+
+\* post-synthesis; the others are post-route.
+
+**The method matters more than any single row.** `head` alone ranges from 253.2
+to 286.5 depending only on how the placer was asked to work — and its best run
+*beats* `base`'s best. A difference of 20 MHz between two single fits of this
+design is not evidence of anything. Differences of means across three
+directives are worth something; differences below about 10 MHz still are not.
+
+What the means say:
+
+* **`LQ` and `SQ` are free.** Removing their decode with the port left at 128
+  bits gave 250.8 MHz against `head`'s 253.2 under the same directive — no
+  better, and well inside the spread.
+* **The quadword port costs about 13 MHz**, not 30: 278.7 → 266.0.
+* **Keeping the alignment networks narrow recovers about 7 of that**, 266.0 →
+  272.7, and costs nothing in area — 10571 LUTs against 10619. Writing the
+  store shift as one 128-bit shift by `ea(3 downto 0)` builds a sixteen-position
+  barrel shifter twice as wide as the old one, and nothing needs it: every
+  access narrower than a quadword is naturally aligned and lies inside one half,
+  so the shift stays 64 bits and address bit 3 picks the half afterwards. That
+  is what the core does now. The claim in the first version of this note — 18.5
+  MHz recovered — was one fit and is withdrawn.
+* **The residual cost of the wider port is about 6 MHz** and is `d_wdata`,
+  `d_rdata` and their fanout.
+
+**MMI's parallel ALU is the expensive item, by a long way:** 272.7 → 212.3, a
+loss of 60 MHz, and +6026 LUTs — 57 % on top of the whole core. That is the real
+clock problem on this page now, and it dwarfs everything the memory port did.
+
+### The obvious fix for it is worse — measured, 2026-09-11
+
+Thirty decode arms each calling a generic function with literal arguments means
+synthesis specialises each call, so the core carried thirty independent lane
+arrays. The obvious repair is to share one adder: every arithmetic and
+comparison form here is one addition or one subtraction away from its answer, so
+a single byte-wise adder with its carry broken at whichever lane boundaries the
+width selects should serve all of them, with sign bits and multiplexers doing
+the rest.
+
+It was written, it passes all 51 regression runs and all eight mutations aimed
+at it — including the two that are specific to its structure, the carry not
+broken at lane boundaries and the wrong bytes-per-lane — and **it is 36 MHz
+slower**: 176.3 against 212.3, consistently, with the smallest spread of any
+variant here. It saves about 4000 LUTs and costs a sixth of the clock.
+
+The reason is visible in what was built. Breaking the carry at a boundary chosen
+at *run time* puts a multiplexer between every pair of bytes, which is exactly
+what a fast carry chain cannot tolerate; the thirty specialised arrays each got
+a clean `CARRY8` chain of a fixed width instead. Area was never the binding
+constraint on this project — [hbm.md](hbm.md) and the roadmap both say the
+scarce resource is UltraRAM, and the whole core is 1.9 % of the part — so the
+trade goes the other way and the thirty-array form is kept.
+
+It is worth recording rather than deleting: a shared datapath is the textbook
+answer, it is smaller, and on this fabric it is the wrong one. A version that
+picks the carry breaks at *synthesis* time — three specialised adders rather
+than one runtime-configurable one — would plausibly get both, and is the shape
+to try next.
+
+One more thing that only synthesis found: the shared version simulated
+correctly and failed `synth_design` with *array index -1 out of range*. Reading
+the previous byte's carry as `cy(i - 1)` is never evaluated at `i = 0`, because
+the lane-start branch is taken there, but synthesis elaborates both arms of the
+unrolled loop. Carrying it in a variable makes the index impossible rather than
+merely unreachable. **`xvhdl` and `xsim` passing is not evidence that a design
+synthesises**, and nothing in this project's flow had said so before.
+
+Timing therefore stands at **212.3 MHz** mean against a 294.912 MHz target, a
+factor of 1.39 — the worst it has been, and MMI is why.
+
+## MMI's parallel ALU — 2026-09-11
+
+MMI0 (function `0x08`) and MMI1 (`0x28`) are the SIMD arithmetic: the same
+handful of operations over 4 × 32, 8 × 16 or 16 × 8 lanes, in wrapping,
+signed-saturating and unsigned-saturating forms. Thirty instructions —
+`PADDW`/`H`/`B`, `PSUB*`, `PCGT*`, `PCEQ*`, `PMAX*`, `PMIN*`, the `PADDS*` and
+`PSUBS*` signed-saturating forms, the `PADDU*` and `PSUBU*` unsigned ones, and
+`PABSW`/`PABSH`.
+
+They are written **once** and instantiated at three widths, in both models.
+That is not tidiness: a saturation bound that is right for halfwords and wrong
+for bytes is precisely the fault that survives a test suite, and here the bound
+is built from the lane's own width rather than written out three times. In the
+RTL, `par_lane` derives `SMAX` and `SMIN` from `a'length`, and `par128` wraps it
+in three static loops with the width chosen by a literal at each decode arm.
+
+**A decode bug this uncovered.** The RTL's MMI arm read `if fn = 0x09 then MMI2
+else MMI3`, so functions `0x08` and `0x28` — MMI0 and MMI1 — fell through and
+were decoded as `POR`, `PNOR` or `PCPYUD`. Nothing noticed, because nothing
+emitted them: the same blind spot that hid MMI2 and MMI3 themselves until the
+generator's dead arms were found earlier the same day.
+
+### The random programs are very weak here — measured
+
+`gen_prog.py` now emits MMI0 and MMI1 at about 7 % of instructions. That is
+enough to execute them and not nearly enough to check them. Mutating the RTL and
+re-running three seeds:
+
+| mutation | random seeds | `gen_mmi.py` |
+|---|---|---|
+| `PMAX` and `PMIN` swapped | 1 of 3 | caught |
+| `PCGT` compares unsigned | 1 of 3 | caught |
+| `PSUBU` wraps instead of clamping at zero | **0 of 3** | caught |
+| `PABS` does not saturate the most negative value | **0 of 3** | caught |
+| `PADDU` does not saturate | 1 of 3 | caught |
+| `PADDSB` built at 16-bit lanes instead of 8 | **0 of 3** | caught |
+| signed saturation bound off by one | **0 of 3** | caught |
+
+Four of seven are never caught. The reason is plain once stated: a random
+register holds a value that happens to compare one way, and **saturation needs
+operands that actually overflow their lane**, which random values built from
+`addiu` and `lui` rarely do.
+
+`sim/ee/gen_mmi.py` builds its operands from the corners and nothing else —
+`0x7F`, `0x80`, `0xFF`, `0x01` as bytes, which read as `0x7F7F`/`0x8080`-shaped
+halfwords and `0x7F80FF01`-shaped words, so one pair of registers puts every
+width against its own maximum, its own minimum, minus one and one. Saturation
+becomes the normal case rather than a rare one. Every defined sub-opcode of both
+tables is emitted against every operand pair and in both operand orders, since
+subtraction and the compares are not symmetric. All seven mutations are caught.
+
+The encodings are cross-checked against PCSX2's `tbl_MMI0` and `tbl_MMI1`, and
+the saturating and absolute-value corners against its `MMI.cpp` — `|0x80000000|`
+is `0x7FFFFFFF`, not itself.
+
+## What is not started
+
+Hazards and pipelining — the core is still one instruction at a time. The FPU
+and the VUs. The integer subset is not complete: no TLB. MMI is the parallel
+ALU above plus the six logical and copy forms (`PAND`, `PXOR`, `PCPYLD`, `POR`,
+`PNOR`, `PCPYUD`); **the pack, extend and shuffle group is not started** —
+`PEXTL*`, `PEXTU*`, `PPAC*`, `PEXT5`, `PPAC5`, `QFSRV` and `PADSBH`. The
+unaligned group — `LWL`, `LWR`, `SWL`, `SWR`, `LDL`, `LDR`, `SDL`, `SDR` — is
+done, and so are `LQ` and `SQ`.
+
+### Where the 30 MHz went — four fits, 2026-09-11
+
+The quadword port cost 283.5 → 253.2 MHz and the first note here guessed at the
+reason from the timing report. The guess was wrong in its first clause and the
+experiment was cheap, so here are four fits of the same core, same part
+(`xcu55n-fsvh2892-2LV-e`), same 3.39 ns constraint, out of context:
+
+| variant | Fmax | LUTs |
+|---|---|---|
+| **base** — the core before this change, 64-bit port | **283.5 MHz** | 10558 |
+| **head** — 128-bit port, `LQ`/`SQ`, 128-bit alignment networks | **253.2 MHz** | 10619 |
+| **noquad** — 128-bit port, alignment networks wide, `LQ`/`SQ` decode removed | **250.8 MHz** | — |
+| **narrow** — 128-bit port, `LQ`/`SQ`, alignment networks kept 64-bit | **271.7 MHz** | 10571 |
+
+`base` reproduces the recorded 283.5 MHz exactly, which is what makes the other
+three comparable.
+
+**`LQ` and `SQ` are not the cost.** Removing their decode entirely, with the
+port left at 128 bits, gives 250.8 MHz — no better than keeping them, and
+slightly worse, which is the size of the run-to-run noise here. The instruction
+pair is free; the port is what was paid for.
+
+**The alignment networks were most of it.** Writing the store shift as one
+128-bit shift by `ea(3 downto 0)` builds a sixteen-position barrel shifter twice
+as wide as the old one — about four times the multiplexer — and the load return
+path did the same in reverse. Neither needed to: every access narrower than a
+quadword is naturally aligned and therefore lies inside one half, so the shift
+can stay 64 bits wide with eight positions and address bit 3 can pick the half
+afterwards. That recovers **18.5 MHz of the 30**, and it is now what the core
+does.
+
+**It is not an area story**, which is the part worth keeping. The three variants
+are within 61 LUTs of each other — 0.6 % — so nothing was competing for space.
+What changed was the depth of a multiplexer on a path that mattered, and the
+placement around it: `head`'s worst path was 64 % routing.
+
+Timing is measured above, three placement directives per variant: **212.3 MHz**
+mean against a 294.912 MHz target. MMI's parallel ALU is 60 MHz of that and is
+the thing to attack next; the memory port costs about 6 MHz once its alignment
+networks are kept narrow.
 
 IPC is better but not closed: CPI 1.78 on ordinary code, 2.15 on branch-heavy.
 What is left is multiply/divide latency (inherent), one stall per memory access,

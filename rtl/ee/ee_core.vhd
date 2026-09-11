@@ -315,6 +315,96 @@ architecture arch of ee_core is
 
    -- Does this opcode read rs / rt?  Getting these wrong in the safe direction
    -- only costs a stall, so anything unrecognised is assumed to read both.
+   -- ---- MMI's parallel ALU ------------------------------------------------
+   -- MMI0 (function 0x08) and MMI1 (0x28) are the same handful of operations
+   -- over 4 x 32, 8 x 16 or 16 x 8 lanes of a 128-bit register, in wrapping,
+   -- signed-saturating and unsigned-saturating forms.
+   --
+   -- One lane function, instantiated at three widths, rather than thirty
+   -- separate units: a saturation bound that is right for halfwords and wrong
+   -- for bytes is exactly the fault that survives a test suite, and here the
+   -- bound is built from the operand's own width instead of written out three
+   -- times.  The width multiplexer at the end costs three copies of the lane
+   -- array; sharing one adder across the widths with carry breaks is the
+   -- smaller structure and is left until this is known to be right.
+   type par_op_t is (P_ADD, P_SUB, P_CGT, P_CEQ, P_MAX, P_MIN,
+                     P_ADDS, P_SUBS, P_ADDU, P_SUBU, P_ABS);
+
+   function par_lane(op : par_op_t; a, b : unsigned) return unsigned is
+      constant W    : natural := a'length;
+      constant ONES : unsigned(W-1 downto 0) := (others => '1');
+      -- the widest and most negative values this lane can hold, built from the
+      -- lane's own width so that one bound cannot be right at 16 bits and wrong
+      -- at 8
+      constant SMAX : signed(W-1 downto 0) := signed(shift_right(ONES, 1));
+      constant SMIN : signed(W-1 downto 0) := signed(not shift_right(ONES, 1));
+      variable sx   : signed(W+1 downto 0) := resize(signed(a), W+2);
+      variable sy   : signed(W+1 downto 0) := resize(signed(b), W+2);
+      variable ux   : unsigned(W downto 0) := resize(a, W+1);
+      variable uy   : unsigned(W downto 0) := resize(b, W+1);
+      variable ss   : signed(W+1 downto 0);
+      variable uu   : unsigned(W downto 0);
+   begin
+      case op is
+         when P_ADD => return a + b;
+         when P_SUB => return a - b;
+         when P_CGT =>
+            if signed(a) > signed(b) then return (a'range => '1');
+            else return (a'range => '0'); end if;
+         when P_CEQ =>
+            if a = b then return (a'range => '1');
+            else return (a'range => '0'); end if;
+         when P_MAX =>
+            if signed(a) > signed(b) then return a; else return b; end if;
+         when P_MIN =>
+            if signed(a) < signed(b) then return a; else return b; end if;
+         when P_ADDS | P_SUBS =>
+            if op = P_ADDS then ss := sx + sy; else ss := sx - sy; end if;
+            if ss > resize(SMAX, W+2) then return unsigned(SMAX);
+            elsif ss < resize(SMIN, W+2) then return unsigned(SMIN);
+            else return unsigned(ss(W-1 downto 0)); end if;
+         when P_ADDU =>
+            uu := ux + uy;
+            if uu(W) = '1' then return (a'range => '1');
+            else return uu(W-1 downto 0); end if;
+         when P_SUBU =>
+            if a < b then return (a'range => '0'); else return a - b; end if;
+         when P_ABS =>
+            -- rt only; rs is not read.  Negating the most negative value cannot
+            -- be represented and the R5900 saturates rather than wrapping, so
+            -- |0x80000000| is 0x7FFFFFFF and not itself.
+            if signed(b) = SMIN then return unsigned(SMAX);
+            elsif signed(b) < 0 then return unsigned(-signed(b));
+            else return b; end if;
+      end case;
+   end function;
+
+   -- The three widths are separate loops because a loop bound has to be static;
+   -- the caller picks one with a literal, so only the selected array is used.
+   function par128(op : par_op_t; a, b : std_logic_vector(127 downto 0);
+                   w : natural) return std_logic_vector is
+      variable r : std_logic_vector(127 downto 0) := (others => '0');
+   begin
+      case w is
+         when 8 =>
+            for i in 0 to 15 loop
+               r(8*i+7 downto 8*i) := std_logic_vector(par_lane(op,
+                  unsigned(a(8*i+7 downto 8*i)), unsigned(b(8*i+7 downto 8*i))));
+            end loop;
+         when 16 =>
+            for i in 0 to 7 loop
+               r(16*i+15 downto 16*i) := std_logic_vector(par_lane(op,
+                  unsigned(a(16*i+15 downto 16*i)), unsigned(b(16*i+15 downto 16*i))));
+            end loop;
+         when others =>
+            for i in 0 to 3 loop
+               r(32*i+31 downto 32*i) := std_logic_vector(par_lane(op,
+                  unsigned(a(32*i+31 downto 32*i)), unsigned(b(32*i+31 downto 32*i))));
+            end loop;
+      end case;
+      return r;
+   end function;
+
    function reads_rs(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
       variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
@@ -437,6 +527,8 @@ begin
       variable ex_val                 : std_logic_vector(63 downto 0);
       variable ex_valhi               : std_logic_vector(63 downto 0);
       variable ex_w128                : std_logic;
+      variable par_v                  : std_logic_vector(127 downto 0);
+      variable par_ok                 : boolean;
       variable ex_hi_we, ex_lo_we     : std_logic;
       variable ex_hi, ex_lo           : std_logic_vector(63 downto 0);
       variable ex_ismem, ex_isload    : std_logic;
@@ -481,9 +573,10 @@ begin
 
       -- MEM
       variable ldv, ldw          : std_logic_vector(63 downto 0);
-      variable ldw128            : std_logic_vector(127 downto 0);
       variable uw, um, uv        : unsigned(31 downto 0);
-      variable uv64, udw         : unsigned(63 downto 0);
+      variable uv64, udw, ldh64  : unsigned(63 downto 0);
+      variable sw64              : unsigned(63 downto 0);
+      variable sbe8              : unsigned(7 downto 0);
       variable ku, shu           : integer range 0 to 63;
 
       -- IF queue bookkeeping
@@ -881,7 +974,64 @@ begin
                   ex_we   := '1';
                   ex_rd   := rd;
                   ex_w128 := '1';
-                  if fn = 16#09# then                        -- MMI2
+                  if fn = 16#08# or fn = 16#28# then         -- MMI0 / MMI1
+                     -- The parallel ALU.  Every arm names its lane width as a
+                     -- literal so that the loop inside par128 has a static
+                     -- bound; the width multiplexer is what is left over.
+                     --
+                     -- Before this existed, function 0x08 and 0x28 fell through
+                     -- to the MMI3 arm below and were decoded as POR, PNOR or
+                     -- PCPYUD.  Nothing noticed, because the generator emitted
+                     -- neither -- the same blind spot that hid MMI2 and MMI3
+                     -- themselves until 2026-09-11.
+                     par_v := (others => '0');
+                     par_ok := true;
+                     if fn = 16#08# then                     -- MMI0
+                        case sa is
+                           when 16#00# => par_v := par128(P_ADD,  a128, b128, 32);
+                           when 16#01# => par_v := par128(P_SUB,  a128, b128, 32);
+                           when 16#02# => par_v := par128(P_CGT,  a128, b128, 32);
+                           when 16#03# => par_v := par128(P_MAX,  a128, b128, 32);
+                           when 16#04# => par_v := par128(P_ADD,  a128, b128, 16);
+                           when 16#05# => par_v := par128(P_SUB,  a128, b128, 16);
+                           when 16#06# => par_v := par128(P_CGT,  a128, b128, 16);
+                           when 16#07# => par_v := par128(P_MAX,  a128, b128, 16);
+                           when 16#08# => par_v := par128(P_ADD,  a128, b128, 8);
+                           when 16#09# => par_v := par128(P_SUB,  a128, b128, 8);
+                           when 16#0A# => par_v := par128(P_CGT,  a128, b128, 8);
+                           when 16#10# => par_v := par128(P_ADDS, a128, b128, 32);
+                           when 16#11# => par_v := par128(P_SUBS, a128, b128, 32);
+                           when 16#14# => par_v := par128(P_ADDS, a128, b128, 16);
+                           when 16#15# => par_v := par128(P_SUBS, a128, b128, 16);
+                           when 16#18# => par_v := par128(P_ADDS, a128, b128, 8);
+                           when 16#19# => par_v := par128(P_SUBS, a128, b128, 8);
+                           when others => par_ok := false;
+                        end case;
+                     else                                    -- MMI1
+                        case sa is
+                           when 16#01# => par_v := par128(P_ABS,  a128, b128, 32);
+                           when 16#02# => par_v := par128(P_CEQ,  a128, b128, 32);
+                           when 16#03# => par_v := par128(P_MIN,  a128, b128, 32);
+                           when 16#05# => par_v := par128(P_ABS,  a128, b128, 16);
+                           when 16#06# => par_v := par128(P_CEQ,  a128, b128, 16);
+                           when 16#07# => par_v := par128(P_MIN,  a128, b128, 16);
+                           when 16#0A# => par_v := par128(P_CEQ,  a128, b128, 8);
+                           when 16#10# => par_v := par128(P_ADDU, a128, b128, 32);
+                           when 16#11# => par_v := par128(P_SUBU, a128, b128, 32);
+                           when 16#14# => par_v := par128(P_ADDU, a128, b128, 16);
+                           when 16#15# => par_v := par128(P_SUBU, a128, b128, 16);
+                           when 16#18# => par_v := par128(P_ADDU, a128, b128, 8);
+                           when 16#19# => par_v := par128(P_SUBU, a128, b128, 8);
+                           when others => par_ok := false;
+                        end case;
+                     end if;
+                     if par_ok then
+                        ex_val   := par_v(63 downto 0);
+                        ex_valhi := par_v(127 downto 64);
+                     else
+                        ex_we := '0'; ex_w128 := '0'; ex_trap := true;
+                     end if;
+                  elsif fn = 16#09# then                     -- MMI2
                      case sa is
                         when 16#12# =>                       -- PAND
                            ex_val   := a128(63 downto 0) and b128(63 downto 0);
@@ -895,7 +1045,7 @@ begin
                         when others =>
                            ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                      end case;
-                  else                                       -- MMI3
+                  elsif fn = 16#29# then                     -- MMI3
                      case sa is
                         when 16#12# =>                       -- POR
                            ex_val   := a128(63 downto 0) or b128(63 downto 0);
@@ -909,6 +1059,8 @@ begin
                         when others =>
                            ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                      end case;
+                  else
+                     ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                   end if;
 
                when 24 | 25 => ex_we := '1'; ex_rd := rt;    -- DADDI/DADDIU
@@ -954,14 +1106,30 @@ begin
                   -- bits were all there was and an aligned doubleword filled it.
                   -- On a quadword port bit 3 chooses which half, so every store
                   -- shifts -- including the one that did not have to before.
-                  kk := to_integer(ea(3 downto 0));
-                  ex_wdata := std_logic_vector(shift_left(resize(unsigned(b), 128), 8 * kk));
+                  --
+                  -- The shift stays **64 bits wide with eight positions**, and
+                  -- bit 3 of the address then picks a half.  Written as one
+                  -- 128-bit shift by ea(3 downto 0) it is a sixteen-position
+                  -- barrel shifter twice as wide -- about four times the
+                  -- multiplexer -- and none of that is needed: SB, SH, SW and SD
+                  -- are all naturally aligned, so none of them can straddle the
+                  -- eight-byte boundary that the half is chosen on.
+                  kk := to_integer(ea(2 downto 0));
+                  dh := to_integer(ea(3 downto 3));
+                  sw64 := shift_left(unsigned(b), 8 * kk);
                   case op is
-                     when 40 => ex_be := std_logic_vector(shift_left(unsigned'(x"0001"), kk));
-                     when 41 => ex_be := std_logic_vector(shift_left(unsigned'(x"0003"), kk));
-                     when 43 => ex_be := std_logic_vector(shift_left(unsigned'(x"000F"), kk));
-                     when others => ex_be := std_logic_vector(shift_left(unsigned'(x"00FF"), kk));
+                     when 40 => sbe8 := shift_left(unsigned'(x"01"), kk);
+                     when 41 => sbe8 := shift_left(unsigned'(x"03"), kk);
+                     when 43 => sbe8 := shift_left(unsigned'(x"0F"), kk);
+                     when others => sbe8 := x"FF";
                   end case;
+                  if dh = 0 then
+                     ex_wdata(63 downto 0)   := std_logic_vector(sw64);
+                     ex_be(7 downto 0)       := std_logic_vector(sbe8);
+                  else
+                     ex_wdata(127 downto 64) := std_logic_vector(sw64);
+                     ex_be(15 downto 8)      := std_logic_vector(sbe8);
+                  end if;
 
                when 30 | 31 =>                               -- LQ / SQ
                   -- The only instructions that move all 128 bits of a register.
@@ -1216,8 +1384,19 @@ begin
                   -- be selected out of it and then extended.  Getting the
                   -- extension wrong is invisible until a value happens to have
                   -- its top bit set.
-                  ldw128 := std_logic_vector(shift_right(unsigned(d_rdata), 8 * m_shift));
-                  ldv := ldw128(63 downto 0);
+                  -- Same reasoning as the store side: choose the doubleword
+                  -- with address bit 3, then shift within it by the low three
+                  -- bits.  A 128-bit shift by all four bits is four times the
+                  -- multiplexer and buys nothing, because every load narrower
+                  -- than a quadword is aligned and lies inside one half.  LQ is
+                  -- the exception and takes no shift at all -- its m_shift is
+                  -- zero and it reads d_rdata whole, below.
+                  if m_shift >= 8 then
+                     ldh64 := unsigned(d_rdata(127 downto 64));
+                  else
+                     ldh64 := unsigned(d_rdata(63 downto 0));
+                  end if;
+                  ldv := std_logic_vector(shift_right(ldh64, 8 * (m_shift mod 8)));
                   case m_width is
                      when 1 =>
                         if m_sign = '1' then

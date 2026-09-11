@@ -84,6 +84,86 @@ class Mem:
         self.b[addr:addr + n] = (val & ((1 << (n * 8)) - 1)).to_bytes(n, "little")
 
 
+# ---- MMI's parallel arithmetic ---------------------------------------------
+#
+# MMI0 (function 0x08) and MMI1 (0x28) are the SIMD ALU: the same handful of
+# operations over 4 x 32, 8 x 16 or 16 x 8 lanes of a 128-bit register, in
+# wrapping, signed-saturating and unsigned-saturating forms.  Writing them as
+# one parameterised function rather than as thirty cases is not tidiness -- a
+# saturation bound that is right for halfwords and wrong for bytes is exactly
+# the kind of fault that survives a test suite, and here the bound is computed
+# from the width instead of written down three times.
+#
+# The sub-opcode is in the `sa` field, not in `fn`.  The tables below are the
+# encodings, cross-checked against PCSX2's tbl_MMI0 and tbl_MMI1.
+
+def _lanes(v, w):
+    """A 128-bit value as 128/w lanes of w bits, lowest lane first."""
+    m = (1 << w) - 1
+    return [(v >> (w * i)) & m for i in range(128 // w)]
+
+
+def _join(ls, w):
+    v = 0
+    for i, x in enumerate(ls):
+        v |= (x & ((1 << w) - 1)) << (w * i)
+    return v
+
+
+def _sgn(x, w):
+    """A w-bit lane read as signed."""
+    return x - (1 << w) if x >> (w - 1) else x
+
+
+def _pop(op, a, b, w):
+    """One lane of a parallel operation.  Returns an unsigned w-bit result."""
+    m = (1 << w) - 1
+    smax, smin = (1 << (w - 1)) - 1, -(1 << (w - 1))
+    sa_, sb_ = _sgn(a, w), _sgn(b, w)
+
+    if op == "add":  return (a + b) & m
+    if op == "sub":  return (a - b) & m
+    if op == "cgt":  return m if sa_ > sb_ else 0
+    if op == "ceq":  return m if a == b else 0
+    if op == "max":  return a if sa_ > sb_ else b
+    if op == "min":  return a if sa_ < sb_ else b
+    if op == "adds": return min(max(sa_ + sb_, smin), smax) & m
+    if op == "subs": return min(max(sa_ - sb_, smin), smax) & m
+    if op == "addu": return min(a + b, m)
+    if op == "subu": return max(a - b, 0)
+    if op == "abs":
+        # The operand is rt; rs is not read.  Negating the most negative value
+        # cannot be represented, and the R5900 saturates rather than wrapping --
+        # |0x80000000| is 0x7FFFFFFF, not itself.
+        return smax & m if sb_ == smin else (-sb_ if sb_ < 0 else sb_) & m
+    raise AssertionError("no such parallel op: %s" % op)
+
+
+# sa -> (lane width, operation).  Gaps are encodings the manual does not define.
+MMI0_OPS = {
+    0x00: (32, "add"),  0x01: (32, "sub"),  0x02: (32, "cgt"),  0x03: (32, "max"),
+    0x04: (16, "add"),  0x05: (16, "sub"),  0x06: (16, "cgt"),  0x07: (16, "max"),
+    0x08: (8,  "add"),  0x09: (8,  "sub"),  0x0A: (8,  "cgt"),
+    0x10: (32, "adds"), 0x11: (32, "subs"),
+    0x14: (16, "adds"), 0x15: (16, "subs"),
+    0x18: (8,  "adds"), 0x19: (8,  "subs"),
+}
+
+MMI1_OPS = {
+    0x01: (32, "abs"),  0x02: (32, "ceq"),  0x03: (32, "min"),
+    0x05: (16, "abs"),  0x06: (16, "ceq"),  0x07: (16, "min"),
+    0x0A: (8,  "ceq"),
+    0x10: (32, "addu"), 0x11: (32, "subu"),
+    0x14: (16, "addu"), 0x15: (16, "subu"),
+    0x18: (8,  "addu"), 0x19: (8,  "subu"),
+}
+
+
+def parallel(op, w, a128, b128):
+    la, lb = _lanes(a128, w), _lanes(b128, w)
+    return _join([_pop(op, x, y, w) for x, y in zip(la, lb)], w)
+
+
 class R5900:
     def __init__(self, mem, pc=0):
         self.gpr = [0] * 32          # 128-bit each; integer ops touch the low 64
@@ -292,6 +372,18 @@ class R5900:
             else:
                 # the remaining CO forms are the TLB instructions
                 self.traps.append(("unimplemented COP0 rs %d" % rs, self.pc - 4))
+        elif op == 28 and fn in (0x08, 0x28):            # MMI0 / MMI1
+            # The parallel ALU.  Like MMI2/MMI3 these put their sub-opcode in
+            # the sa field rather than in fn, and like them they define all 128
+            # bits of the destination.
+            a128, b128 = self.r128(rs), self.r128(rt)
+            tbl = MMI0_OPS if fn == 0x08 else MMI1_OPS
+            if sa in tbl:
+                w, pop = tbl[sa]
+                self.w128(rd, parallel(pop, w, a128, b128))
+            else:
+                self.traps.append(("unimplemented MMI%d sa %d"
+                                   % (0 if fn == 0x08 else 1, sa), self.pc - 4))
         elif op == 28 and fn in (0x09, 0x29):            # MMI2 / MMI3
             # These are the SIMD half of MMI and the first instructions to touch
             # the upper 64 bits of a register.  The sub-opcode is in the sa
