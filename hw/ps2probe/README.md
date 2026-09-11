@@ -121,7 +121,27 @@ colour would settle it, and there is no texture unit to drive it with.
 
 ## Status
 
-**Builds; untested against hardware.** Every line of the readback path is
-written from the manual and has never been run on a console. The first run
-should be treated as testing the probe, not the GS: a wrong `BUSDIR` sequence or
-a wrong DMA direction will look exactly like a GS that returns nothing.
+**Builds, and the host half is tested; the console half is still untested.**
+
+`gsprobe.c` compiles clean under `-Wall` against ps2sdk — including the newer
+`ZCPROBE` — and the binary carries every string it is meant to print. Nothing in
+it has run on a console.
+
+`compare.py` *is* tested, by `selftest.py`, which needs no PlayStation 2: if the
+console agreed with the model everywhere then `ps2client` would print exactly
+what the model itself produces, so that log is built and required to compare
+clean, then perturbed and required to raise a complaint. Three cases — a console
+that agrees, one wrong pixel, and a console that truncates depth instead of
+clamping it.
+
+**That self-test earned its place the first time it ran.** `model()` was reading
+the depth buffer back without the block exclusive-or that the depth formats
+address with, while the reference had started *writing* with it hours earlier —
+1536 of the probe's 2048 depth pixels. Against a console it would have looked
+like a hardware discovery rather than a bug on this side, which is precisely the
+failure the warning at the top of `compare.py` describes, arriving by precisely
+the route it predicts.
+
+The first console run should still be treated as testing the probe rather than
+the GS: a wrong `BUSDIR` sequence or a wrong DMA direction will look exactly
+like a GS that returns nothing.

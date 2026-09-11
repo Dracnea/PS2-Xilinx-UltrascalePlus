@@ -22,7 +22,7 @@ will look like a hardware discovery.
 """
 import os, re, sys, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "sim", "gs"))
-from gs_ref import GS, addr32p                       # noqa: E402
+from gs_ref import GS, addr32p, BLK_Z                # noqa: E402
 
 FB_W, FB_H = 64, 32
 ZB_PAGE = 4
@@ -81,7 +81,23 @@ def stream_zgrad(along_y):
                (0x05, xyz(0, FB_H - 1, z2))])
 
 
-def model(packets, page):
+def model(packets, page, blkxor=0):
+    """Run a packet stream and read the buffer back the way the probe does.
+
+    `blkxor` is BLK_Z for the depth probes and 0 for the colour one, and it is
+    not optional bookkeeping: the depth formats address memory with the block
+    index exclusive-ored by 24, and `readback_psm` on the console asks for
+    PSMZ32, so the transfer undoes that swizzle and hands back a linear image.
+    Reading the model's memory without the same xor returns a *different
+    picture* -- 1536 of this probe's 2048 pixels -- which would have arrived
+    looking exactly like a hardware discovery.
+
+    That is not hypothetical.  This file read without the xor for a day after
+    the reference started writing with it, because nothing here had ever been
+    run: the two halves are the same primitives described twice, in C and in
+    Python, and the docstring at the top warns that nothing forces them to
+    agree.  The warning was right and it was this function that drifted.
+    """
     gs = GS()
     # gif_packet consumes one packet and returns where it stopped, so a stream
     # of several has to be walked; handing it the whole list runs only the
@@ -95,7 +111,7 @@ def model(packets, page):
     rows = []
     for y in range(FB_H):
         rows.append([int.from_bytes(
-            gs.vm[addr32p(page, FB_W // 64, x, y) * 4:][:4], "little")
+            gs.vm[addr32p(page, FB_W // 64, x, y, blkxor) * 4:][:4], "little")
             for x in range(FB_W)])
     return rows
 
@@ -196,8 +212,8 @@ def main():
     bad += report("gouraud", model(stream_gouraud(), 0),
                   parse(text, "PROBE gouraud", "ROW"))
     zy = parse(text, "ZPROBE ygrad", "ZROW")
-    bad += report("z-ygrad", model(stream_zgrad(True), ZB_PAGE), zy)
-    bad += report("z-xgrad", model(stream_zgrad(False), ZB_PAGE),
+    bad += report("z-ygrad", model(stream_zgrad(True), ZB_PAGE, BLK_Z), zy)
+    bad += report("z-xgrad", model(stream_zgrad(False), ZB_PAGE, BLK_Z),
                   parse(text, "ZPROBE xgrad", "ZROW"))
     if zy:
         pairing(zy)
