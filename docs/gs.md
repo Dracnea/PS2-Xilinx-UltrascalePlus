@@ -950,6 +950,44 @@ was harmless.
 through the host port to produce the same checksum. That read path is also the
 only thing exercising the arbiter.
 
+### What it costs, and what it closes at — 2026-09-11
+
+The first fit of the whole Graphics Synthesizer, out of context on
+`xcu55n-fsvh2892-2LV-e`:
+
+| | |
+|---|---|
+| UltraRAM | **128 of 640 — 20.00 %** |
+| CLB LUTs | 19149 (2.20 %) |
+| CLB registers | 14870 (0.85 %) |
+| DSPs | 96 (1.61 %) |
+| Block RAM | 0 |
+| **Fmax** | **110.8 MHz** |
+
+The UltraRAM figure is the one that was predicted: `gs_lmem.vhd` was written to
+settle the physical question and said 128 URAM, 20 % of the C1100, before
+anything else existed. It is exactly that, which is a small piece of evidence
+that the memory is being inferred as UltraRAM and not quietly built out of
+something else.
+
+**The clock is the problem.** The real GS runs at 147.456 MHz and this closes at
+110.8, so the design is a quarter short before the texture unit — the largest
+remaining block — has been written at all.
+
+The critical path says where to look: `chans[0].u/lane_reg` to
+`gif/wr_data_reg`, **37 logic levels with fifteen carry chains**, 44 % logic and
+56 % routing. That is the whole per-pixel colour path standing as one
+combinational chain — the Gouraud interpolator's lane value, into the blender,
+into the format pack, into the word being written. Nothing between the
+interpolator and memory is registered.
+
+So the GS has the same shape of problem the EE core had and the same kind of
+answer available: the pixel path wants a pipeline stage, most obviously between
+the interpolator and the blender. That is a bigger change than it sounds,
+because the rasteriser's state machine currently assumes a pixel is finished in
+the cycle it is decided — but it is the thing standing between this and the
+console's own clock.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture — and step 5, PCRTC.
