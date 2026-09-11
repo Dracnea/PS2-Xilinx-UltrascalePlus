@@ -70,10 +70,26 @@ class Card:
         self.wr("gs_gif_push", 1)
 
     def drain(self, timeout=10.0):
+        """Wait until the GS is *idle*, not merely until the last push was taken.
+
+        `busy` falls when the GIF accepts a quadword, which for a quadword that
+        kicks a primitive is long before the primitive is drawn -- the GIF holds
+        its ready line low for the whole of it.  Waiting on `busy` alone reports
+        a 4 MB clear as finishing in no measurable time, then resets the GS in
+        the middle of it and reads the pixel count before the drawing has
+        happened.  Both of those looked like the card disagreeing with the
+        model.
+
+        Idle is `busy` clear *and* `ready` set: nothing pushed and nothing being
+        drawn.
+        """
         end = time.time() + timeout
-        while self.rd("gs_status") & 1:
+        while True:
+            st = self.rd("gs_status")
+            if (st & 1) == 0 and (st & 2) != 0:
+                return
             if time.time() > end:
-                raise TimeoutError("the GIF is still busy")
+                raise TimeoutError(f"the GS is still working (status {st:#x})")
 
     def read_word(self, addr, timeout=1.0):
         """One 256-bit word of local memory."""
@@ -86,6 +102,45 @@ class Card:
         for i in range(8):
             v |= self.rd(f"gs_rd_d{i}") << (32 * i)
         return v
+
+
+def clear_stream():
+    """A GIF stream that writes zero over the whole of local memory.
+
+    The card keeps its 4 MB across `gs_reset` -- a reset clears the logic, not
+    the UltraRAM -- while gs_ref.py starts every run with the memory zeroed.
+    So the second stream of a session disagrees with the model everywhere the
+    first one drew, and the values give it away: they are the previous test's
+    colour, blended under the new one.  Simulation never shows this because it
+    starts fresh each time.
+
+    Clearing needs no host write port and no rebuild.  One sprite at page 0
+    with FBW = 16, covering 1024 x 1024 pixels of PSMCT32, is exactly 512 pages
+    -- the whole of local memory, once.  At roughly a pixel a cycle it is about
+    eight milliseconds.
+    """
+    def tag(nloop, eop, regs, nreg):
+        return nloop | (eop << 15) | ((nreg & 15) << 60) | (regs << 64)
+    items = [
+        (0x4C, 0 | (16 << 16) | (0 << 24)),                   # FRAME_1: page 0, 1024 wide
+        (0x18, 0),                                            # XYOFFSET_1
+        (0x40, 0 | (1023 << 16) | (0 << 32) | (1023 << 48)),  # SCISSOR_1
+        (0x42, 0), (0x46, 1),
+        (0x4E, 0 | (1 << 32)),                                # ZBUF_1, ZMSK=1: depth untouched
+        (0x47, (1 << 16) | (1 << 17)),                        # TEST_1: ALWAYS
+        (0x01, 0),                                            # RGBAQ: zero
+        (0x00, 6),                                            # PRIM: sprite, no blending
+    ]
+    regs = 0
+    for i in range(len(items)):
+        regs |= 0xE << (4 * i)
+    out = [tag(1, 0, regs, len(items))]
+    for a, d in items:
+        out.append((d & ((1 << 64) - 1)) | (a << 64))
+    out.append(tag(1, 1, 0xEE, 2))
+    out.append((0 | (0 << 16)) | (0x05 << 64))
+    out.append((1024 << 4) | ((1024 << 4) << 16) | (0x05 << 64))
+    return out
 
 
 def fnv1a(data):
@@ -104,6 +159,8 @@ def main():
     ap.add_argument("--prog", required=True, help="a GIF stream, one quadword per line")
     ap.add_argument("--dump", nargs=2, type=lambda x: int(x, 0), default=[0, 256],
                     metavar=("FROM", "LEN"), help="bytes of local memory to compare in detail")
+    ap.add_argument("--no-clear", action="store_true",
+                    help="skip clearing local memory first (it survives gs_reset)")
     ap.add_argument("--whole", action="store_true",
                     help="read all 4 MB back and compare the checksum too (slow)")
     a = ap.parse_args()
@@ -122,6 +179,15 @@ def main():
 
     card = Card(a.dev, a.csr)
     card.reset()
+    if not a.no_clear:
+        # The card's memory survives a reset and the model's does not, so they
+        # have to be made to agree before anything is compared.
+        t = time.time()
+        for qw in clear_stream():
+            card.push(qw)
+        card.drain(timeout=30.0)
+        print(f"cleared 4 MB of local memory in {time.time()-t:.2f}s")
+        card.reset()
     t0 = time.time()
     for qw in qwords:
         card.push(qw)
@@ -143,8 +209,14 @@ def main():
     for r in range(0x00, 0x80):
         card.wr("gs_dbg_sel", r)
         v = card.rd("gs_dbg_lo") | (card.rd("gs_dbg_hi") << 32)
-        if v != gs.reg[r]:
-            print(f"MISMATCH register {r:02x}: card {v:016x} model {gs.reg[r]:016x}")
+        # gs_ref keeps only the addresses the manual defines, and the card has
+        # all 128 -- so an undefined one reads 0 from the model, which is also
+        # what it must read from the card: a write to an address the manual does
+        # not define has to leave every register alone.  `.get` is how the
+        # reference's own --raw dump prints them.
+        want = gs.reg.get(r, 0)
+        if v != want:
+            print(f"MISMATCH register {r:02x}: card {v:016x} model {want:016x}")
             bad += 1
 
     base, ln = a.dump

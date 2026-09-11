@@ -1113,13 +1113,47 @@ simulation, against the same reference, with the same tooling.
 `tools/gs/gsrun.py` is that comparison: it feeds a stream, then diffs the
 register file, the pixel count and local memory against `sim/gs/gs_ref.py`.
 
-> **NOTE (unverified):** none of this has been on the card. The bitstream is
-> built and meets timing; that is all. The first run should be treated as
-> testing this target rather than testing the GS — a wrong CSR decode or a
-> handshake that never completes will look exactly like a rasteriser that draws
-> nothing.
-> *Verify by:* loading it and running `tools/gs/gsrun.py` with a stream the
-> simulation already agrees on, starting with one sprite.
+### It runs — 2026-09-11
+
+**The Graphics Synthesizer runs on the C1100 and agrees with the reference
+model.** The first time either of the two large blocks has been on hardware.
+
+Fourteen streams, every one of them compared against `sim/gs/gs_ref.py` on the
+register file, the pixel count, and **the whole of local memory** — the same
+FNV-1a checksum over all 4 MB that the simulation prints:
+
+| | |
+|---|---|
+| first light, one 8 x 4 sprite | pass |
+| `gen_fb16.py`, the directed 16-bit program | pass |
+| twelve random `gen_gif.py` streams | pass |
+
+That directed program is the interesting one: PSMCT16 and PSMCT16S, PSMZ16 and
+PSMZ16S, both block orders, alpha blending, the depth test and the depth clamp,
+all of it settled in simulation over the preceding days and none of it seen by
+silicon until now. The whole-memory comparison takes four seconds, so there is
+no reason to run the cheaper one.
+
+Feeding is quicker than expected: about 80,000 quadwords a second through the
+CSR window, so a 4096-quadword stream is well under a second and the readback
+dominates.
+
+**Both faults found on the way were in the host tool, not the card**, and both
+are worth recording because simulation cannot show either.
+
+* **Local memory survives `gs_reset`.** A reset clears the logic, not the
+  UltraRAM, while `gs_ref.py` starts every run with 4 MB of zeros — so the
+  second stream of a session disagreed everywhere the first had drawn, and the
+  values gave it away: the previous test's colour, blended under the new one.
+  `gsrun.py` now clears memory first, which needs no host write port and no
+  rebuild: one sprite at page 0 with FBW = 16 covering 1024 x 1024 pixels of
+  PSMCT32 is exactly 512 pages, the whole of local memory, in about ten
+  milliseconds.
+* **`busy` falls when a quadword is *accepted*, not when its primitive is
+  *drawn*.** Waiting on it alone reported a 4 MB clear as finishing in no
+  measurable time, then reset the GS in the middle of it and read the pixel
+  count before the drawing had happened — which presented as the card drawing
+  95 pixels where the model drew 120. Idle is `busy` clear *and* `ready` set.
 
 `tools/gs/gen_firstlight.py` is that stream: an 8 x 4 opaque rectangle at the
 origin in PSMCT32, no blending, no depth, no clipping, one colour. Thirty-two
