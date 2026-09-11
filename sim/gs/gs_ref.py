@@ -240,6 +240,40 @@ def addr16p(pagebase, bw, x, y, sform=False, blkxor=0):
             (x >> 3) & 1)
 
 
+# ---- RGBA16 -----------------------------------------------------------------
+#
+# The 16-bit pixel is A1 B5 G5 R5, alpha in bit 15 and red in bits 4:0, and the
+# two conversions are not inverses of each other.  Both are taken from the
+# manual rather than assumed, because the obvious guess is wrong in the same
+# direction each time.
+#
+#   * Writing **truncates**: the diagram in 3.9.5 lines the frame buffer's five
+#     bits up against bits 7:3 of the 8-bit channel, so the low three are
+#     dropped.  (Dither is what is meant to make that acceptable, and dither is
+#     a later block.)
+#   * Reading **shifts up with zeros**, not by replicating the top bits: the
+#     manual draws the 5-to-8 expansion explicitly as `E D C B A 0 0 0`.  The
+#     replicating form -- which spreads the value over the full 0..255 range and
+#     is what a graphics programmer reaches for -- is a different function, and
+#     white would come back as 0xFF from it and 0xF8 from this one.
+#   * Alpha read back from a 16-bit buffer is **0x80 or 0x00**, never 0xFF.
+
+def pack16(rgba):
+    """RGBA8888 -> RGBA5551, as the GS writes it."""
+    return (((rgba >> 3) & 0x1F)
+            | (((rgba >> 11) & 0x1F) << 5)
+            | (((rgba >> 19) & 0x1F) << 10)
+            | (((rgba >> 31) & 0x01) << 15))
+
+
+def expand16(px):
+    """RGBA5551 -> RGBA8888, as the GS expands it for processing."""
+    return (((px & 0x1F) << 3)
+            | ((((px >> 5) & 0x1F) << 3) << 8)
+            | ((((px >> 10) & 0x1F) << 3) << 16)
+            | ((0x80 if (px >> 15) & 1 else 0x00) << 24))
+
+
 # ---- GIF -------------------------------------------------------------------
 
 # PACKED-mode register descriptors.  0x0-0xA and 0xC-0xF are defined; 0xB is
@@ -379,6 +413,70 @@ class GS:
                 # neither compared nor written.
                 "mask": 0x00FFFFFF if zpsm == 1 else 0xFFFFFFFF}
 
+    def fbsetup(self, c):
+        """What the FRAME register says about the frame buffer, or None if this
+        model cannot draw to it.
+
+        Collecting this in one place is what lets the sprite and the triangle
+        share a pixel write.  They had the same dozen lines twice, and the
+        16-bit formats would have made it the same thirty lines twice.
+        """
+        frame = self.reg[0x4C + c]
+        psm = bits(frame, 29, 24)
+        if psm not in (0, 1, 2, 10):    # PSMCT32, PSMCT24, PSMCT16, PSMCT16S
+            return None
+        fbmsk = bits(frame, 63, 32)
+        if psm == 1:
+            # PSMCT24 is 24 bits inside a 32-bit word, addressed exactly as
+            # PSMCT32 is.  The top byte is not part of the pixel, so it survives
+            # the write -- which is the same thing FBMSK does, and is therefore
+            # expressed as one.
+            fbmsk |= 0xFF000000
+        return {"bits":  16 if psm in (2, 10) else 32,
+                "sform": psm == 10,
+                "fbp":   bits(frame, 8, 0),      # in 8 KB pages
+                "fbw":   bits(frame, 21, 16),    # in 64-pixel units
+                "fbmsk": fbmsk}
+
+    def fbaddr(self, fb, x, y):
+        """(word, half) for a pixel, or None if it falls outside local memory.
+
+        Kept separate from the write because the caller has to know a pixel is
+        addressable *before* the depth test runs: a pixel that is off the end of
+        memory must not update the Z buffer either, and folding the bounds check
+        into the write would silently reverse that order.
+        """
+        if fb["bits"] == 32:
+            a, half = addr32p(fb["fbp"], fb["fbw"], x, y), 0
+        else:
+            a, half = addr16p(fb["fbp"], fb["fbw"], x, y, fb["sform"])
+        return None if a >= VM_WORDS else (a, half)
+
+    def putpixel(self, fb, loc, src, c):
+        """Blend one pixel against what is there and write it back under FBMSK."""
+        a, half = loc
+        word = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
+        if fb["bits"] == 32:
+            m = fb["fbmsk"]
+            px = self.blend(src, word, c)
+            word = (word & m) | (px & ~m & 0xFFFFFFFF)
+        else:
+            # The destination is read back *expanded*, because the blender works
+            # in 8 bits per channel whatever the buffer holds -- and because a
+            # 16-bit buffer's alpha is 0x80 or 0x00 rather than the 0 or 255 a
+            # one-bit value would suggest.
+            old16 = (word >> (16 * half)) & 0xFFFF
+            px = self.blend(src, expand16(old16), c)
+            # FBMSK's bit positions are those of the pixel *before* format
+            # conversion (3.9.5), and the bits that survive that conversion are
+            # exactly the ones pack16 keeps.  So the mask converts with the same
+            # function the colour does, rather than needing one of its own.
+            m16 = pack16(fb["fbmsk"])
+            new16 = (old16 & m16) | (pack16(px) & ~m16 & 0xFFFF)
+            word = (word & ~(0xFFFF << (16 * half))) | (new16 << (16 * half))
+        self.vm[a * 4:a * 4 + 4] = word.to_bytes(4, "little")
+        self.pixels += 1
+
     def zcheck(self, zs, x, y, z):
         """The depth test at one pixel, and the Z write that goes with it.
 
@@ -467,17 +565,11 @@ class GS:
 
         """
         c = self.ctx()
-        frame = self.reg[0x4C + c]
         xyoff = self.reg[0x18 + c]
         sciss = self.reg[0x40 + c]
-        psm = bits(frame, 29, 24)
-        if psm not in (0, 1):
+        fb = self.fbsetup(c)
+        if fb is None:
             return
-        fbp   = bits(frame, 8, 0)
-        fbw   = bits(frame, 21, 16)
-        fbmsk = bits(frame, 63, 32)
-        if psm == 1:
-            fbmsk |= 0xFF000000
         ofx, ofy = bits(xyoff, 15, 0), bits(xyoff, 47, 32)
 
         # Pixel space, as exact rationals.  The hardware coordinates are 12.4
@@ -552,8 +644,8 @@ class GS:
                     walk.append(_Walk(seed, dvdx))
 
             for xx in range(left, right + 1):
-                a = addr32p(fbp, fbw, xx, yy)
-                if a >= VM_WORDS:
+                loc = self.fbaddr(fb, xx, yy)
+                if loc is None:
                     continue
                 if zwalk is not None:
                     zv = _floor(zwalk.at(xx - left))
@@ -567,11 +659,7 @@ class GS:
                         src |= (0 if q < 0 else (255 if q > 255 else q)) << (8 * n)
                 else:
                     src = rgba
-                old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
-                px = self.blend(src, old, c)
-                v = (old & fbmsk) | (px & ~fbmsk & 0xFFFFFFFF)
-                self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
-                self.pixels += 1
+                self.putpixel(fb, loc, src, c)
 
     def draw_sprite(self, v0, v1):
         """A flat-coloured, axis-aligned rectangle in PSMCT32.
@@ -585,21 +673,11 @@ class GS:
         No texture and no dither: those are later blocks.
         """
         c = self.ctx()
-        frame  = self.reg[0x4C + c]
         xyoff  = self.reg[0x18 + c]
         sciss  = self.reg[0x40 + c]
-        psm = bits(frame, 29, 24)
-        if psm not in (0, 1):                      # PSMCT32 and PSMCT24
+        fb = self.fbsetup(c)
+        if fb is None:
             return
-        fbp  = bits(frame, 8, 0)                   # in 8 KB pages
-        fbw  = bits(frame, 21, 16)                 # in 64-pixel units
-        fbmsk = bits(frame, 63, 32)
-        if psm == 1:
-            # PSMCT24 is 24 bits inside a 32-bit word, addressed exactly as
-            # PSMCT32 is.  The top byte is not part of the pixel, so it survives
-            # the write -- which is the same thing FBMSK does, and is therefore
-            # expressed as one.
-            fbmsk |= 0xFF000000
         ofx, ofy = bits(xyoff, 15, 0), bits(xyoff, 47, 32)
 
         x0 = (v0[0] - ofx) >> 4
@@ -620,16 +698,12 @@ class GS:
         zs   = self.zsetup(c)
         for y in range(y0, y1 + 1):
             for x in range(x0, x1 + 1):
-                a = addr32p(fbp, fbw, x, y)
-                if a >= VM_WORDS:
+                loc = self.fbaddr(fb, x, y)
+                if loc is None:
                     continue
                 if not self.zcheck(zs, x, y, z):
                     continue
-                old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
-                px = self.blend(rgba, old, c)
-                v = (old & fbmsk) | (px & ~fbmsk & 0xFFFFFFFF)
-                self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
-                self.pixels += 1
+                self.putpixel(fb, loc, rgba, c)
 
     # -- host-to-local ------------------------------------------------------
     def start_transfer(self):

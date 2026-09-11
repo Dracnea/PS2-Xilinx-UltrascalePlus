@@ -766,11 +766,81 @@ confirms no two pixels collide. PCSX2's `columnTable16` tabulates *pixel*
 indices within a block rather than word indices, which is the one place these
 can be misread; the tool compares `word * 2 + half` against it.
 
+## The 16-bit pixel path — 2026-09-11
+
+PSMCT16 and PSMCT16S can now be drawn to, in the reference and the RTL
+together. Three conversions carry the whole of it, and all three are the
+opposite of the obvious guess, which is why each is taken from the manual
+rather than assumed:
+
+* **Writing truncates.** The masking diagram in 3.9.5 lines the frame buffer's
+  five bits up against bits 7:3 of the 8-bit channel, so the low three are
+  dropped. Dither is what is meant to make that acceptable, and dither is a
+  later block.
+* **Reading shifts back up with zeros**, not by replicating the top bits: the
+  manual draws the expansion as `E D C B A 0 0 0`. White in a 16-bit buffer
+  therefore reads back as `0xF8F8F8`, not `0xFFFFFF`. The replicating form is
+  what a graphics programmer reaches for and is a different function.
+* **Alpha read from a 16-bit buffer is 0x80 or 0x00**, never 0xFF.
+
+FBMSK needs no conversion function of its own. Its bit positions are those of
+the pixel *before* format conversion, and the bits that survive the conversion
+are exactly the ones `pack16` keeps — so the mask converts with the same
+function the colour does.
+
+The no-read fast path survives at 16 bits: when FBMSK is zero and blending is
+off, the byte enables protect the other pixel sharing the word, so a 16-bit
+pixel does not force a read-modify-write.
+
+### What the random streams could not see
+
+`gen_gif.py` now picks a 16-bit frame buffer for about four draws in ten, and
+that was **not** enough. Mutating the RTL and re-running three random seeds:
+
+| mutation | caught |
+|---|---|
+| the S block order used for both formats | 3 of 3 |
+| the half taken from x(4) instead of x(3) | 2 of 3 |
+| `pack16` keeping the wrong five bits | 2 of 3 |
+| `expand16` replicating instead of zero-filling | **0 of 3** |
+
+The last one is not bad luck. Expansion is reached only when the destination is
+*read*, and the two candidate expansions of a five-bit value differ only in the
+low three bits — exactly the bits `pack16` discards again on the way back. A
+destination that is read, blended by a selector that copies it, and written back
+is bit-identical under either rule. The difference becomes visible only when
+arithmetic carries it up into bit 3.
+
+`sim/gs/gen_fb16.py` arranges that deliberately: a fill pass writes a known
+destination, then a blend pass draws over it with `Cv = (Cs - Cd) * FIX >> 7`
+at FIX = 0x80, subtracting the destination at full weight so that the source's
+low three bits decide which side of a multiple of eight the result lands on. A
+second blend pass uses `C = Ad`, which is what makes the *alpha* rule
+observable, since a coefficient of 0x80 and one of 0xFF are nothing alike.
+
+**Two things about writing that program are worth keeping**, because both made
+it pass while proving nothing:
+
+* Its first version filled each page with a **uniform** colour. A block order is
+  a permutation of blocks within a page, and permuting blocks that all hold the
+  same value changes nothing — so the directed program scored 0 of 1 against a
+  block-order mutation that the random streams had caught 3 times in 3. A
+  directed test can be *weaker* than a random one, and this is how.
+* Its second version varied the pattern with a period of two tiles, and a block
+  is exactly two tiles wide, so every block again held identical content. The
+  period has to share no factor with the block, which is why the alpha pattern
+  runs on three.
+
+With those fixed, all nine mutations tried are caught by `gen_fb16.py` alone:
+both block orders, the half selection, the column order, the page stride, both
+directions of the colour conversion, the alpha rule, and the mask conversion.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture — and step 5, PCRTC.
-Local-to-host and local-to-local transfers. The 16-bit **pixel path**: the
-addressing above is done and verified, but nothing yet packs RGBA5551, masks a
-16-bit half within a word, blends in 16 bits, or transfers in PSMCT16, so
-PSMCT32 and PSMCT24 remain the only formats that can be drawn to. Dither waits
-on that, since it needs a 16-bit format to act on.
+Local-to-host and local-to-local transfers. **PSMZ16 and PSMZ16S**: the
+addressing exists and is cross-checked, and `pix_addr16_page` already takes the
+Z block xor, but the depth path still accepts only the 32-bit Z formats, so a
+16-bit colour buffer is drawn with a 32-bit Z. Host-to-local transfers are
+still PSMCT32 only. Dither, which needs a 16-bit format to act on and now has
+one.

@@ -74,6 +74,20 @@ def zval(rng):
                        rng.randrange(1 << 24)])
 
 
+def fbpsm(rng):
+    """A frame-buffer pixel format for a drawing sequence.
+
+    PSMCT32 stays the common case because it is what everything else in the
+    suite assumes, but the 16-bit formats have to appear often enough that a
+    stream reaches the half-word write path, the RGBA16 truncation and the
+    converted FBMSK.  PSMCT16 and PSMCT16S differ only in block order, so both
+    are generated: one of them alone would leave the other's permutation
+    untested, and they are the two easiest things here to get the wrong way
+    round.
+    """
+    return rng.choice([0, 0, 0, 1, 2, 2, 10])
+
+
 def blend_regs(rng):
     """ALPHA and COLCLAMP, and whether PRIM enables blending at all.
 
@@ -115,7 +129,7 @@ def gen(rng, ntags):
                    rng.randrange(0, 4), rng.randrange(20, 32))
             abe, alpha, clamp = blend_regs(rng)
             zbuf, ztest = depth_regs(rng)
-            items = [(0x4C, fbp | (1 << 16) | (rng.choice([0, 0, 1]) << 24) | (msk << 32)),
+            items = [(0x4C, fbp | (1 << 16) | (fbpsm(rng) << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x40 + 1, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
@@ -154,7 +168,7 @@ def gen(rng, ntags):
             # straddle a block boundary more often than not.
             iip = rng.choice([0, 0, 1, 1])
             zbuf, ztest = depth_regs(rng)
-            items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (rng.choice([0, 0, 1]) << 24) | (msk << 32)),
+            items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (fbpsm(rng) << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x42, alpha), (0x46, clamp),

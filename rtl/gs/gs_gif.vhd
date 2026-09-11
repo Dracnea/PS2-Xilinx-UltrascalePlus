@@ -151,6 +151,10 @@ architecture arch of gs_gif is
    signal dr_fbp     : unsigned(8 downto 0) := (others => '0');
    signal dr_fbw     : unsigned(5 downto 0) := (others => '0');
    signal dr_fbmsk   : std_logic_vector(31 downto 0) := (others => '0');
+   -- the frame buffer's format: 16 bits per pixel, and the S block order
+   signal dr_fb16    : std_logic := '0';
+   signal dr_fbs     : std_logic := '0';
+   signal dr_half    : integer range 0 to 1 := 0;
    -- the blender's settings, latched with the rest of the primitive
    signal dr_abe     : std_logic := '0';
    signal dr_alpha   : std_logic_vector(7 downto 0) := (others => '0');  -- A B C D
@@ -322,6 +326,67 @@ architecture arch of gs_gif is
    begin
       return pix_addr_page(bp(13 downto 5), bw, x, y);
    end function;
+
+   -- The 16-bit formats.  A page is 64x64 pixels, a block 16x8, a column 16x2,
+   -- and two pixels share a word.  The six bits naming the word within a block
+   -- are the *same* interleave as at 32 bits -- a column holds sixteen words
+   -- either way, and the extra eight pixels of width go into the upper half of
+   -- those same words -- so only the block index changes, and which half, which
+   -- is x(3) and is returned by fb16_half rather than folded in here.
+   --
+   -- PSMCT16 and PSMCT16S differ only in the order of blocks within a page.
+   -- Both orders are wire permutations here, as the 32-bit one is.
+   function pix_addr16_page(pg : unsigned(8 downto 0); bw : unsigned(5 downto 0);
+                            x, y : unsigned(10 downto 0);
+                            sform : std_logic;
+                            zblk  : std_logic := '0') return unsigned is
+      variable page : unsigned(8 downto 0);
+      variable blk  : unsigned(4 downto 0);
+   begin
+      page := resize(pg + resize(y(10 downto 6) * bw, 9)
+                     + resize(x(10 downto 6), 9), 9);
+      if sform = '0' then
+         blk := y(5) & x(5) & y(4) & x(4) & y(3);
+      else
+         blk := x(5) & y(4) & y(5) & x(4) & y(3);
+      end if;
+      blk := blk xor ("11" & "000" and (4 downto 0 => zblk));
+      return page & blk & y(2) & y(1) & x(2) & x(1) & y(0) & x(0);
+   end function;
+
+   function fb16_half(x : unsigned(10 downto 0)) return integer is
+   begin
+      return to_integer(unsigned'("" & x(3)));
+   end function;
+
+   -- RGBA16 is A1 B5 G5 R5.  The two conversions are not inverses: writing
+   -- truncates the low three bits of each channel, and reading shifts back up
+   -- with *zeros* rather than replicating the top bits, so white comes back as
+   -- 0xF8F8F8 and not 0xFFFFFF.  Alpha read from a 16-bit buffer is 0x80 or
+   -- 0x00, never 0xFF.  All three are drawn explicitly in the GS User's Manual
+   -- (3.9.5 and "Color Processing in PSMCT16(S) Mode") and all three are the
+   -- opposite of the obvious guess.
+   function pack16(rgba : std_logic_vector(31 downto 0))
+      return std_logic_vector is
+   begin
+      return rgba(31) & rgba(23 downto 19) & rgba(15 downto 11) & rgba(7 downto 3);
+   end function;
+
+   function expand16(px : std_logic_vector(15 downto 0))
+      return std_logic_vector is
+   begin
+      return (px(15) & "0000000")          -- alpha: 0x80 or 0x00
+           & (px(14 downto 10) & "000")
+           & (px(9 downto 5) & "000")
+           & (px(4 downto 0) & "000");
+   end function;
+
+   -- The four frame-buffer formats this rasteriser can draw to.
+   function fb_drawable(psm : std_logic_vector(5 downto 0)) return boolean is
+   begin
+      return psm = "000000" or psm = "000001"      -- PSMCT32, PSMCT24
+          or psm = "000010" or psm = "001010";     -- PSMCT16, PSMCT16S
+   end function;
 begin
 
    edges : for k in 0 to 2 generate
@@ -428,6 +493,7 @@ begin
       variable w_do    : boolean;
       variable wa      : unsigned(19 downto 0);
       variable lane    : integer range 0 to 7;
+      variable half    : integer range 0 to 1;
       variable last    : boolean;
       variable vri     : unsigned(4 downto 0);
       variable vloop   : unsigned(14 downto 0);
@@ -438,6 +504,7 @@ begin
       variable ofx, ofy, ax, ay, bx, by, t : integer range -65536 to 65535;
       variable sx0, sx1, sy0, sy1          : integer range 0 to 2047;
       variable oldpx, newpx, blended       : std_logic_vector(31 downto 0);
+      variable old16, new16, msk16         : std_logic_vector(15 downto 0);
       variable ylo, yhi, tya, tyb          : integer range -65536 to 65535;
       variable lft, rgt                    : integer range -4096 to 4095;
       variable ka, kb                      : integer range 0 to 2;
@@ -713,6 +780,14 @@ begin
                         else
                            dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
                         end if;
+                        dr_fb16 <= '0';
+                        dr_fbs  <= '0';
+                        if reg(16#4C# + ctxi)(29 downto 24) = "000010" then
+                           dr_fb16 <= '1';
+                        elsif reg(16#4C# + ctxi)(29 downto 24) = "001010" then
+                           dr_fb16 <= '1';
+                           dr_fbs  <= '1';
+                        end if;
                         dr_rgba  <= reg(1)(31 downto 0);
                         dr_abe   <= reg(0)(6);
                         dr_alpha <= reg(16#42# + ctxi)(7 downto 0);
@@ -729,9 +804,9 @@ begin
                         dr_y     <= to_unsigned(ay, 11);
                         dr_y1    <= to_unsigned(by, 11);
                         if ax > bx or ay > by or ax < 0 or ay < 0
-                           or (reg(16#4C# + ctxi)(29 downto 24) /= "000000"
-                               and reg(16#4C# + ctxi)(29 downto 24) /= "000001") then
-                           dr_empty <= '1';       -- nothing to draw, or not PSMCT32
+                           or not fb_drawable(reg(16#4C# + ctxi)(29 downto 24)) then
+                           dr_empty <= '1';       -- nothing to draw, or a format
+                                                  -- this rasteriser cannot write
                         else
                            dr_empty <= '0';
                         end if;
@@ -782,14 +857,22 @@ begin
                         else
                            dr_fbmsk <= reg(16#4C# + ctxi)(63 downto 32);
                         end if;
+                        dr_fb16 <= '0';
+                        dr_fbs  <= '0';
+                        if reg(16#4C# + ctxi)(29 downto 24) = "000010" then
+                           dr_fb16 <= '1';
+                        elsif reg(16#4C# + ctxi)(29 downto 24) = "001010" then
+                           dr_fb16 <= '1';
+                           dr_fbs  <= '1';
+                        end if;
                         dr_rgba  <= reg(1)(31 downto 0);
                         dr_abe   <= reg(0)(6);
                         dr_alpha <= reg(16#42# + ctxi)(7 downto 0);
                         dr_fix   <= unsigned(reg(16#42# + ctxi)(39 downto 32));
                         dr_clamp <= reg(16#46#)(0);
-                        if reg(16#4C# + ctxi)(29 downto 24) /= "000000"
-                           and reg(16#4C# + ctxi)(29 downto 24) /= "000001" then
-                           dr_empty <= '1';            -- neither PSMCT32 nor 24
+                        if not fb_drawable(reg(16#4C# + ctxi)(29 downto 24)) then
+                           dr_empty <= '1';            -- a format this
+                                                       -- rasteriser cannot write
                         else
                            dr_empty <= '0';
                         end if;
@@ -1072,22 +1155,41 @@ begin
                         state   <= S_ZRD;
                      end if;
                   else
-                     wa   := pix_addr_page(dr_fbp, dr_fbw, dr_x, dr_y);
+                     if dr_fb16 = '1' then
+                        wa   := pix_addr16_page(dr_fbp, dr_fbw, dr_x, dr_y, dr_fbs);
+                        half := fb16_half(dr_x);
+                     else
+                        wa   := pix_addr_page(dr_fbp, dr_fbw, dr_x, dr_y);
+                        half := 0;
+                     end if;
                      lane := to_integer(wa(2 downto 0));
                      if dr_fbmsk = x"00000000" and dr_abe = '0' then
                         -- nothing to preserve, so no read is needed: the common
-                        -- case stays one pixel per clock
+                        -- case stays one pixel per clock.  At 16 bits the byte
+                        -- enables protect the *other* pixel sharing the word,
+                        -- so this path stays available rather than forcing a
+                        -- read-modify-write on every 16-bit pixel.
                         wr_en   <= '1';
                         wr_addr <= std_logic_vector(wa(19 downto 3));
-                        wr_data <= std_logic_vector(shift_left(
-                                      resize(unsigned(src_rgba), 256), 32 * lane));
-                        wr_be   <= std_logic_vector(shift_left(
-                                      resize(unsigned'(x"F"), 32), 4 * lane));
+                        if dr_fb16 = '1' then
+                           wr_data <= std_logic_vector(shift_left(
+                                         resize(unsigned(pack16(src_rgba)), 256),
+                                         32 * lane + 16 * half));
+                           wr_be   <= std_logic_vector(shift_left(
+                                         resize(unsigned'("11"), 32),
+                                         4 * lane + 2 * half));
+                        else
+                           wr_data <= std_logic_vector(shift_left(
+                                         resize(unsigned(src_rgba), 256), 32 * lane));
+                           wr_be   <= std_logic_vector(shift_left(
+                                         resize(unsigned'(x"F"), 32), 4 * lane));
+                        end if;
                         pixels  <= pixels + 1;
                      else
                         rd_en   <= '1';
                         rd_addr <= std_logic_vector(wa(19 downto 3));
                         dr_addr <= wa;
+                        dr_half <= half;
                         state   <= S_DRAWRD;
                      end if;
                   end if;
@@ -1115,6 +1217,15 @@ begin
                      lane := to_integer(dr_addr(2 downto 0));
                      oldpx := std_logic_vector(
                                  shift_right(unsigned(rd_data), 32 * lane)(31 downto 0));
+                     if dr_fb16 = '1' then
+                        -- The destination is expanded before the blender sees
+                        -- it, because the blender works in 8 bits per channel
+                        -- whatever the buffer holds -- and because a 16-bit
+                        -- buffer's alpha is 0x80 or 0x00, not 0 or 255.
+                        old16 := std_logic_vector(
+                                    shift_right(unsigned(oldpx), 16 * dr_half)(15 downto 0));
+                        oldpx := expand16(old16);
+                     end if;
                      -- PRIM.ABE decides whether the blender runs at all.  This
                      -- path is also taken for a plain masked write, where the
                      -- destination is read to preserve the masked bits and the
@@ -1124,13 +1235,29 @@ begin
                      else
                         blended := src_rgba;
                      end if;
-                     newpx := (oldpx and dr_fbmsk) or (blended and not dr_fbmsk);
                      wr_en   <= '1';
                      wr_addr <= std_logic_vector(dr_addr(19 downto 3));
-                     wr_data <= std_logic_vector(shift_left(
-                                   resize(unsigned(newpx), 256), 32 * lane));
-                     wr_be   <= std_logic_vector(shift_left(
-                                   resize(unsigned'(x"F"), 32), 4 * lane));
+                     if dr_fb16 = '1' then
+                        -- FBMSK's bit positions are those of the pixel *before*
+                        -- format conversion (3.9.5), and the bits that survive
+                        -- the conversion are exactly the ones pack16 keeps -- so
+                        -- the mask converts with the same function the colour
+                        -- does rather than needing one of its own.
+                        msk16 := pack16(dr_fbmsk);
+                        new16 := (old16 and msk16) or (pack16(blended) and not msk16);
+                        wr_data <= std_logic_vector(shift_left(
+                                      resize(unsigned(new16), 256),
+                                      32 * lane + 16 * dr_half));
+                        wr_be   <= std_logic_vector(shift_left(
+                                      resize(unsigned'("11"), 32),
+                                      4 * lane + 2 * dr_half));
+                     else
+                        newpx := (oldpx and dr_fbmsk) or (blended and not dr_fbmsk);
+                        wr_data <= std_logic_vector(shift_left(
+                                      resize(unsigned(newpx), 256), 32 * lane));
+                        wr_be   <= std_logic_vector(shift_left(
+                                      resize(unsigned'(x"F"), 32), 4 * lane));
+                     end if;
                      pixels  <= pixels + 1;
                      state   <= S_DRAW;
                   end if;
