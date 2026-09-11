@@ -1074,9 +1074,19 @@ again.
 Sixteen per cent over four cuts, and the remaining gap to the console's 147.456
 MHz is about fourteen per cent more.
 
-**None of this blocks a board target.** 129.1 MHz is a perfectly good clock to
-bring the Graphics Synthesizer up on a card at — the console's clock is what
-full-speed emulation needs, not what proving the hardware works needs.
+**None of this blocked the board target**, and 129.1 MHz was a perfectly good
+clock to *bring the GS up* at — which is what it was used for, and it worked.
+
+But the earlier phrasing here called 147.456 MHz what "full-speed emulation
+needs", and that was the wrong frame for this project. **This is a rebuild of
+the machine, not an emulator.** A Graphics Synthesizer that runs at 129.1 MHz is
+not a slow GS, it is a GS with the wrong clock, and the timing relationships
+between it, the EE and the IOP are part of what the software depends on.
+147.456 MHz is a specification, and the remaining 12 % is work still owed rather
+than a performance nicety. [ps2-hardware-study.md](ps2-hardware-study.md) §6
+carries the measured status of all three blocks against their native rates, and
+the separate problem that the C1100's 100 MHz reference cannot produce the
+PS2's 18.432 MHz clock family exactly.
 
 ## On a card — 2026-09-11
 
@@ -1167,6 +1177,36 @@ first version drew *nothing*, because the two vertices were sent as bare
 quadwords rather than through A+D with XYZ2's address, and writing XYZ2 is what
 kicks a primitive. That would have looked on the card exactly like a GIF that
 never accepted a packet.
+
+## A picture — 2026-09-11
+
+`tools/gs/gen_scene.py` draws something meant to be *looked at* rather than
+diffed: six flat sprites in the primary colours, one large Gouraud triangle with
+red, green and blue at its corners, two half-transparent sprites blended over
+it, and a depth-tested pair where the nearer triangle must occlude the farther
+one. Only what is built — no texture, because there is no texture unit.
+
+`tools/gs/gsgrab.py` runs it on the card, reads the frame buffer back, undoes
+the swizzle and writes a PNG. **The card's picture is byte-identical to the
+model's**: 0 of 215,040 colour bytes differ, and the two PNG files match
+exactly.
+
+Two things about this are worth separating.
+
+**It is not PCRTC.** The Graphics Synthesizer's video block reads the frame
+buffer at a pixel clock and drives a display; a C1100 has no video connector, so
+the picture leaves the card the way everything else does — over PCIe — and is
+assembled on the host. What this shares with PCRTC is the part that is
+PlayStation 2 rather than plumbing: taking a frame buffer's base, width and
+pixel format and turning swizzled contents into a raster. The video block itself
+is still unwritten.
+
+**A picture checks something a checksum cannot.** Every test until now compared
+two numbers, and two numbers agree or they do not. An image is how a gradient
+running the wrong way, or a seam along a shared edge, actually gets recognised —
+faults that are perfectly self-consistent and would pass any amount of
+differential testing. `--model-only` renders the same stream through
+`gs_ref.py`, so the two can be put side by side.
 
 ## What is not started
 

@@ -210,6 +210,47 @@ ports is the part these cards uniquely make possible.
 | IOP | 36.864 MHz | trivial |
 | RDRAM | 400 MHz DDR x 2 x 16 | replaced by HBM; bandwidth is not the issue |
 
+### Where each block actually stands — 2026-09-11
+
+Measured, not estimated, and stated against the native clock because **that is
+the specification**. This project is rebuilding the machine, not emulating it:
+a block that does not run at its native rate is not slow, it is *wrong*, and the
+timing relationships between the three processors are part of what the software
+depends on.
+
+| block | native | measured | short by |
+|---|---|---|---|
+| EE core | 294.912 MHz | 192.7 (mean, three directives) | **35 %** |
+| GS | 147.456 MHz | 129.1 | **12 %** |
+| IOP | 36.864 MHz | runs on the card | met |
+
+The GS number is the one to fix first and the study above already said it was
+reachable. The EE is the known blocker and nothing here has changed that.
+
+### The other half of the problem: the C1100 cannot make these clocks exactly
+
+Every PS2 clock is an integer multiple of **18.432 MHz** — the EE is 16x, the GS
+8x, the IOP 2x — and 18.432 MHz is not reachable from this card's 100 MHz
+reference. The ratio is 576/3125, and the 5^5 in the denominator is not
+something an MMCM's multiplier grid can produce.
+
+`_IOPClocks` already lives with this: it runs the IOP at **36.875 MHz against a
+native 36.864**, 0.03 % fast, from a VCO of 1106.25 MHz. The same approach gives
+the GS 147.5 MHz from a VCO of 1475 (100 x 14.75, output divide 10), also 0.03 %
+fast.
+
+**What matters is not the absolute error but that every block shares it.** A
+0.03 % offset applied uniformly is a console running 0.03 % fast — far inside a
+real crystal's tolerance, and invisible. Two blocks with *different* offsets
+would break the integer ratios the hardware depends on, and that would not be
+invisible at all. So the PS2's clock tree should come from **one VCO** with
+integer output dividers, the way `_IOPClocks` already derives the IOP's 1x, 2x
+and 3x — not from a per-block MMCM chosen for each block's convenience.
+
+Exactness, if it is ever wanted, is a board change rather than a logic one: an
+18.432 MHz (or 147.456 MHz) oscillator feeding the fabric makes every ratio
+exact. Worth knowing; not worth doing before the blocks close at their rates.
+
 So a **cycle-accurate EE at native rate is the blocker**, exactly as the
 retro-cores note said. The options are (a) a half-rate EE (games run at half
 speed — useless as a product, useful as a bring-up target), (b) a
