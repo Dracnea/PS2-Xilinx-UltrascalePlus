@@ -74,11 +74,11 @@ class Mem:
     def __init__(self, size=1 << 20):
         self.b = bytearray(size)
 
-    def load(self, addr, n, signed=False):
-        v = int.from_bytes(self.b[addr:addr + n], "little")
-        if signed and v >> (n * 8 - 1):
-            v -= 1 << (n * 8)
-        return v & M64 if not signed else v & M64
+    def load(self, addr, n):
+        """n bytes, little-endian, zero-extended.  Sign extension is the
+        caller's business because only some load instructions want it, and the
+        width that is extended from is the instruction's, not the port's."""
+        return int.from_bytes(self.b[addr:addr + n], "little")
 
     def store(self, addr, n, val):
         self.b[addr:addr + n] = (val & ((1 << (n * 8)) - 1)).to_bytes(n, "little")
@@ -266,6 +266,21 @@ class R5900:
             a = (s64(self.r(rs)) + simm) & M64
             n = {40: 1, 41: 2, 43: 4, 63: 8}[op]
             self.mem.store(a, n, self.r(rt))
+        elif op in (30, 31):                            # LQ / SQ
+            # The only instructions that move all 128 bits of a register to or
+            # from memory, and the reason the register file is 128 bits wide.
+            #
+            # The low four bits of the address are *ignored* rather than
+            # checked: the manual is explicit that LQ and SQ take no address
+            # error exception on a misaligned address, they simply access the
+            # quadword containing it.  Masking here rather than trapping is the
+            # whole of that rule, and a model that raised an exception would
+            # disagree with silicon on code that works.
+            a = ((s64(self.r(rs)) + simm) & M64) & ~15
+            if op == 30:
+                self.w128(rt, self.mem.load(a, 16))
+            else:
+                self.mem.store(a, 16, self.r128(rt))
         elif op == 16:                                  # COP0
             if rs == 0:                                 # MFC0
                 self.w(rt, sext32(self.cop0[rd] & M32))

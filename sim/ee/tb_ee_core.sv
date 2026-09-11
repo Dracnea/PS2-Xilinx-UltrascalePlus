@@ -27,8 +27,8 @@ module tb_ee_core;
    wire         i_ready;
    logic [31:0] d_addr;
    logic        d_read, d_write, d_ready;
-   logic [7:0]  d_be;
-   logic [63:0] d_wdata, d_rdata;
+   logic [15:0]  d_be;
+   logic [127:0] d_wdata, d_rdata;
    logic        retire;
    logic [63:0] retire_pc, dbg_hi, dbg_lo, dbg_hi1, dbg_lo1;
    logic [127:0] dbg_gpr;
@@ -78,23 +78,35 @@ module tb_ee_core;
    assign i_data  = ipd[ilat-1];
    assign i_ready = ipv[ilat-1];
 
-   // ---- data port: 64 bits with byte enables, dlat cycles of latency -------
+   // ---- data port: 128 bits with byte enables, dlat cycles of latency ------
+   // A quadword, matching the core's port and ee_ram.vhd's.  The address is
+   // masked to the quadword here because that is the port contract the real
+   // memory implements: ee_ram.vhd picks its half with addr(4) and never looks
+   // at bits 3:0 at all, leaving the byte enables to say which bytes are meant.
+   //
+   // A consequence worth stating rather than discovering later: because this
+   // port ignores the low four bits, it **cannot** tell whether the core
+   // cleared them.  LQ and SQ mask the address in ee_core.vhd, and removing
+   // that mask leaves every differential run passing.  The mask is there for a
+   // target that is less forgiving than this one; what these runs do check is
+   // the rule that has an architectural consequence -- that a misaligned LQ is
+   // not a fault and reads the quadword containing the address.
    integer      bi;
-   logic        dpend = 0;
-   integer      dcnt  = 0;
-   logic [31:0] daddr_l;
-   logic [63:0] dwdata_l;
-   logic [7:0]  dbe_l;
-   logic        dwr_l;
+   logic         dpend = 0;
+   integer       dcnt  = 0;
+   logic [31:0]  daddr_l;
+   logic [127:0] dwdata_l;
+   logic [15:0]  dbe_l;
+   logic         dwr_l;
 
-   task automatic do_access(input [31:0] ad, input [63:0] wd,
-                            input [7:0] be, input wr);
+   task automatic do_access(input [31:0] ad, input [127:0] wd,
+                            input [15:0] be, input wr);
       begin
          if (wr)
-            for (bi = 0; bi < 8; bi = bi + 1)
-               if (be[bi]) mem[(ad & ~32'h7) + bi] = wd[bi*8 +: 8];
-         for (bi = 0; bi < 8; bi = bi + 1)
-            d_rdata[bi*8 +: 8] <= mem[(ad & ~32'h7) + bi];
+            for (bi = 0; bi < 16; bi = bi + 1)
+               if (be[bi]) mem[(ad & ~32'hF) + bi] = wd[bi*8 +: 8];
+         for (bi = 0; bi < 16; bi = bi + 1)
+            d_rdata[bi*8 +: 8] <= mem[(ad & ~32'hF) + bi];
       end
    endtask
 

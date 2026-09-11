@@ -76,13 +76,18 @@ entity ee_core is
       i_data     : in  std_logic_vector(31 downto 0) := (others => '0');
       i_ready    : in  std_logic := '0';
 
-      -- data port, 64 bits with byte enables
+      -- data port, 128 bits with byte enables.  A quadword, not a doubleword,
+      -- for two reasons that agree: LQ and SQ move all 128 bits of a register
+      -- and cannot be expressed on a narrower port without a second beat, and
+      -- ee_ram.vhd -- the 32 MB main memory this core will attach to -- already
+      -- presents exactly this width.  Every narrower access picks its bytes out
+      -- of the quadword with the byte enables and the address's low four bits.
       d_addr     : out std_logic_vector(31 downto 0) := (others => '0');
       d_read     : out std_logic := '0';
       d_write    : out std_logic := '0';
-      d_be       : out std_logic_vector(7 downto 0) := (others => '0');
-      d_wdata    : out std_logic_vector(63 downto 0) := (others => '0');
-      d_rdata    : in  std_logic_vector(63 downto 0) := (others => '0');
+      d_be       : out std_logic_vector(15 downto 0) := (others => '0');
+      d_wdata    : out std_logic_vector(127 downto 0) := (others => '0');
+      d_rdata    : in  std_logic_vector(127 downto 0) := (others => '0');
       d_ready    : in  std_logic := '0';
 
       -- for the testbench: one pulse per retired instruction, with the state
@@ -246,9 +251,9 @@ architecture arch of ee_core is
    signal m_unal_l  : std_logic := '0';
    signal m_mbase   : std_logic_vector(63 downto 0) := (others => '0');
    signal m_isload  : std_logic := '0';
-   signal m_width   : integer range 1 to 8 := 4;
+   signal m_width   : integer range 1 to 16 := 4;
    signal m_sign    : std_logic := '0';
-   signal m_shift   : integer range 0 to 7 := 0;
+   signal m_shift   : integer range 0 to 15 := 0;
 
    -- ---- A2/WB -------------------------------------------------------------
    signal w_valid   : std_logic := '0';
@@ -360,6 +365,7 @@ architecture arch of ee_core is
          -- is the only way it ever emits them.
          when 34 | 38 | 26 | 27 => return true;                 -- LWL/LWR/LDL/LDR
          when 42 | 46 | 44 | 45 => return true;                 -- SWL/SWR/SDL/SDR
+         when 31 => return true;                               -- SQ stores rt
          when others => return false;   -- rt is the destination, or unused
       end case;
    end function;
@@ -370,6 +376,7 @@ architecture arch of ee_core is
       case op is
          when 32 | 33 | 35 | 36 | 37 | 39 | 55 => return true;
          when 34 | 38 | 26 | 27 => return true;   -- the unaligned load forms
+         when 30 => return true;                  -- LQ
          when others => return false;
       end case;
    end function;
@@ -433,16 +440,16 @@ begin
       variable ex_hi_we, ex_lo_we     : std_logic;
       variable ex_hi, ex_lo           : std_logic_vector(63 downto 0);
       variable ex_ismem, ex_isload    : std_logic;
-      variable ex_width               : integer range 1 to 8;
+      variable ex_width               : integer range 1 to 16;
       variable ex_sign                : std_logic;
-      variable ex_shift               : integer range 0 to 7;
+      variable ex_shift               : integer range 0 to 15;
       variable ex_addr                : std_logic_vector(31 downto 0);
-      variable ex_be                  : std_logic_vector(7 downto 0);
-      variable ex_wdata               : std_logic_vector(63 downto 0);
+      variable ex_be                  : std_logic_vector(15 downto 0);
+      variable ex_wdata               : std_logic_vector(127 downto 0);
       variable ex_unal, ex_unal_dw    : std_logic;
       variable ex_unal_l              : std_logic;
       variable ex_mbase               : std_logic_vector(63 downto 0);
-      variable kk, hw                 : integer range 0 to 7;
+      variable kk, hw, dh             : integer range 0 to 7;
       variable ex_take                : boolean;
       variable ex_trap                : boolean;
       variable ex_busy                : boolean;
@@ -476,7 +483,7 @@ begin
       variable ldv, ldw          : std_logic_vector(63 downto 0);
       variable ldw128            : std_logic_vector(127 downto 0);
       variable uw, um, uv        : unsigned(31 downto 0);
-      variable uv64              : unsigned(63 downto 0);
+      variable uv64, udw         : unsigned(63 downto 0);
       variable ku, shu           : integer range 0 to 63;
 
       -- IF queue bookkeeping
@@ -923,7 +930,7 @@ begin
                      when 39 => ex_width := 4; ex_sign := '0';
                      when others => ex_width := 8; ex_sign := '0';
                   end case;
-                  ex_shift := to_integer(ea(2 downto 0));
+                  ex_shift := to_integer(ea(3 downto 0));
 
                when 34 | 38 | 26 | 27 =>                     -- LWL/LWR/LDL/LDR
                   ea := unsigned(signed(a) + simm);
@@ -932,7 +939,7 @@ begin
                   ex_isload := '1';
                   ex_we     := '1';
                   ex_rd     := rt;
-                  ex_shift  := to_integer(ea(2 downto 0));
+                  ex_shift  := to_integer(ea(3 downto 0));
                   ex_unal   := '1';
                   if op = 26 or op = 27 then ex_unal_dw := '1'; end if;
                   if op = 34 or op = 26 then ex_unal_l  := '1'; end if;
@@ -942,13 +949,53 @@ begin
                   ea := unsigned(signed(a) + simm);
                   ex_addr  := std_logic_vector(ea(31 downto 0));
                   ex_ismem := '1';
-                  ex_wdata := std_logic_vector(shift_left(unsigned(b), 8 * to_integer(ea(2 downto 0))));
+                  -- SD reached the port with ex_be = x"FF" and no shift when
+                  -- the port was 64 bits wide, because the address's low three
+                  -- bits were all there was and an aligned doubleword filled it.
+                  -- On a quadword port bit 3 chooses which half, so every store
+                  -- shifts -- including the one that did not have to before.
+                  kk := to_integer(ea(3 downto 0));
+                  ex_wdata := std_logic_vector(shift_left(resize(unsigned(b), 128), 8 * kk));
                   case op is
-                     when 40 => ex_be := std_logic_vector(shift_left(unsigned'(x"01"), to_integer(ea(2 downto 0))));
-                     when 41 => ex_be := std_logic_vector(shift_left(unsigned'(x"03"), to_integer(ea(2 downto 0))));
-                     when 43 => ex_be := std_logic_vector(shift_left(unsigned'(x"0F"), to_integer(ea(2 downto 0))));
-                     when others => ex_be := x"FF";
+                     when 40 => ex_be := std_logic_vector(shift_left(unsigned'(x"0001"), kk));
+                     when 41 => ex_be := std_logic_vector(shift_left(unsigned'(x"0003"), kk));
+                     when 43 => ex_be := std_logic_vector(shift_left(unsigned'(x"000F"), kk));
+                     when others => ex_be := std_logic_vector(shift_left(unsigned'(x"00FF"), kk));
                   end case;
+
+               when 30 | 31 =>                               -- LQ / SQ
+                  -- The only instructions that move all 128 bits of a register.
+                  -- The low four bits of the address are *ignored*, not checked:
+                  -- the manual is explicit that neither takes an address error
+                  -- exception, they access the quadword containing the address.
+                  -- So the shift is zero and the byte enables are all on, and a
+                  -- misaligned LQ is a legal instruction with a defined result
+                  -- rather than a trap.
+                  --
+                  -- The mask below is defensive rather than load-bearing, and
+                  -- saying so is better than letting the next reader assume it
+                  -- was measured: this port's targets ignore the low four bits
+                  -- themselves -- ee_ram.vhd picks its half with addr(4) and
+                  -- never reads bits 3:0 -- so removing the mask changes no
+                  -- simulation result.  It is here for a target that is less
+                  -- forgiving.  What *is* checked is the architectural rule,
+                  -- that a misaligned LQ reads the containing quadword and does
+                  -- not fault; sim/ee/gen_quad.py walks all sixteen offsets.
+                  ea := unsigned(signed(a) + simm);
+                  ex_addr  := std_logic_vector(ea(31 downto 4)) & "0000";
+                  ex_ismem := '1';
+                  ex_shift := 0;
+                  if op = 30 then                            -- LQ
+                     ex_isload := '1';
+                     ex_we     := '1';
+                     ex_w128   := '1';
+                     ex_rd     := rt;
+                     ex_width  := 16;
+                     ex_sign   := '0';
+                  else                                       -- SQ
+                     ex_wdata := b128;
+                     ex_be    := x"FFFF";
+                  end if;
 
                when 42 | 46 | 44 | 45 =>                     -- SWL/SWR/SDL/SDR
                   -- Each writes part of the aligned unit containing the
@@ -958,30 +1005,42 @@ begin
                   ea := unsigned(signed(a) + simm);
                   ex_addr  := std_logic_vector(ea(31 downto 0));
                   ex_ismem := '1';
+                  -- Each of these addresses a unit *inside* the quadword: a
+                  -- doubleword form works within the half named by address bit
+                  -- 3, a word form within the quarter named by bits 3:2.  The
+                  -- within-unit arithmetic is unchanged; only the final shift
+                  -- into the wider port is new.
                   if op = 44 or op = 45 then                 -- doubleword forms
                      kk := to_integer(ea(2 downto 0));
+                     dh := to_integer(ea(3 downto 3));       -- which half of the quadword
                      if op = 44 then                         -- SDL
-                        ex_wdata := std_logic_vector(shift_right(unsigned(b), 8 * (7 - kk)));
-                        ex_be    := std_logic_vector(resize(unsigned'(x"FF") srl (7 - kk), 8));
+                        ex_wdata := std_logic_vector(shift_left(
+                                       resize(shift_right(unsigned(b), 8 * (7 - kk)), 128),
+                                       64 * dh));
+                        ex_be    := std_logic_vector(shift_left(
+                                       resize(unsigned'(x"FF") srl (7 - kk), 16), 8 * dh));
                      else                                    -- SDR
-                        ex_wdata := std_logic_vector(shift_left(unsigned(b), 8 * kk));
-                        ex_be    := std_logic_vector(shift_left(unsigned'(x"FF"), kk));
+                        ex_wdata := std_logic_vector(shift_left(
+                                       resize(shift_left(unsigned(b), 8 * kk), 128),
+                                       64 * dh));
+                        ex_be    := std_logic_vector(shift_left(
+                                       resize(shift_left(unsigned'(x"FF"), kk), 16), 8 * dh));
                      end if;
                   else                                       -- word forms
                      kk := to_integer(ea(1 downto 0));
-                     hw := to_integer(ea(2 downto 2));       -- which half of the 64-bit unit
+                     hw := to_integer(ea(3 downto 2));       -- which quarter of the quadword
                      if op = 42 then                         -- SWL
                         ex_wdata := std_logic_vector(shift_left(
-                                       resize(shift_right(unsigned(b(31 downto 0)), 8 * (3 - kk)), 64),
+                                       resize(shift_right(unsigned(b(31 downto 0)), 8 * (3 - kk)), 128),
                                        32 * hw));
                         ex_be    := std_logic_vector(shift_left(
-                                       resize(unsigned'(x"0F") srl (3 - kk), 8), 4 * hw));
+                                       resize(unsigned'(x"0F") srl (3 - kk), 16), 4 * hw));
                      else                                    -- SWR
                         ex_wdata := std_logic_vector(shift_left(
-                                       resize(shift_left(unsigned(b(31 downto 0)), 8 * kk), 64),
+                                       resize(shift_left(unsigned(b(31 downto 0)), 8 * kk), 128),
                                        32 * hw));
                         ex_be    := std_logic_vector(shift_left(
-                                       resize(shift_left(unsigned'(x"0F"), kk) and x"0F", 8), 4 * hw));
+                                       resize(shift_left(unsigned'(x"0F"), kk) and x"0F", 16), 4 * hw));
                      end if;
                   end if;
 
@@ -1118,11 +1177,9 @@ begin
                   -- source and the destination here, which is why these had to
                   -- be added to the forwarding decode as readers of rt.
                   if m_unal_dw = '0' then                       -- word forms
-                     if m_shift >= 4 then
-                        uw := unsigned(d_rdata(63 downto 32));
-                     else
-                        uw := unsigned(d_rdata(31 downto 0));
-                     end if;
+                     -- which of the quadword's four words the address falls in
+                     uw := unsigned(d_rdata(32 * (m_shift / 4) + 31
+                                            downto 32 * (m_shift / 4)));
                      ku := m_shift mod 4;
                      if m_unal_l = '1' then                     -- LWL
                         shu := 8 * (3 - ku);
@@ -1135,15 +1192,18 @@ begin
                      end if;
                      ldw := sext32(std_logic_vector(uv));
                   else                                          -- doubleword forms
-                     ku := m_shift;
+                     -- and which of its two halves, for the doubleword forms
+                     udw := unsigned(d_rdata(64 * (m_shift / 8) + 63
+                                             downto 64 * (m_shift / 8)));
+                     ku := m_shift mod 8;
                      if m_unal_l = '1' then                     -- LDL
                         shu := 8 * (7 - ku);
-                        uv64 := (shift_left(unsigned(d_rdata), shu)
+                        uv64 := (shift_left(udw, shu)
                                  or (unsigned(m_mbase)
                                      and (shift_left(to_unsigned(1, 64), shu) - 1)));
                      else                                       -- LDR
                         shu := 8 * ku;
-                        uv64 := (shift_right(unsigned(d_rdata), shu)
+                        uv64 := (shift_right(udw, shu)
                                  or (unsigned(m_mbase)
                                      and not shift_right(unsigned'(x"FFFFFFFFFFFFFFFF"), shu)));
                      end if;
@@ -1156,7 +1216,8 @@ begin
                   -- be selected out of it and then extended.  Getting the
                   -- extension wrong is invisible until a value happens to have
                   -- its top bit set.
-                  ldv := std_logic_vector(shift_right(unsigned(d_rdata), 8 * m_shift));
+                  ldw128 := std_logic_vector(shift_right(unsigned(d_rdata), 8 * m_shift));
+                  ldv := ldw128(63 downto 0);
                   case m_width is
                      when 1 =>
                         if m_sign = '1' then
@@ -1179,7 +1240,11 @@ begin
                      when others =>
                         ldw := ldv;
                   end case;
-                  w_val <= x"0000000000000000" & ldw;
+                  if m_width = 16 then                  -- LQ: the whole quadword
+                     w_val <= d_rdata;
+                  else
+                     w_val <= x"0000000000000000" & ldw;
+                  end if;
                else
                   w_val <= m_val;
                end if;

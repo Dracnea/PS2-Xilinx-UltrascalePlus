@@ -856,19 +856,76 @@ that will never come.
 
 368 runs pass: the standing matrix and the wide campaign together.
 
+## LQ and SQ, and a quadword data port — 2026-09-11
+
+The register file has been 128 bits wide since the first commit, and until now
+nothing could move 128 bits to or from memory: `PCPYLD` and `PCPYUD` were the
+only way a value ever reached a register's upper half. `LQ` and `SQ` close
+that, and they are the reason the data port is now a quadword.
+
+**The port went from 64 bits to 128.** That is the larger half of this change
+and it touches every memory instruction, because a narrower access now selects
+its bytes out of a quadword rather than a doubleword: the shift is
+`ea(3 downto 0)` instead of `ea(2 downto 0)`, `SD` acquired a shift it did not
+need before, and the unaligned forms pick their doubleword with address bit 3
+and their word with bits 3:2 before doing the same arithmetic they always did.
+
+The width was not chosen for `LQ`'s convenience. `rtl/ee/ee_ram.vhd` — the 32 MB
+main memory this core attaches to — already presents 128 bits with sixteen byte
+enables, so the 64-bit port was the mismatch, and the R5900's own load/store
+unit is quadword-wide.
+
+**What is checked, and what is not.** `sim/ee/gen_quad.py` walks all sixteen
+offsets within a quadword for both instructions, with distinct non-zero values
+in *both* halves of every register and every quadword in memory. That last
+detail is the point rather than thoroughness for its own sake: an `LQ` built to
+write only the low 64 bits passes every random seed and fails the third
+instruction of the directed program. Both halves are usually zero, so a load
+that dropped the upper one wrote the zeroes that were already there.
+
+The rule that the low four bits of the address are *ignored* rather than
+faulted is honoured in both models, and the misaligned offsets exercise it —
+but the mask in the RTL is **not** what implements it and is not verified.
+Every target on this port ignores those bits itself (`ee_ram.vhd` selects its
+half with `addr(4)` and never reads bits 3:0), so removing the mask changes no
+simulation result. It is there for a stricter target, and the comment in
+`ee_core.vhd` says so rather than letting the next reader assume it was
+measured.
+
+### Two arms of the random generator had never fired — 2026-09-11
+
+`sim/ee/gen_prog.py` chose its instruction mix with a chain of
+`elif pick < k` arms and hand-written constants, and two of them were
+unreachable. The COP0 arm was added below an arm testing `pick < 0.92` with a
+threshold of `0.90`; the MMI SIMD arm was added later at `0.92` under the same
+one. **Both were dead from the moment they were written**, so no random program
+has ever contained a COP0 move or an MMI SIMD instruction, and **none of the
+368 differential runs recorded above covered either**.
+
+Nothing said so, because a generator that omits a class of instruction produces
+a program that runs perfectly and proves less than it claims. This is the same
+shape as the three broken instruments recorded elsewhere on this page, and it
+is the most expensive shape: the test was green for the wrong reason.
+
+The mix is now a weight table, which cannot shadow an arm, and `--census`
+prints what was actually emitted so the claim can be checked rather than
+assumed. Making both arms live found no bug — COP0 and MMI SIMD pass in random
+programs at the first attempt — which is the good outcome and not the point.
+The point is that it was not known.
+
 ## What is not started
 
-Hazards and pipelining — the core is still one instruction at a time. MMI, the
-FPU, the VUs. And the integer subset itself is not complete: no
-no TLB, no `LQ`/`SQ`, and none of MMI's SIMD
-instructions — only the
-pipeline-1 forms that share the SPECIAL encodings. The unaligned group — `LWL`, `LWR`, `SWL`, `SWR`,
-`LDL`, `LDR`, `SDL`, `SDR` — is done.
+Hazards and pipelining — the core is still one instruction at a time. The FPU
+and the VUs. The integer subset is not complete: no TLB, and MMI's SIMD set is
+only the six logical and copy forms (`PAND`, `PXOR`, `PCPYLD`, `POR`, `PNOR`,
+`PCPYUD`) — the parallel arithmetic of MMI0 and MMI1 is not started. The
+unaligned group — `LWL`, `LWR`, `SWL`, `SWR`, `LDL`, `LDR`, `SDL`, `SDR` — is
+done, and so are `LQ` and `SQ`.
 
-Timing is not closed: 242.8 MHz against a 294.912 MHz target, a factor of 1.21.
-The critical path is now `forwarding mux → 64-bit ALU → result register`, which
-is the fundamental path of a single-cycle ALU and closes by splitting the ALU
-itself across A1 and A2 rather than by moving anything else around.
+Timing was last measured at 283.5 MHz against a 294.912 MHz target, a factor of
+1.04, before the data port was widened to 128 bits. **That figure is now
+stale:** widening the port changes the load return path and the store
+alignment network, and no fit has been run since. Re-measure before quoting it.
 
 IPC is better but not closed: CPI 1.78 on ordinary code, 2.15 on branch-heavy.
 What is left is multiply/divide latency (inherent), one stall per memory access,
