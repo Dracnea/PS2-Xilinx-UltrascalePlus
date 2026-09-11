@@ -20,7 +20,7 @@ in C and in Python, and there is no mechanism that forces them to agree: if the
 probe is changed and this is not, the diff will be of two different pictures and
 will look like a hardware discovery.
 """
-import os, sys, argparse
+import os, re, sys, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "sim", "gs"))
 from gs_ref import GS, addr32p                       # noqa: E402
 
@@ -150,6 +150,42 @@ def pairing(rows):
              else ""))
 
 
+def zclamp(text):
+    """What the console did with a depth too wide for its Z buffer.
+
+    The probe writes 0x01234567 into a PSMZ24 buffer through a sprite -- a
+    sprite because its depth is an integer from the second vertex and never
+    interpolates, so the depth bias cannot contaminate the answer -- and prints
+    what came back.  Clamping gives 0xFFFFFF, truncating gives 0x234567, and
+    the two are far enough apart that no analysis is needed.
+
+    This model implements clamping, taken from PCSX2.  The manual does not say.
+    If the console says TRUNCATE, the change is one line in each
+    implementation: `zc = m if z > m else z` in sim/gs/gs_ref.py and the
+    src_zc assignment in rtl/gs/gs_gif.vhd.
+    """
+    m = re.search(r"^ZCPROBE psmz24 wrote (\w+) read (\w+) -> (\w+)",
+                  text, re.M)
+    if not m:
+        print("z-clamp: the console printed no ZCPROBE line")
+        return 0
+    wrote, read, verdict = m.group(1), m.group(2), m.group(3)
+    print("\nz-clamp: wrote %s into PSMZ24, read back %s -- console says %s"
+          % (wrote, read, verdict))
+    if verdict == "CLAMP":
+        print("         which is what this project models.  The rule is now")
+        print("         verified rather than taken from PCSX2.")
+        return 0
+    if verdict == "TRUNCATE":
+        print("         which this project does NOT model: it clamps.  Change")
+        print("         _zcheck's clamp in sim/gs/gs_ref.py and src_zc in")
+        print("         rtl/gs/gs_gif.vhd, and re-run the differential suite.")
+        return 1
+    print("         which is neither answer.  Record the number rather than")
+    print("         choosing between two rules that both fail to predict it.")
+    return 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("logfile", help="what ps2client printed")
@@ -165,6 +201,7 @@ def main():
                   parse(text, "ZPROBE xgrad", "ZROW"))
     if zy:
         pairing(zy)
+    bad += zclamp(text)
     print("\n%s" % ("everything the console drew matches the model"
                     if bad == 0 else
                     "the console disagrees -- it is the one that is right"))

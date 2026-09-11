@@ -98,6 +98,22 @@ reads rows *k* and *k+2* identically at every *k*, nobody has published why, and
 no emulator models the vertical structure it would imply. A pure Y gradient
 shows it without any analysis, and `compare.py` prints the count.
 
+**`ZCPROBE`** — one sprite, one number, two possible answers. It writes
+`0x01234567` into a **PSMZ24** buffer with `ZTST = ALWAYS` and `ZMSK = 0`, then
+reads it back, to settle what the GS does with a depth too wide for its Z
+format. Clamping gives `0xFFFFFF`; truncating gives `0x234567`. This project
+models clamping, taken from PCSX2, and the manual gives the three Z formats
+without ever saying what happens to a value that will not fit.
+
+Two choices here are deliberate. It uses a **sprite**, whose depth is an integer
+from the second vertex and never interpolates, so the depth bias — the other
+unverified rule on this page — cannot contaminate the answer. And it uses
+PSMZ24 with a PSMCT32 frame buffer, because the manual only allows a frame and Z
+format from the same group, PSMZ24 is in PSMCT32's group, and PSMZ24 is
+addressed exactly as PSMZ32 is — so the existing readback reaches it unchanged.
+`compare.py` prints the verdict and names the one line in each implementation to
+change if the console says TRUNCATE.
+
 The remaining open question needs a probe that does not exist yet: **the affine
 texture coordinate is truncated and may carry a block width of its own**, but no
 capture has swept it. The same width curve that established eight pixels for

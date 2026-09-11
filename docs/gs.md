@@ -835,12 +835,82 @@ With those fixed, all nine mutations tried are caught by `gen_fb16.py` alone:
 both block orders, the half selection, the column order, the page stride, both
 directions of the colour conversion, the alpha rule, and the mask conversion.
 
+## 16-bit depth, and a depth that does not fit — 2026-09-11
+
+PSMZ16 and PSMZ16S join the depth path, on the 16-bit addressing already built
+and cross-checked. Two things came with them.
+
+### A depth too wide for its buffer clamps; it does not wrap
+
+The committed depth code masked the incoming depth with the format's width.
+That is the same thing as clamping for every value that fits and the **opposite**
+for every value that does not: a Z of `0x01000000` against PSMZ24 compares as 0
+after a mask and as `0xFFFFFF` after a clamp, so a `GREATER` test flips from
+failing everything to passing everything.
+
+It could not be seen before. The generator's deepest vertex was 24 bits and the
+only narrow format was PSMZ24, so masking and clamping agreed on every value
+ever generated — and the reference and the RTL masked together, so the
+differential agreed with itself. PSMZ16 makes it central rather than latent:
+nearly every depth a vertex carries exceeds 16 bits.
+
+> **NOTE (unverified):** clamping is taken from PCSX2, which does it twice over
+> — `min_u32(z_max)` on the vertex and a scanline clamp gated on whether the
+> primitive's maximum depth exceeds the format — which is the shape of something
+> modelled from hardware rather than a convenience. The GS User's Manual gives
+> the three Z formats (2.3.2) and never says what happens to a value too wide
+> for one.
+> *Verify by:* `hw/ps2probe` asks the console directly. `ZCPROBE` writes
+> `0x01234567` into a PSMZ24 buffer through a **sprite** — a sprite because its
+> depth is an integer from the second vertex and never interpolates, so the
+> depth bias cannot contaminate the answer — and reads it back. Clamping gives
+> `0xFFFFFF`, truncating gives `0x234567`; the two are far enough apart to need
+> no analysis. `compare.py` prints the verdict and names the one line in each
+> implementation to change if it says TRUNCATE.
+
+### Frame and Z formats may not be paired freely
+
+The manual (2.5.4) puts both into two groups and allows a combination only
+within one: **PSMCT16 goes with PSMZ16**, and PSMCT32, PSMCT24, PSMCT16S,
+PSMZ32, PSMZ24 and PSMZ16S go together. The generator paired them at random
+until now, so some fraction of every run was asking two models to agree about a
+configuration the hardware does not define. It now picks the Z format from the
+frame format's group.
+
+### The testbench was silently dropping packets
+
+`tb_gs.sv` held 4096 quadwords and `$readmemh` fills only as far as the array
+goes, reporting nothing about the rest. A directed program of 4576 quadwords was
+therefore truncated: the reference read all of it, the RTL saw a prefix, and the
+diff blamed the two models for disagreeing about a register. The array is 16384
+now, and — because any size can be exceeded — a run that fills it says so and
+stops, since a truncated run must not be able to look like a failing one.
+
+That is the fourth instrument on this project to fail by staying quiet, after
+the drain that ended mid-setup, the filtered unknown-register count, and the
+`ilat`/`dlat` of zero.
+
+### What the directed stream had to be taught, twice more
+
+`gen_fb16.py` now lays a depth pattern and tests against it. Getting it to prove
+anything needed the same lesson the colour half taught, applied twice more:
+
+* A **flat** Z buffer is invariant under any permutation of its blocks, so a
+  block-order mutation is invisible against one. The first version ended with a
+  full-page pass whose depth beat the whole buffer, which writes the same value
+  everywhere — and with that in place the reference gave a bit-identical result
+  with the depth block xor switched off entirely.
+* The fix is not a different pattern but a different **structure**: the pattern
+  is laid down once, disturbed once in a way that keeps it varied, and after
+  that every pass leaves `ZMSK` set and only *reads* it. The colour buffer
+  records which pixels passed, which is what the comparison needs anyway.
+
+With that, all five depth mutations tried are caught — the clamp reverted to a
+mask, the depth block xor switched off, PSMZ16S given the plain block order, the
+half taken from the wrong address bit, and the half ignored on read.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture — and step 5, PCRTC.
-Local-to-host and local-to-local transfers. **PSMZ16 and PSMZ16S**: the
-addressing exists and is cross-checked, and `pix_addr16_page` already takes the
-Z block xor, but the depth path still accepts only the 32-bit Z formats, so a
-16-bit colour buffer is drawn with a 32-bit Z. Host-to-local transfers are
-still PSMCT32 only. Dither, which needs a 16-bit format to act on and now has
-one.
+Local-to-host and local-to-local transfers; host-to-local is still PSMCT32 only.
+Dither, which needs a 16-bit format to act on and now has one.

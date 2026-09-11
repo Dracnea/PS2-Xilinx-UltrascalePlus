@@ -37,7 +37,12 @@ module tb_gs;
    logic [31:0] vmsum;
    integer dump_base, dump_len;
    string  pktfile;
-   logic [127:0] pkts [0:4095];
+   // 16384 rather than 4096: a directed program that enumerates formats runs to
+   // several thousand quadwords, and $readmemh fills only as far as the array
+   // goes and says nothing about the rest.  See the overflow check below --
+   // the size alone is not the fix, because any size can be exceeded.
+   localparam MAXPKT = 16384;
+   logic [127:0] pkts [0:MAXPKT-1];
 
    // ---- local memory: 4 MB, written 256 bits at a time with byte enables ---
    localparam VMBYTES = 4*1024*1024;
@@ -103,12 +108,26 @@ module tb_gs;
       if (!$value$plusargs("dumpbase=%d", dump_base)) dump_base = 0;
       if (!$value$plusargs("dumplen=%d", dump_len))   dump_len  = 256;
       for (n = 0; n < VMBYTES; n = n + 1) vm[n] = 8'h00;
-      for (n = 0; n < 4096; n = n + 1) pkts[n] = 128'h0;
+      for (n = 0; n < MAXPKT; n = n + 1) pkts[n] = 128'h0;
       $readmemh(pktfile, pkts);
       // the generator writes a count on the first line as a comment, so instead
       // count the trailing zero quadwords off the end
-      npkt = 4096;
+      npkt = MAXPKT;
       while (npkt > 0 && pkts[npkt-1] === 128'h0) npkt = npkt - 1;
+
+      // $readmemh stops at the end of the array and reports nothing, so a file
+      // longer than pkts is silently truncated: the reference reads all of it,
+      // the RTL sees a prefix, and the diff blames the two models for
+      // disagreeing about a register.  That cost a real debugging session on a
+      // directed program of 4576 quadwords against an array of 4096.  A
+      // truncated run must not look like a failing one, so say so and stop.
+      if (npkt == MAXPKT) begin
+         $display("# tb_gs: %s fills all %0d packet slots -- it may have been",
+                  pktfile, MAXPKT);
+         $display("# truncated on load.  Raise MAXPKT or shorten the program;");
+         $display("# a silently truncated stream is not a comparison.");
+         $finish;
+      end
 
       repeat (4) @(posedge clk);
       reset <= 0;

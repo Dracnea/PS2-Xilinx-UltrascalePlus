@@ -162,6 +162,74 @@ static void draw_zgrad(int along_y)
     gif_send((u64 *)gifbuf, p);
 }
 
+/* ---- the depth clamp probe --------------------------------------------- */
+/*
+ * A depth too wide for the Z buffer's format: does it clamp to the format's
+ * maximum, or does it wrap?
+ *
+ * This project models clamping, taken from PCSX2, which does it twice over --
+ * min_u32 on the vertex and a scanline clamp gated on whether the primitive's
+ * maximum depth exceeds the format.  The GS User's Manual gives the three Z
+ * formats in 2.3.2 and never says what happens to a value that will not fit.
+ * Nothing here has seen a console decide it.
+ *
+ * The two answers are far apart and need no analysis to tell apart, which is
+ * what makes this worth asking directly.  A **sprite** is used rather than a
+ * triangle because a sprite's depth is an integer from its second vertex and
+ * never interpolates, so the depth bias -- the other unverified rule on this
+ * page -- cannot contaminate the answer.
+ *
+ * PSMZ24 with a PSMCT32 frame buffer is the pair to use: the manual's 2.5.4
+ * only allows a frame and Z format from the same group, PSMZ24 is in the same
+ * group as PSMCT32, and PSMZ24 is addressed exactly as PSMZ32 is -- so the
+ * existing readback reaches it unchanged.
+ *
+ * With Z = 0x01234567 written into a 24-bit buffer:
+ *
+ *     clamped   -> 0xFFFFFF
+ *     truncated -> 0x234567
+ *
+ * The top byte of a PSMZ24 word is not part of the value and may read back as
+ * anything, so compare only the low 24 bits.
+ */
+#define ZCLAMP_Z 0x01234567u
+
+static void draw_zclamp(void)
+{
+    u64 *p = (u64 *)gifbuf;
+    u64 *tag = p;
+    p += 2;
+
+    p = ad(p, GS_SET_FRAME(0, FB_W / 64, FB_PSM, 0),        GS_REG_FRAME_1);
+    p = ad(p, GS_SET_XYOFFSET(0, 0),                        GS_REG_XYOFFSET_1);
+    p = ad(p, GS_SET_SCISSOR(0, FB_W - 1, 0, FB_H - 1),     GS_REG_SCISSOR_1);
+    /* ZTE = 1, ZTST = ALWAYS, ZMSK = 0: every pixel writes its depth */
+    p = ad(p, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, 1),          GS_REG_TEST_1);
+    p = ad(p, GS_SET_ZBUF(ZB_PAGE, 0x31 & 0xF, 0),          GS_REG_ZBUF_1);
+    p = ad(p, GS_SET_PRIM(GS_PRIM_SPRITE, 0, 0, 0, 0, 0, 0, 0, 0), GS_REG_PRIM);
+    {
+        u32 n = (u32)((p - tag) / 2) - 1;
+        tag[0] = GIF_SET_TAG(n, 1, 0, 0, GIF_FLG_PACKED, 1);
+        tag[1] = GIF_REG_AD;
+    }
+    gif_send((u64 *)gifbuf, p);
+
+    p = (u64 *)gifbuf;
+    tag = p;
+    p += 2;
+    p = ad(p, GS_SET_RGBAQ(64, 64, 64, 128, 0), GS_REG_RGBAQ);
+    /* A sprite takes its depth from the *second* vertex, so the first carries a
+       different one: if it were ever used the readback would say so. */
+    p = ad(p, GS_SET_XYZ(0 << 4, 0 << 4, 0x00000001),                 GS_REG_XYZ2);
+    p = ad(p, GS_SET_XYZ(FB_W << 4, FB_H << 4, ZCLAMP_Z),             GS_REG_XYZ2);
+    {
+        u32 n = (u32)((p - tag) / 2) - 1;
+        tag[0] = GIF_SET_TAG(n, 1, 0, 0, GIF_FLG_PACKED, 1);
+        tag[1] = GIF_REG_AD;
+    }
+    gif_send((u64 *)gifbuf, p);
+}
+
 /* ---- the subject: one Gouraud triangle with known vertex colours ------- */
 static void draw_gouraud(void)
 {
@@ -252,6 +320,28 @@ int main(void)
             }
             printf("ZPROBE end\n");
         }
+    }
+
+    /* the depth clamp: one sprite, one number, two possible answers */
+    {
+        u32 v;
+        memset(back, 0, sizeof(back));
+        draw_zclamp();
+        readback_psm(ZB_PAGE, FB_W / 64, ZB_PSM, FB_W, FB_H, back);
+        v = ((u32 *)back)[0] & 0x00FFFFFFu;
+        printf("ZCPROBE psmz24 wrote %08x read %06x -> %s\n",
+               ZCLAMP_Z, v,
+               v == 0x00FFFFFFu ? "CLAMP"
+               : (v == (ZCLAMP_Z & 0x00FFFFFFu) ? "TRUNCATE" : "NEITHER"));
+        /* print a few more in case the first pixel is not representative */
+        for (y = 0; y < 4; y++)
+        {
+            printf("ZCROW %02u", y);
+            for (x = 0; x < 8; x++)
+                printf(" %06x", ((u32 *)back)[y * FB_W + x] & 0x00FFFFFFu);
+            printf("\n");
+        }
+        printf("ZCPROBE end\n");
     }
 
     SleepThread();

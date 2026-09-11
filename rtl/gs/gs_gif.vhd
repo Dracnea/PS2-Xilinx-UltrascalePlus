@@ -170,6 +170,10 @@ architecture arch of gs_gif is
    signal dr_zmsk    : std_logic := '0';
    signal dr_zbp     : unsigned(8 downto 0) := (others => '0');
    signal dr_zmask   : std_logic_vector(31 downto 0) := (others => '0');
+   -- the depth buffer's format: 16 bits per value, and the S block order
+   signal dr_z16     : std_logic := '0';
+   signal dr_zs      : std_logic := '0';
+   signal dr_zhalf   : integer range 0 to 1 := 0;
    signal dr_z       : std_logic_vector(31 downto 0) := (others => '0');
    signal dr_zdone   : std_logic := '0';    -- this pixel has passed its test
    signal dr_zaddr   : unsigned(19 downto 0) := (others => '0');
@@ -196,6 +200,8 @@ architecture arch of gs_gif is
    signal z_val   : unsigned(31 downto 0);
    signal src_z   : std_logic_vector(31 downto 0);
    signal z_old   : std_logic_vector(31 downto 0);
+   signal z_word  : std_logic_vector(31 downto 0);
+   signal src_zc  : std_logic_vector(31 downto 0);
    signal z_pass  : std_logic;
    -- '1' on the cycle the current pixel is finished with, however it ended:
    -- written, masked away, or killed by the depth test.  One signal, so that
@@ -436,12 +442,31 @@ begin
    -- manual says about Sprite and what the console probes found.
    src_z <= std_logic_vector(z_val) when tri_mode = '1' else dr_z;
 
-   z_old <= std_logic_vector(shift_right(unsigned(rd_data),
-                             32 * to_integer(dr_zaddr(2 downto 0)))(31 downto 0));
+   z_word <= std_logic_vector(shift_right(unsigned(rd_data),
+                              32 * to_integer(dr_zaddr(2 downto 0)))(31 downto 0));
+   -- At 16 bits two depths share a word, so which half is read is chosen the
+   -- same way the colour path chooses it.
+   z_old <= (x"0000" & z_word(16 * dr_zhalf + 15 downto 16 * dr_zhalf))
+            when dr_z16 = '1' else z_word;
+
+   -- A depth wider than the buffer format **clamps**; it does not wrap.  This
+   -- was a mask until 2026-09-11, which is the same thing for every value that
+   -- fits and the opposite for every value that does not: 0x01000000 against
+   -- PSMZ24 compares as 0 after a mask and as 0xFFFFFF after a clamp, so a
+   -- GREATER test flips from failing everything to passing everything.  It was
+   -- invisible while the deepest generated vertex was 24 bits and the only
+   -- narrow format was PSMZ24; PSMZ16 makes it central, since nearly every Z a
+   -- vertex carries exceeds 16 bits.
+   --
+   -- Clamping is taken from PCSX2 and is *not* verified against a console; the
+   -- manual gives the three Z formats and never says what happens to a value
+   -- too wide for one.  hw/ps2probe asks it directly.
+   src_zc <= dr_zmask when unsigned(src_z) > unsigned(dr_zmask) else src_z;
+
    z_pass <= '1' when dr_ztst = "10"
-                      and unsigned(src_z and dr_zmask) >= unsigned(z_old and dr_zmask)
+                      and unsigned(src_zc) >= unsigned(z_old and dr_zmask)
              else '1' when dr_ztst = "11"
-                      and unsigned(src_z and dr_zmask) >  unsigned(z_old and dr_zmask)
+                      and unsigned(src_zc) >  unsigned(z_old and dr_zmask)
              else '0';
 
    -- The one decision that a pixel is over.  Three ways out: the fast colour
@@ -558,16 +583,25 @@ begin
          dr_ztst <= tr(18 downto 17);
          dr_zmsk <= zr(32);
          dr_zbp  <= unsigned(zr(8 downto 0));
-         if zr(27 downto 24) = "0001" then
-            dr_zmask <= x"00FFFFFF";              -- PSMZ24
-         else
-            dr_zmask <= x"FFFFFFFF";              -- PSMZ32
-         end if;
+         -- dr_zmask is the widest value the format can hold.  It is both the
+         -- field mask and the value an out-of-range depth clamps to.
+         dr_z16 <= '0';
+         dr_zs  <= '0';
+         case zr(27 downto 24) is
+            when "0001" => dr_zmask <= x"00FFFFFF";           -- PSMZ24
+            when "0010" => dr_zmask <= x"0000FFFF";            -- PSMZ16
+                           dr_z16 <= '1';
+            when "1010" => dr_zmask <= x"0000FFFF";            -- PSMZ16S
+                           dr_z16 <= '1';
+                           dr_zs  <= '1';
+            when others => dr_zmask <= x"FFFFFFFF";            -- PSMZ32
+         end case;
          if tr(16) = '0' then
             dr_zon <= '0';
          elsif tr(18 downto 17) = "01" and zr(32) = '1' then
             dr_zon <= '0';
-         elsif zr(27 downto 24) = "0000" or zr(27 downto 24) = "0001" then
+         elsif zr(27 downto 24) = "0000" or zr(27 downto 24) = "0001"
+            or zr(27 downto 24) = "0010" or zr(27 downto 24) = "1010" then
             dr_zon <= '1';
          else
             dr_zon <= '0';
@@ -1133,9 +1167,17 @@ begin
                      -- after the colour would still produce the right picture
                      -- most of the time and the wrong one wherever FBMSK or the
                      -- blender touches a pixel that should not have survived.
-                     za   := pix_addr_page(dr_zbp, dr_fbw, dr_x, dr_y, '1');
+                     if dr_z16 = '1' then
+                        za   := pix_addr16_page(dr_zbp, dr_fbw, dr_x, dr_y,
+                                                dr_zs, '1');
+                        half := fb16_half(dr_x);
+                     else
+                        za   := pix_addr_page(dr_zbp, dr_fbw, dr_x, dr_y, '1');
+                        half := 0;
+                     end if;
                      lane := to_integer(za(2 downto 0));
                      dr_zaddr <= za;
+                     dr_zhalf <= half;
                      if dr_ztst = "00" then
                         null;                 -- NEVER: px_step retires it
                      elsif dr_ztst = "01" then
@@ -1144,10 +1186,19 @@ begin
                         if dr_zmsk = '0' then
                            wr_en   <= '1';
                            wr_addr <= std_logic_vector(za(19 downto 3));
-                           wr_data <= std_logic_vector(shift_left(
-                                         resize(unsigned(src_z), 256), 32 * lane));
-                           wr_be   <= std_logic_vector(shift_left(
-                                         resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
+                           if dr_z16 = '1' then
+                              wr_data <= std_logic_vector(shift_left(
+                                            resize(unsigned(src_zc(15 downto 0)), 256),
+                                            32 * lane + 16 * half));
+                              wr_be   <= std_logic_vector(shift_left(
+                                            resize(unsigned'("11"), 32),
+                                            4 * lane + 2 * half));
+                           else
+                              wr_data <= std_logic_vector(shift_left(
+                                            resize(unsigned(src_zc), 256), 32 * lane));
+                              wr_be   <= std_logic_vector(shift_left(
+                                            resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
+                           end if;
                         end if;
                      else
                         rd_en   <= '1';
@@ -1202,10 +1253,19 @@ begin
                            lane := to_integer(dr_zaddr(2 downto 0));
                            wr_en   <= '1';
                            wr_addr <= std_logic_vector(dr_zaddr(19 downto 3));
-                           wr_data <= std_logic_vector(shift_left(
-                                         resize(unsigned(src_z), 256), 32 * lane));
-                           wr_be   <= std_logic_vector(shift_left(
-                                         resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
+                           if dr_z16 = '1' then
+                              wr_data <= std_logic_vector(shift_left(
+                                            resize(unsigned(src_zc(15 downto 0)), 256),
+                                            32 * lane + 16 * dr_zhalf));
+                              wr_be   <= std_logic_vector(shift_left(
+                                            resize(unsigned'("11"), 32),
+                                            4 * lane + 2 * dr_zhalf));
+                           else
+                              wr_data <= std_logic_vector(shift_left(
+                                            resize(unsigned(src_zc), 256), 32 * lane));
+                              wr_be   <= std_logic_vector(shift_left(
+                                            resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
+                           end if;
                         end if;
                         state <= S_DRAW;
                      end if;

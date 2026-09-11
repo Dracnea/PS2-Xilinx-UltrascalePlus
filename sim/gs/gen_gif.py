@@ -42,7 +42,20 @@ AD_ADDRS = [0x00, 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0A,
             0x0B, 0x20, 0x55, 0x70]
 
 
-def depth_regs(rng):
+# Which Z formats may be used with which frame-buffer format.  The manual
+# (2.5.4) puts both into two groups and says a combination is legal only within
+# one group: PSMCT16 goes with PSMZ16, and everything else goes together.  A
+# generator that ignored this would spend some of its runs asking two models to
+# agree about a configuration the hardware does not define.
+ZGROUP = {
+    0:  [0, 0, 0, 1, 10],      # PSMCT32  -> PSMZ32, PSMZ24, PSMZ16S
+    1:  [0, 0, 0, 1, 10],      # PSMCT24  -> the same
+    10: [0, 0, 0, 1, 10],      # PSMCT16S -> the same
+    2:  [2],                   # PSMCT16  -> PSMZ16 only
+}
+
+
+def depth_regs(rng, fpsm=0):
     """ZBUF and TEST for one primitive, and whether depth is in play.
 
     The Z buffer is put on pages the drawing does not use about half the time
@@ -57,7 +70,7 @@ def depth_regs(rng):
     """
     ztst = rng.choice([0, 1, 2, 2, 3, 3])
     zmsk = rng.choice([0, 0, 0, 1])
-    zpsm = rng.choice([0, 0, 0, 1])              # PSMZ32, occasionally PSMZ24
+    zpsm = rng.choice(ZGROUP[fpsm])
     zbp  = rng.choice([0, 1, 2, 4, 4, 8])
     return (zbp | (zpsm << 24) | (zmsk << 32),
             (1 << 16) | (ztst << 17))
@@ -69,9 +82,14 @@ def zval(rng):
     Drawn from a small set of nearby values rather than uniformly over 32 bits,
     because a uniform Z makes GEQUAL and GREATER agree on essentially every
     pixel and the depth test then passes without ever being exercised.
+
+    The two wide draws matter for a different reason: a depth too wide for the
+    buffer format clamps rather than wraps, and the two are the same thing for
+    every value that fits.  Values above 24 and above 16 bits are the only ones
+    that can tell them apart, so both are generated.
     """
     return rng.choice([0x0000, 0x2000, 0x4000, 0x8000, 0xC000, 0xFFFF,
-                       rng.randrange(1 << 24)])
+                       rng.randrange(1 << 24), rng.randrange(1 << 32)])
 
 
 def fbpsm(rng):
@@ -128,8 +146,9 @@ def gen(rng, ntags):
             sc  = (rng.randrange(0, 8), rng.randrange(40, 64),
                    rng.randrange(0, 4), rng.randrange(20, 32))
             abe, alpha, clamp = blend_regs(rng)
-            zbuf, ztest = depth_regs(rng)
-            items = [(0x4C, fbp | (1 << 16) | (fbpsm(rng) << 24) | (msk << 32)),
+            fpsm = fbpsm(rng)
+            zbuf, ztest = depth_regs(rng, fpsm)
+            items = [(0x4C, fbp | (1 << 16) | (fpsm << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x40 + 1, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
@@ -167,8 +186,9 @@ def gen(rng, ntags):
             # touches the block step at all, so the widths below are chosen to
             # straddle a block boundary more often than not.
             iip = rng.choice([0, 0, 1, 1])
-            zbuf, ztest = depth_regs(rng)
-            items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (fbpsm(rng) << 24) | (msk << 32)),
+            fpsm = fbpsm(rng)
+            zbuf, ztest = depth_regs(rng, fpsm)
+            items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (fpsm << 24) | (msk << 32)),
                      (0x18, 0),
                      (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
                      (0x42, alpha), (0x46, clamp),

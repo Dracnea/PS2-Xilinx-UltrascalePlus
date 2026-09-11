@@ -402,16 +402,21 @@ class GS:
         if ztst == 1 and zmsk == 1:                 # ALWAYS + masked: no access
             return None
         zpsm = bits(zbuf, 27, 24)
-        if zpsm not in (0, 1):                      # PSMZ32 and PSMZ24 only
+        if zpsm not in (0, 1, 2, 10):   # PSMZ32, PSMZ24, PSMZ16, PSMZ16S
             return None
         return {"zbp":  bits(zbuf, 8, 0),
                 "fbw":  bits(self.reg[0x4C + ctx], 21, 16),
                 "ztst": ztst,
                 "zmsk": zmsk,
-                # PSMZ24 is 24 bits inside a 32-bit word, addressed exactly as
-                # PSMZ32 is; the top byte is not part of the value, so it is
-                # neither compared nor written.
-                "mask": 0x00FFFFFF if zpsm == 1 else 0xFFFFFFFF}
+                "bits":  16 if zpsm in (2, 10) else 32,
+                "sform": zpsm == 10,
+                # The widest value the format can hold.  It is both the field
+                # mask and the value an out-of-range depth **clamps** to -- see
+                # zcheck.  PSMZ24 is 24 bits inside a 32-bit word, addressed
+                # exactly as PSMZ32 is, and its top byte is neither compared nor
+                # written.
+                "zmax": {0: 0xFFFFFFFF, 1: 0x00FFFFFF,
+                         2: 0x0000FFFF, 10: 0x0000FFFF}[zpsm]}
 
     def fbsetup(self, c):
         """What the FRAME register says about the frame buffer, or None if this
@@ -490,19 +495,48 @@ class GS:
             return True
         if zs["ztst"] == 0:                         # NEVER: nothing survives
             return False
-        a = addr32p(zs["zbp"], zs["fbw"], x, y, BLK_Z)
+        if zs["bits"] == 32:
+            a, half = addr32p(zs["zbp"], zs["fbw"], x, y, BLK_Z), 0
+        else:
+            a, half = addr16p(zs["zbp"], zs["fbw"], x, y, zs["sform"], BLK_Z)
         if a >= VM_WORDS:
             return False
-        m = zs["mask"]
+        m = zs["zmax"]
+
+        # A depth wider than the buffer format **clamps**; it does not wrap.
+        # This model masked it until 2026-09-11, which is the same thing for
+        # every value that fits and the opposite for every value that does not:
+        # a Z of 0x01000000 against PSMZ24 compares as 0 after a mask and as
+        # 0xFFFFFF after a clamp, so a GREATER test flips from failing
+        # everything to passing everything.
+        #
+        # It could not be seen before because the generator's deepest vertex was
+        # 24 bits and the only narrow format was PSMZ24, so masking and clamping
+        # agreed on every value ever generated.  PSMZ16 makes it central rather
+        # than latent: nearly every Z a vertex carries exceeds 16 bits.
+        #
+        # > **NOTE (unverified):** clamping is taken from PCSX2, which does it
+        # > twice over -- `min_u32(z_max)` on the vertex and `zclamp` in the
+        # > scanline -- and gates the second on whether the primitive's maximum
+        # > Z exceeds the format, which is the shape of something modelled from
+        # > hardware rather than a convenience.  The GS User's Manual gives the
+        # > three Z formats (2.3.2) and never says what happens to a value too
+        # > wide for one.  *Verify by:* hw/ps2probe asks the console directly.
+        zc = m if z > m else z
+
         if zs["ztst"] == 1:                         # ALWAYS: no read needed
             ok = True
         else:
-            old = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little") & m
-            ok = (z & m) >= old if zs["ztst"] == 2 else (z & m) > old
+            word = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
+            old = (word >> (16 * half)) & m if zs["bits"] == 16 else word & m
+            ok = zc >= old if zs["ztst"] == 2 else zc > old
         if ok and zs["zmsk"] == 0:
-            prev = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
-            v = (prev & ~m & 0xFFFFFFFF) | (z & m)
-            self.vm[a * 4:a * 4 + 4] = v.to_bytes(4, "little")
+            word = int.from_bytes(self.vm[a * 4:a * 4 + 4], "little")
+            if zs["bits"] == 16:
+                word = (word & ~(0xFFFF << (16 * half))) | (zc << (16 * half))
+            else:
+                word = (word & ~m & 0xFFFFFFFF) | zc
+            self.vm[a * 4:a * 4 + 4] = word.to_bytes(4, "little")
         return ok
 
     # -- primitives ---------------------------------------------------------
