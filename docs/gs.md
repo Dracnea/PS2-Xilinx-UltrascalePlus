@@ -1121,6 +1121,19 @@ register file, the pixel count and local memory against `sim/gs/gs_ref.py`.
 > *Verify by:* loading it and running `tools/gs/gsrun.py` with a stream the
 > simulation already agrees on, starting with one sprite.
 
+`tools/gs/gen_firstlight.py` is that stream: an 8 x 4 opaque rectangle at the
+origin in PSMCT32, no blending, no depth, no clipping, one colour. Thirty-two
+pixels of `0x80406020`, and **both simulation harnesses agree on it** — the
+ordinary differential and the one that runs against the real `gs_lmem`, which is
+what the card has. So a disagreement on the card is the board target's fault and
+not the rasteriser's, which is the only useful property for a first run.
+
+It is also its own small argument for having a first-light stream at all: the
+first version drew *nothing*, because the two vertices were sent as bare
+quadwords rather than through A+D with XYZ2's address, and writing XYZ2 is what
+kicks a primitive. That would have looked on the card exactly like a GIF that
+never accepted a packet.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture — and step 5, PCRTC.
