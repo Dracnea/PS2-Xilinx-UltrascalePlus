@@ -212,6 +212,24 @@ architecture arch of gs_gif is
    -- Gouraud triangle is being walked, the latched flat colour otherwise
    signal src_rgba : std_logic_vector(31 downto 0);
 
+   -- The interpolated colour and depth, captured when the read that will
+   -- consume them is issued.
+   --
+   -- The first fit of the whole GS closed at 110.8 MHz against the console's
+   -- 147.456, and the critical path was the entire per-pixel colour path
+   -- standing as one combinational chain: the Gouraud interpolator's lane
+   -- accumulate (3.0 ns), into the blender (a further 5.4), into the format
+   -- pack and the write mask, arriving at wr_data 9.07 ns after a register in
+   -- gs_chan_dda.  Thirty-seven logic levels with fifteen carry chains.
+   --
+   -- Cutting it between the interpolator and the blender is free, because the
+   -- interpolator is already standing still there: px_step is not asserted on
+   -- the edge that moves S_DRAW to S_DRAWRD, so c_adv is low and the DDA holds
+   -- its value across both cycles.  The blender was reading a value that had
+   -- not changed since the cycle before; it now reads it from a register.
+   signal dr_src  : std_logic_vector(31 downto 0) := (others => '0');
+   signal dr_srcz : std_logic_vector(31 downto 0) := (others => '0');
+
    -- pixels waiting to be written, one per clock
    signal px_data  : std_logic_vector(127 downto 0) := (others => '0');
    signal px_n     : unsigned(2 downto 0) := (others => '0');
@@ -464,9 +482,9 @@ begin
    src_zc <= dr_zmask when unsigned(src_z) > unsigned(dr_zmask) else src_z;
 
    z_pass <= '1' when dr_ztst = "10"
-                      and unsigned(src_zc) >= unsigned(z_old and dr_zmask)
+                      and unsigned(dr_srcz) >= unsigned(z_old and dr_zmask)
              else '1' when dr_ztst = "11"
-                      and unsigned(src_zc) >  unsigned(z_old and dr_zmask)
+                      and unsigned(dr_srcz) >  unsigned(z_old and dr_zmask)
              else '0';
 
    -- The one decision that a pixel is over.  Three ways out: the fast colour
@@ -1203,6 +1221,7 @@ begin
                      else
                         rd_en   <= '1';
                         rd_addr <= std_logic_vector(za(19 downto 3));
+                        dr_srcz <= src_zc;
                         state   <= S_ZRD;
                      end if;
                   else
@@ -1241,6 +1260,7 @@ begin
                         rd_addr <= std_logic_vector(wa(19 downto 3));
                         dr_addr <= wa;
                         dr_half <= half;
+                        dr_src  <= src_rgba;
                         state   <= S_DRAWRD;
                      end if;
                   end if;
@@ -1255,14 +1275,14 @@ begin
                            wr_addr <= std_logic_vector(dr_zaddr(19 downto 3));
                            if dr_z16 = '1' then
                               wr_data <= std_logic_vector(shift_left(
-                                            resize(unsigned(src_zc(15 downto 0)), 256),
+                                            resize(unsigned(dr_srcz(15 downto 0)), 256),
                                             32 * lane + 16 * dr_zhalf));
                               wr_be   <= std_logic_vector(shift_left(
                                             resize(unsigned'("11"), 32),
                                             4 * lane + 2 * dr_zhalf));
                            else
                               wr_data <= std_logic_vector(shift_left(
-                                            resize(unsigned(src_zc), 256), 32 * lane));
+                                            resize(unsigned(dr_srcz), 256), 32 * lane));
                               wr_be   <= std_logic_vector(shift_left(
                                             resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
                            end if;
@@ -1291,9 +1311,9 @@ begin
                      -- destination is read to preserve the masked bits and the
                      -- source must go through untouched.
                      if dr_abe = '1' then
-                        blended := blend_px(src_rgba, oldpx, dr_alpha, dr_fix, dr_clamp);
+                        blended := blend_px(dr_src, oldpx, dr_alpha, dr_fix, dr_clamp);
                      else
-                        blended := src_rgba;
+                        blended := dr_src;
                      end if;
                      wr_en   <= '1';
                      wr_addr <= std_logic_vector(dr_addr(19 downto 3));

@@ -981,12 +981,35 @@ combinational chain — the Gouraud interpolator's lane value, into the blender,
 into the format pack, into the word being written. Nothing between the
 interpolator and memory is registered.
 
-So the GS has the same shape of problem the EE core had and the same kind of
-answer available: the pixel path wants a pipeline stage, most obviously between
-the interpolator and the blender. That is a bigger change than it sounds,
-because the rasteriser's state machine currently assumes a pixel is finished in
-the cycle it is decided — but it is the thing standing between this and the
-console's own clock.
+So the GS has the same shape of problem the EE core had, and the pixel path
+wants a pipeline stage between the interpolator and the blender.
+
+### The cut is free, and worth less than it looks — 2026-09-11
+
+It is free because the interpolator is already standing still there. `px_step`
+is not asserted on the edge that moves `S_DRAW` to `S_DRAWRD`, so `c_adv` is low
+and the DDA holds its value across both cycles: the blender was reading a value
+that had not changed since the cycle before, and now reads it from a register.
+The same applies to the depth the comparison uses. Twenty-one of twenty-one
+runs pass unchanged, and eleven of eleven against the real memory.
+
+**110.8 → 117.3 MHz.** That is 6.5 MHz, not the sixty the path arithmetic
+suggested, and the reason is visible in where the path went rather than in what
+it became. The old path is gone entirely; the new one is
+`gif/t_x_reg → gif/chans[3].u/dv_n_reg`, twenty-two levels with eight carry
+chains **and six DSP stages** — the triangle setup, where the interpolation
+gradients are divided out before a single pixel is drawn.
+
+The lesson is one about method rather than about the GS. Cutting the longest
+path is only worth what the *second* longest path allows, and nothing in the
+first measurement said how close behind it was. Two long paths in different
+parts of the design, one per-pixel and one per-triangle, and fixing the first
+buys the difference between them and no more.
+
+The setup divider is the next target, and it is a different kind of problem: it
+is arithmetic that genuinely takes a long time, so it wants more cycles rather
+than a register in the middle. It already runs once per triangle rather than
+once per pixel, which is what makes spending cycles there affordable.
 
 ## What is not started
 

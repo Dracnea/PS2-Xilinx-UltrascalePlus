@@ -1179,6 +1179,68 @@ store alignment networks taught earlier in the day, and it did not transfer on
 its own: *make the shifter the width of the answer, not the width of the
 operand.*
 
+## The core wired to its own main memory — 2026-09-11
+
+`ee_core` and `ee_ram` had never been connected. Each was verified against a
+model of the other: `sim/ee/tb_ee_core.sv` gives the core a flat memory with a
+settable latency, and `sim/mem/tb_mem.sv` gives the cache a behavioural HBM and
+no processor. `rtl/ee/ee_top.vhd` is the seam, and it is not just wiring —
+there are three differences to reconcile, and two of them bit.
+
+**Two masters, one port.** `ee_ram` serves one 128-bit access at a time and the
+core has two ports. Data wins: a load is holding up an instruction that is
+already half executed, while a fetch is speculative and has a queue to wait in.
+
+**Three fetches in flight, answered one at a time.** `i_read` is a single-cycle
+pulse and the core allows three outstanding, replies required in order, so the
+addresses queue in `ee_top` and are served in turn.
+
+**A held strobe against a pulsed request**, which is where both bugs were. The
+core raises `d_read` and holds it until `d_ready`; `ee_ram` latches its request
+in `IDLE` on the first cycle `req` is high and therefore wants a pulse. Holding
+`req` until `ack` makes `ee_ram` see it still high when it returns to `IDLE` and
+run the same access twice. `sim/mem/tb_mem.sv` drives it as a pulse and does not
+say why; this is why.
+
+### Two deadlocks, and what they looked like
+
+Neither was subtle once found and both looked like something else first.
+
+The first attempt guarded against re-issuing the core's held strobe by waiting
+for it to fall before accepting anything. That **deadlocks**: the core clears
+`d_read` from a stage that needs an instruction to advance, so an arbiter which
+refuses to fetch until `d_read` falls, when `d_read` cannot fall until a fetch
+arrives, stops dead.
+
+The second attempt used a flag cleared when the strobe fell, which survived
+sixty instructions and deadlocked at a hundred and ten. On **back-to-back
+loads** the core clears `d_read` and raises it again for the next access in the
+same clocked process, so the later assignment wins and `d_read` is never
+observed low at all. A flag waiting for a falling edge that never comes waits
+forever. What works is a one-cycle hold: the core cannot signal a new request
+until the cycle after it sees `d_ready`, because `d_read` is registered.
+
+> A third suspicion cost time and was wrong. A directed test of `ee_ram`'s
+> half-selection appeared to show it returning the half belonging to the
+> *previous* request — a clean off-by-one, in somebody else's module. It was the
+> test: it held `req` until `ack` and so issued every access twice. `ee_ram` is
+> correct. Checking the harness before believing a result about the module under
+> it would have saved the detour.
+
+### What it costs to run on a real memory
+
+`sim/ee/run_top_diff.sh` runs any program the ordinary differential takes, with
+the core fetching and loading through the cache and a behavioural HBM. **15 of
+15 pass** — the directed generators and eight random programs.
+
+CPI is the number worth carrying forward. The core measures **1.78** against a
+flat memory that answers in one cycle, and **9.4 to 10.5** here on a cold cache
+with an eight-cycle AXI latency. A hundred-and-fifty-instruction program takes
+about 1500 cycles and misses thirty times. That is not a defect — it is what a
+cold cache in front of HBM costs, and it is the first honest look at the number,
+since every CPI quoted on this page until now assumed memory that was always
+ready.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
