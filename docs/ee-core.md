@@ -968,16 +968,6 @@ The encodings are cross-checked against PCSX2's `tbl_MMI0` and `tbl_MMI1`, and
 the saturating and absolute-value corners against its `MMI.cpp` — `|0x80000000|`
 is `0x7FFFFFFF`, not itself.
 
-## What is not started
-
-Hazards and pipelining — the core is still one instruction at a time. The FPU
-and the VUs. The integer subset is not complete: no TLB. MMI is the parallel
-ALU above plus the six logical and copy forms (`PAND`, `PXOR`, `PCPYLD`, `POR`,
-`PNOR`, `PCPYUD`); **the pack, extend and shuffle group is not started** —
-`PEXTL*`, `PEXTU*`, `PPAC*`, `PEXT5`, `PPAC5`, `QFSRV` and `PADSBH`. The
-unaligned group — `LWL`, `LWR`, `SWL`, `SWR`, `LDL`, `LDR`, `SDL`, `SDR` — is
-done, and so are `LQ` and `SQ`.
-
 ### Where the clock went, and how much of that first answer was noise — 2026-09-11
 
 The quadword port measured 283.5 → 253.2 MHz and the first note here attributed
@@ -1025,7 +1015,36 @@ What the means say:
 loss of 60 MHz, and +6026 LUTs — 57 % on top of the whole core. That is the real
 clock problem on this page now, and it dwarfs everything the memory port did.
 
-### The obvious fix for it is worse — measured, 2026-09-11
+### The third shape is the right one — 2026-09-11
+
+Two shapes had been measured for MMI's parallel ALU and neither was good: thirty
+specialised lane arrays (212.3 MHz, 16597 LUTs) and one adder whose carry breaks
+were chosen at run time (176.3 MHz, 13341 LUTs). The third takes the useful half
+of each.
+
+**Break the carry at elaboration, share the adder across operations.** Each lane
+width gets its own static loop, so a lane is one ordinary fixed-width addition
+and maps to a clean carry chain — there is simply no carry wire between lanes to
+multiplex. Within a width, every operation shares that one adder: `neg` selects
+add or subtract, and the saturating, comparing and min/max forms are all
+selection on its sum, its carry out and three sign bits.
+
+| shape | Fmax (3 directives) | LUTs |
+|---|---|---|
+| thirty specialised arrays | 208.6 / 207.9 / 220.3 → **212.3** | 16597 |
+| one adder, run-time breaks | 177.2 / 173.8 / 177.8 → **176.3** | 13341 |
+| **per-width adders, elaboration-time breaks** | 209.5 / 212.1 / 220.6 → **214.1** | **13916** |
+
+Marginally *better* than the thirty arrays on the clock — 214.1 against 212.3,
+which is inside the noise and so is fairly read as "the same" — and **2681 LUTs
+cheaper**, 16 % of the MMI block. That is most of what the run-time version
+saved, without any of its 36 MHz.
+
+The lesson is narrow and worth keeping. *Sharing* was never the problem, and
+neither was the multiplexer at the end that picks a width. What a carry chain
+cannot tolerate is a multiplexer **inside** it.
+
+### The second shape, and why it failed — measured, 2026-09-11
 
 Thirty decode arms each calling a generic function with literal arguments means
 synthesis specialises each call, so the core carried thirty independent lane
@@ -1066,111 +1085,125 @@ synthesises**, and nothing in this project's flow had said so before.
 Timing therefore stands at **212.3 MHz** mean against a 294.912 MHz target, a
 factor of 1.39 — the worst it has been, and MMI is why.
 
-## MMI's parallel ALU — 2026-09-11
+## The pack, extend and shuffle group, and the SA register — 2026-09-11
 
-MMI0 (function `0x08`) and MMI1 (`0x28`) are the SIMD arithmetic: the same
-handful of operations over 4 × 32, 8 × 16 or 16 × 8 lanes, in wrapping,
-signed-saturating and unsigned-saturating forms. Thirty instructions —
-`PADDW`/`H`/`B`, `PSUB*`, `PCGT*`, `PCEQ*`, `PMAX*`, `PMIN*`, the `PADDS*` and
-`PSUBS*` signed-saturating forms, the `PADDU*` and `PSUBU*` unsigned ones, and
-`PABSW`/`PABSH`.
+The rest of MMI0 and MMI1: `PEXTL`/`PEXTU`/`PPAC` at three widths, `PEXT5`,
+`PPAC5`, `PADSBH` and `QFSRV`. These move lanes about rather than computing
+anything, so they share nothing with the adder and are wires and multiplexers.
 
-They are written **once** and instantiated at three widths, in both models.
-That is not tidiness: a saturation bound that is right for halfwords and wrong
-for bytes is precisely the fault that survives a test suite, and here the bound
-is built from the lane's own width rather than written out three times. In the
-RTL, `par_lane` derives `SMAX` and `SMIN` from `a'length`, and `par128` wraps it
-in three static loops with the width chosen by a literal at each decode arm.
+Three families, each one rule at three widths. `PEXTL` interleaves the *low*
+half of `rt` and `rs` with `rt` supplying the even lanes; `PEXTU` does the same
+from the upper half; `PPAC` keeps every other lane, `rt`'s into the low half and
+`rs`'s into the upper. `PPAC` is the truncating partner of `PEXT` — taking every
+other lane of a 2W-bit value keeps the low W bits of each of its lanes — which
+is why the two are encoded adjacently.
 
-**A decode bug this uncovered.** The RTL's MMI arm read `if fn = 0x09 then MMI2
-else MMI3`, so functions `0x08` and `0x28` — MMI0 and MMI1 — fell through and
-were decoded as `POR`, `PNOR` or `PCPYUD`. Nothing noticed, because nothing
-emitted them: the same blind spot that hid MMI2 and MMI3 themselves until the
-generator's dead arms were found earlier the same day.
+`PEXT5` spreads an RGBA5551 word to a byte per channel, five bits shifted up by
+three with zeros below and never replicated. That is the **same expansion the
+Graphics Synthesizer applies to a 16-bit frame buffer**, arrived at
+independently on the other track the same day, minus the `0x80` that only a
+pixel read wants; `PPAC5` is its truncating inverse and keeps exactly the bits
+`pack16` keeps. `PADSBH` is the one instruction whose halves differ: the low
+four halfwords subtract and the upper four add.
 
-### The random programs are very weak here — measured
+### QFSRV brings architectural state with it
 
-`gen_prog.py` now emits MMI0 and MMI1 at about 7 % of instructions. That is
-enough to execute them and not nearly enough to check them. Mutating the RTL and
-re-running three seeds:
+`QFSRV` shifts `{rs, rt}` right by **SA bytes** and keeps the low 128 bits,
+which makes it the instruction for realigning a quadword that straddles a
+boundary — and is why its shift amount lives in a register rather than in the
+instruction word. So the shift-amount register comes with it, and its four
+writers: `MTSA` (SPECIAL `0x29`), `MFSA` (SPECIAL `0x28`), and `MTSAB` and
+`MTSAH`, which are the two members of REGIMM that neither branch nor link
+(`rt` = 24 and 25).
 
-| mutation | random seeds | `gen_mmi.py` |
+`MTSAB` and `MTSAH` **exclusive-or** their operand with the immediate rather
+than replacing it, which lets a byte offset be flipped without a
+read-modify-write. That is not a transcription slip, and it is the one detail
+here a test can miss silently — see below.
+
+SA is four bits in both models: it names a byte within a quadword and nothing
+else, and `MTSAB` and `MTSAH` already mask to that much. `MTSA` takes a whole
+register on hardware and this model keeps its low four bits, which is the single
+place here that goes beyond PCSX2 — it stores the full 32 bits and would
+disagree after an `MTSA` of something larger. The generators never emit one, so
+the two are not compared on it. SA is now printed in the differential trace
+beside HI and LO, because a register that only `QFSRV` reads and only three
+instructions write is otherwise nearly invisible.
+
+### What the directed test had to be taught
+
+Ten mutations were aimed at this group. Eight were caught at the first attempt;
+two were not, and both for reasons worth recording.
+
+* **The corner operands are wrong for permutations.** The arithmetic half of
+  `gen_mmi.py` uses `0x7F`, `0x80`, `0xFF`, `0x01` repeated sixteen times, which
+  is exactly right for saturation and useless for a shuffle: repeating the same
+  byte hides any reordering completely. The shuffle half needs every byte
+  distinct and now has its own operand pairs. This is the same trap that made
+  the Graphics Synthesizer's first directed test prove nothing, in a different
+  costume.
+* **`MTSAB` with a zero operand cannot tell exclusive-or from addition.** The
+  first version of the QFSRV sweep set SA from `r0`, and `0 xor imm` and
+  `0 + imm` are the same for every immediate — so a mutation replacing the
+  exclusive-or with an addition passed. The sweep now runs from four non-zero
+  bases, and `MTSAH` and `MTSA` get their own sweeps rather than being assumed
+  to follow `MTSAB`.
+
+All ten are caught now: both operand orders of `PEXTL`, `PEXTU` reading the
+wrong half, `PPAC` keeping the wrong lanes, `PEXT5` replicating, `PPAC5` taking
+the wrong bits, `PADSBH` adding where it should subtract, `QFSRV` indexing bits
+instead of bytes or concatenating its operands the wrong way round, `MTSAH`
+forgetting its shift, and `MTSAB` adding instead of exclusive-oring.
+
+### QFSRV's shifter, written twice — 2026-09-11
+
+The whole group first cost **37 MHz**: 214.1 for the core without it against
+177 with it, for only 1812 LUTs. That is a critical path, not an area problem,
+and it was worth finding out which instruction owned it.
+
+| variant | Fmax (Default) | LUTs |
 |---|---|---|
-| `PMAX` and `PMIN` swapped | 1 of 3 | caught |
-| `PCGT` compares unsigned | 1 of 3 | caught |
-| `PSUBU` wraps instead of clamping at zero | **0 of 3** | caught |
-| `PABS` does not saturate the most negative value | **0 of 3** | caught |
-| `PADDU` does not saturate | 1 of 3 | caught |
-| `PADDSB` built at 16-bit lanes instead of 8 | **0 of 3** | caught |
-| signed saturation bound off by one | **0 of 3** | caught |
+| the group, `QFSRV` as `shift_right` on 256 bits | 174.6 | 15728 |
+| the group with `QFSRV` deleted outright | 186.2 | 14291 |
+| the group, `QFSRV` as sixteen byte multiplexers | **195.1** | — |
 
-Four of seven are never caught. The reason is plain once stated: a random
-register holds a value that happens to compare one way, and **saturation needs
-operands that actually overflow their lane**, which random values built from
-`addiu` and `lui` rarely do.
+`QFSRV` written as `shift_right(unsigned(rs & rt), 8 * SA)` builds a barrel
+shifter sized for its 256-bit operand. Written as sixteen byte-wide selections
+out of that same 256-bit value — which is the same function — it builds what the
+instruction actually needs: sixteen 16-to-1 multiplexers, one per output byte.
 
-`sim/ee/gen_mmi.py` builds its operands from the corners and nothing else —
-`0x7F`, `0x80`, `0xFF`, `0x01` as bytes, which read as `0x7F7F`/`0x8080`-shaped
-halfwords and `0x7F80FF01`-shaped words, so one pair of registers puts every
-width against its own maximum, its own minimum, minus one and one. Saturation
-becomes the normal case rather than a rare one. Every defined sub-opcode of both
-tables is emitted against every operand pair and in both operand orders, since
-subtraction and the compares are not symmetric. All seven mutations are caught.
-
-The encodings are cross-checked against PCSX2's `tbl_MMI0` and `tbl_MMI1`, and
-the saturating and absolute-value corners against its `MMI.cpp` — `|0x80000000|`
-is `0x7FFFFFFF`, not itself.
+The second form is worth **20 MHz, more than deleting the instruction was**, and
+that last part is the surprising bit: the expensive thing was never QFSRV's
+presence, it was the shape the shifter was written in. Same lesson the load and
+store alignment networks taught earlier in the day, and it did not transfer on
+its own: *make the shifter the width of the answer, not the width of the
+operand.*
 
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
-and the VUs. The integer subset is not complete: no TLB. MMI is the parallel
-ALU above plus the six logical and copy forms (`PAND`, `PXOR`, `PCPYLD`, `POR`,
-`PNOR`, `PCPYUD`); **the pack, extend and shuffle group is not started** —
-`PEXTL*`, `PEXTU*`, `PPAC*`, `PEXT5`, `PPAC5`, `QFSRV` and `PADSBH`. The
+and the VUs. The integer subset is not complete: no TLB. **MMI0 and MMI1 are
+complete.** What remains of MMI is the rest of MMI2 and MMI3 — the
+multiply-accumulate forms (`PMADD*`, `PMSUB*`, `PHMADH`), `PMULTW`/`PDIVW`, the
+shifts and rotates (`PSLLVW`, `PSRLVW`, `PSRAVW`, `PROT3W`), and the remaining
+interleaves (`PINTH`, `PCPYH`, `PEXEH`, `PEXEW`, `PREVH`, `PMFHI`, `PMFLO`) —
+of which only `PAND`, `PXOR`, `PCPYLD`, `POR`, `PNOR` and `PCPYUD` exist. The
 unaligned group — `LWL`, `LWR`, `SWL`, `SWR`, `LDL`, `LDR`, `SDL`, `SDR` — is
 done, and so are `LQ` and `SQ`.
 
-### Where the 30 MHz went — four fits, 2026-09-11
+Timing, three placement directives per variant, against a 294.912 MHz target:
 
-The quadword port cost 283.5 → 253.2 MHz and the first note here guessed at the
-reason from the timing report. The guess was wrong in its first clause and the
-experiment was cheap, so here are four fits of the same core, same part
-(`xcu55n-fsvh2892-2LV-e`), same 3.39 ns constraint, out of context:
-
-| variant | Fmax | LUTs |
+| core | Fmax mean | LUTs |
 |---|---|---|
-| **base** — the core before this change, 64-bit port | **283.5 MHz** | 10558 |
-| **head** — 128-bit port, `LQ`/`SQ`, 128-bit alignment networks | **253.2 MHz** | 10619 |
-| **noquad** — 128-bit port, alignment networks wide, `LQ`/`SQ` decode removed | **250.8 MHz** | — |
-| **narrow** — 128-bit port, `LQ`/`SQ`, alignment networks kept 64-bit | **271.7 MHz** | 10571 |
+| before MMI0/MMI1 | 272.7 | 10571 |
+| + the parallel ALU, per-width adders | 214.1 | 13916 |
+| **+ the pack, extend and shuffle group** | **192.7** | 15612 |
 
-`base` reproduces the recorded 283.5 MHz exactly, which is what makes the other
-three comparable.
-
-**`LQ` and `SQ` are not the cost.** Removing their decode entirely, with the
-port left at 128 bits, gives 250.8 MHz — no better than keeping them, and
-slightly worse, which is the size of the run-to-run noise here. The instruction
-pair is free; the port is what was paid for.
-
-**The alignment networks were most of it.** Writing the store shift as one
-128-bit shift by `ea(3 downto 0)` builds a sixteen-position barrel shifter twice
-as wide as the old one — about four times the multiplexer — and the load return
-path did the same in reverse. Neither needed to: every access narrower than a
-quadword is naturally aligned and therefore lies inside one half, so the shift
-can stay 64 bits wide with eight positions and address bit 3 can pick the half
-afterwards. That recovers **18.5 MHz of the 30**, and it is now what the core
-does.
-
-**It is not an area story**, which is the part worth keeping. The three variants
-are within 61 LUTs of each other — 0.6 % — so nothing was competing for space.
-What changed was the depth of a multiplexer on a path that mattered, and the
-placement around it: `head`'s worst path was 64 % routing.
-
-Timing is measured above, three placement directives per variant: **212.3 MHz**
-mean against a 294.912 MHz target. MMI's parallel ALU is 60 MHz of that and is
-the thing to attack next; the memory port costs about 6 MHz once its alignment
-networks are kept narrow.
+So MMI has cost 80 MHz and half as many LUTs again as the rest of the core put
+together, and it is where the clock now goes. The memory port costs about 6 MHz
+by comparison. Both remaining items are known: the parallel ALU's saturating
+forms sit in the same single-cycle path as the scalar ALU and could move into
+A2, and the shuffle group's multiplexers are all in the result mux.
 
 IPC is better but not closed: CPI 1.78 on ordinary code, 2.15 on branch-heavy.
 What is left is multiply/divide latency (inherent), one stall per memory access,

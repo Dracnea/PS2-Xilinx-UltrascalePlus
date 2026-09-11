@@ -101,6 +101,8 @@ entity ee_core is
       dbg_hi     : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_lo     : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_hi1    : out std_logic_vector(63 downto 0) := (others => '0');
+      -- the shift-amount register, four bits: a byte offset in a quadword
+      dbg_sa     : out std_logic_vector(3 downto 0) := (others => '0');
       dbg_lo1    : out std_logic_vector(63 downto 0) := (others => '0');
       dbg_traps  : out unsigned(15 downto 0) := (others => '0');
       -- why no instruction entered A1 on this edge, so that cycles lost to the
@@ -122,6 +124,13 @@ architecture arch of ee_core is
    -- why the decode below reuses the same arms rather than duplicating them --
    -- duplicated arms are how the second pair would quietly drift from the first.
    signal hi1, lo1 : std_logic_vector(63 downto 0) := (others => '0');
+
+   -- The shift-amount register.  Four bits, because it names a byte within a
+   -- quadword and nothing else: QFSRV is its only reader, and MTSAB and MTSAH
+   -- already mask their operands to that much.  It is architectural state, so
+   -- it is written in WB with everything else and forwarded like HI and LO --
+   -- an MTSAB immediately before a QFSRV is the way the pair is actually used.
+   signal sa_reg : std_logic_vector(3 downto 0) := (others => '0');
 
    -- COP0, the system control coprocessor: 32 registers of 32 bits.  This slice
    -- is the register file and MFC0/MTC0 only.  Count is deliberately not
@@ -237,6 +246,8 @@ architecture arch of ee_core is
    signal m_c0_idx  : integer range 0 to 31 := 0;
    signal m_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
    signal m_hi_we   : std_logic := '0';
+   signal m_sa_we   : std_logic := '0';
+   signal m_sa      : std_logic_vector(3 downto 0) := (others => '0');
    signal m_lo_we   : std_logic := '0';
    signal m_hi      : std_logic_vector(63 downto 0) := (others => '0');
    signal m_lo      : std_logic_vector(63 downto 0) := (others => '0');
@@ -282,6 +293,8 @@ architecture arch of ee_core is
    signal w_c0_idx  : integer range 0 to 31 := 0;
    signal w_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
    signal w_hi_we   : std_logic := '0';
+   signal w_sa_we   : std_logic := '0';
+   signal w_sa      : std_logic_vector(3 downto 0) := (others => '0');
    signal w_lo_we   : std_logic := '0';
    signal w_hi      : std_logic_vector(63 downto 0) := (others => '0');
    signal w_lo      : std_logic_vector(63 downto 0) := (others => '0');
@@ -317,89 +330,260 @@ architecture arch of ee_core is
    -- only costs a stall, so anything unrecognised is assumed to read both.
    -- ---- MMI's parallel ALU ------------------------------------------------
    -- MMI0 (function 0x08) and MMI1 (0x28) are the same handful of operations
-   -- over 4 x 32, 8 x 16 or 16 x 8 lanes of a 128-bit register, in wrapping,
-   -- signed-saturating and unsigned-saturating forms.
+   -- over 4 x 32, 8 x 16 or 16 x 8 lanes, in wrapping, signed-saturating and
+   -- unsigned-saturating forms.
    --
-   -- One lane function, instantiated at three widths, rather than thirty
-   -- separate units: a saturation bound that is right for halfwords and wrong
-   -- for bytes is exactly the fault that survives a test suite, and here the
-   -- bound is built from the operand's own width instead of written out three
-   -- times.  The width multiplexer at the end costs three copies of the lane
-   -- array; sharing one adder across the widths with carry breaks is the
-   -- smaller structure and is left until this is known to be right.
+   -- **One adder per width, with the lane boundaries fixed at elaboration.**
+   -- Two earlier shapes are worth knowing about because both were measured:
+   --
+   --   * thirty separate lane arrays, one per (operation, width) pair, because
+   --     every decode arm called a generic function with literal arguments and
+   --     synthesis specialised each call.  212.3 MHz, 16597 LUTs.
+   --   * one adder shared across all three widths, with its carry broken at
+   --     whichever boundary the width selected *at run time*.  Smaller, and 36
+   --     MHz slower: a run-time break puts a multiplexer between every pair of
+   --     bytes, which is what a fast carry chain cannot tolerate.
+   --
+   -- This is the third shape and the point of it: the break is chosen when the
+   -- design elaborates, so each lane is one ordinary fixed-width addition and
+   -- maps to a clean carry chain -- while every *operation* at that width still
+   -- shares the one adder, which is where the area went.
    type par_op_t is (P_ADD, P_SUB, P_CGT, P_CEQ, P_MAX, P_MIN,
                      P_ADDS, P_SUBS, P_ADDU, P_SUBU, P_ABS);
 
-   function par_lane(op : par_op_t; a, b : unsigned) return unsigned is
+   -- One lane's result, from the operands, that lane's sum, and its carry out.
+   -- Bounds come from the lane's own width so that one cannot be right at 16
+   -- bits and wrong at 8.
+   function par_out(op : par_op_t; a, b, sum : std_logic_vector;
+                    cout : std_logic) return std_logic_vector is
       constant W    : natural := a'length;
       constant ONES : unsigned(W-1 downto 0) := (others => '1');
-      -- the widest and most negative values this lane can hold, built from the
-      -- lane's own width so that one bound cannot be right at 16 bits and wrong
-      -- at 8
-      constant SMAX : signed(W-1 downto 0) := signed(shift_right(ONES, 1));
-      constant SMIN : signed(W-1 downto 0) := signed(not shift_right(ONES, 1));
-      variable sx   : signed(W+1 downto 0) := resize(signed(a), W+2);
-      variable sy   : signed(W+1 downto 0) := resize(signed(b), W+2);
-      variable ux   : unsigned(W downto 0) := resize(a, W+1);
-      variable uy   : unsigned(W downto 0) := resize(b, W+1);
-      variable ss   : signed(W+1 downto 0);
-      variable uu   : unsigned(W downto 0);
+      constant SMAX : std_logic_vector(W-1 downto 0)
+                    := std_logic_vector(shift_right(ONES, 1));
+      constant SMIN : std_logic_vector(W-1 downto 0)
+                    := std_logic_vector(not shift_right(ONES, 1));
+      constant ZERO : std_logic_vector(W-1 downto 0) := (others => '0');
+      constant FULL : std_logic_vector(W-1 downto 0) := (others => '1');
+      variable asb, bsb, rsb : std_logic;
+      variable ovf, lt, eq   : std_logic;
    begin
+      asb := a(a'left); bsb := b(b'left); rsb := sum(sum'left);
+      if a = b then eq := '1'; else eq := '0'; end if;
+      -- Signed overflow: for a + b the operands must agree in sign and the
+      -- result disagree; for a - b they must differ and the result disagree
+      -- with a.  Three sign bits, no extra arithmetic.
       case op is
-         when P_ADD => return a + b;
-         when P_SUB => return a - b;
-         when P_CGT =>
-            if signed(a) > signed(b) then return (a'range => '1');
-            else return (a'range => '0'); end if;
-         when P_CEQ =>
-            if a = b then return (a'range => '1');
-            else return (a'range => '0'); end if;
-         when P_MAX =>
-            if signed(a) > signed(b) then return a; else return b; end if;
-         when P_MIN =>
-            if signed(a) < signed(b) then return a; else return b; end if;
+         when P_ADD | P_ADDS | P_ADDU =>
+            ovf := (asb xnor bsb) and (rsb xor asb);
+         when others =>
+            ovf := (asb xor bsb) and (rsb xor asb);
+      end case;
+      lt := rsb xor ovf;                      -- signed a < b, from the subtract
+
+      case op is
+         when P_ADD | P_SUB => return sum;
          when P_ADDS | P_SUBS =>
-            if op = P_ADDS then ss := sx + sy; else ss := sx - sy; end if;
-            if ss > resize(SMAX, W+2) then return unsigned(SMAX);
-            elsif ss < resize(SMIN, W+2) then return unsigned(SMIN);
-            else return unsigned(ss(W-1 downto 0)); end if;
+            -- The saturated value depends only on a's sign: two positives
+            -- overflowing add upward, and a positive minus a negative does too.
+            if ovf = '1' then
+               if asb = '0' then return SMAX; else return SMIN; end if;
+            end if;
+            return sum;
          when P_ADDU =>
-            uu := ux + uy;
-            if uu(W) = '1' then return (a'range => '1');
-            else return uu(W-1 downto 0); end if;
+            if cout = '1' then return FULL; else return sum; end if;
          when P_SUBU =>
-            if a < b then return (a'range => '0'); else return a - b; end if;
+            -- a + not b + 1 carries out when a >= b, so no carry is a borrow.
+            if cout = '0' then return ZERO; else return sum; end if;
+         when P_CEQ =>
+            if eq = '1' then return FULL; else return ZERO; end if;
+         when P_CGT =>
+            if lt = '0' and eq = '0' then return FULL; else return ZERO; end if;
+         when P_MAX =>
+            if lt = '1' then return b; else return a; end if;
+         when P_MIN =>
+            if lt = '1' then return a; else return b; end if;
          when P_ABS =>
-            -- rt only; rs is not read.  Negating the most negative value cannot
-            -- be represented and the R5900 saturates rather than wrapping, so
-            -- |0x80000000| is 0x7FFFFFFF and not itself.
-            if signed(b) = SMIN then return unsigned(SMAX);
-            elsif signed(b) < 0 then return unsigned(-signed(b));
+            -- rt only; rs is not read, and the adder was given zero for a, so
+            -- sum is already -b.  Negating the most negative value cannot be
+            -- represented and the R5900 saturates rather than wrapping.
+            if b = SMIN then return SMAX;
+            elsif bsb = '1' then return sum;
             else return b; end if;
       end case;
    end function;
 
-   -- The three widths are separate loops because a loop bound has to be static;
-   -- the caller picks one with a literal, so only the selected array is used.
-   function par128(op : par_op_t; a, b : std_logic_vector(127 downto 0);
-                   w : natural) return std_logic_vector is
-      variable r : std_logic_vector(127 downto 0) := (others => '0');
+   function par_alu(op : par_op_t; a, b : std_logic_vector(127 downto 0);
+                    w : natural) return std_logic_vector is
+      variable neg : std_logic;
+      variable av  : std_logic_vector(127 downto 0);
+      variable res : std_logic_vector(127 downto 0) := (others => '0');
+      variable n8  : unsigned(7 downto 0);
+      variable n16 : unsigned(15 downto 0);
+      variable n32 : unsigned(31 downto 0);
+      variable s9  : unsigned(8 downto 0);
+      variable s17 : unsigned(16 downto 0);
+      variable s33 : unsigned(32 downto 0);
    begin
+      case op is
+         when P_SUB | P_SUBS | P_SUBU | P_CGT | P_MAX | P_MIN | P_ABS =>
+            neg := '1';
+         when others =>
+            neg := '0';
+      end case;
+      -- PABS is |b|, which is the same subtractor with zero on the other side.
+      if op = P_ABS then av := (others => '0'); else av := a; end if;
+      n8 := (others => neg); n16 := (others => neg); n32 := (others => neg);
+
+      -- Three static lane structures.  Each addition below has a width the
+      -- compiler knows, so the carry chain inside a lane is ordinary and the
+      -- break between lanes is free -- there is simply no carry wire there.
       case w is
          when 8 =>
-            for i in 0 to 15 loop
-               r(8*i+7 downto 8*i) := std_logic_vector(par_lane(op,
-                  unsigned(a(8*i+7 downto 8*i)), unsigned(b(8*i+7 downto 8*i))));
+            for k in 0 to 15 loop
+               s9 := resize(unsigned(av(8*k+7 downto 8*k)), 9)
+                   + resize(unsigned(b(8*k+7 downto 8*k)) xor n8, 9)
+                   + unsigned'("" & neg);
+               res(8*k+7 downto 8*k) :=
+                  par_out(op, av(8*k+7 downto 8*k), b(8*k+7 downto 8*k),
+                          std_logic_vector(s9(7 downto 0)), s9(8));
             end loop;
          when 16 =>
-            for i in 0 to 7 loop
-               r(16*i+15 downto 16*i) := std_logic_vector(par_lane(op,
-                  unsigned(a(16*i+15 downto 16*i)), unsigned(b(16*i+15 downto 16*i))));
+            for k in 0 to 7 loop
+               s17 := resize(unsigned(av(16*k+15 downto 16*k)), 17)
+                    + resize(unsigned(b(16*k+15 downto 16*k)) xor n16, 17)
+                    + unsigned'("" & neg);
+               res(16*k+15 downto 16*k) :=
+                  par_out(op, av(16*k+15 downto 16*k), b(16*k+15 downto 16*k),
+                          std_logic_vector(s17(15 downto 0)), s17(16));
             end loop;
          when others =>
-            for i in 0 to 3 loop
-               r(32*i+31 downto 32*i) := std_logic_vector(par_lane(op,
-                  unsigned(a(32*i+31 downto 32*i)), unsigned(b(32*i+31 downto 32*i))));
+            for k in 0 to 3 loop
+               s33 := resize(unsigned(av(32*k+31 downto 32*k)), 33)
+                    + resize(unsigned(b(32*k+31 downto 32*k)) xor n32, 33)
+                    + unsigned'("" & neg);
+               res(32*k+31 downto 32*k) :=
+                  par_out(op, av(32*k+31 downto 32*k), b(32*k+31 downto 32*k),
+                          std_logic_vector(s33(31 downto 0)), s33(32));
+            end loop;
+      end case;
+      return res;
+   end function;
+
+   -- ---- MMI's pack, extend and shuffle group -------------------------------
+   -- These move lanes about rather than computing anything, so they are wires
+   -- and multiplexers and share nothing with the adder above.  Three families,
+   -- each one rule at three widths:
+   --
+   --   PEXTL*  interleave the *low* half of rt and rs, rt supplying even lanes
+   --   PEXTU*  the same from the upper half
+   --   PPAC*   keep every other lane -- rt's into the low half, rs's the upper
+   --
+   -- PPAC is the truncating partner of PEXT: taking every other lane of a
+   -- 2W-bit value keeps the low W bits of each of its lanes, which is why the
+   -- two are encoded adjacently.
+   type shf_op_t is (S_PEXTL, S_PEXTU, S_PPAC, S_PEXT5, S_PPAC5,
+                     S_PADSBH, S_QFSRV);
+
+   function par_shuf(op : shf_op_t; w : natural;
+                     a, b : std_logic_vector(127 downto 0);
+                     sa : std_logic_vector(3 downto 0))
+      return std_logic_vector is
+      variable r : std_logic_vector(127 downto 0) := (others => '0');
+      variable q : std_logic_vector(255 downto 0);
+      variable o : natural;
+   begin
+      case op is
+         when S_PEXTL | S_PEXTU =>
+            if op = S_PEXTL then o := 0; else o := 64; end if;
+            case w is
+               when 8 =>
+                  for i in 0 to 7 loop
+                     r(16*i+7  downto 16*i)   := b(o+8*i+7 downto o+8*i);
+                     r(16*i+15 downto 16*i+8) := a(o+8*i+7 downto o+8*i);
+                  end loop;
+               when 16 =>
+                  for i in 0 to 3 loop
+                     r(32*i+15 downto 32*i)    := b(o+16*i+15 downto o+16*i);
+                     r(32*i+31 downto 32*i+16) := a(o+16*i+15 downto o+16*i);
+                  end loop;
+               when others =>
+                  for i in 0 to 1 loop
+                     r(64*i+31 downto 64*i)    := b(o+32*i+31 downto o+32*i);
+                     r(64*i+63 downto 64*i+32) := a(o+32*i+31 downto o+32*i);
+                  end loop;
+            end case;
+
+         when S_PPAC =>
+            case w is
+               when 8 =>
+                  for i in 0 to 7 loop
+                     r(8*i+7 downto 8*i)          := b(16*i+7 downto 16*i);
+                     r(8*(i+8)+7 downto 8*(i+8))  := a(16*i+7 downto 16*i);
+                  end loop;
+               when 16 =>
+                  for i in 0 to 3 loop
+                     r(16*i+15 downto 16*i)         := b(32*i+15 downto 32*i);
+                     r(16*(i+4)+15 downto 16*(i+4)) := a(32*i+15 downto 32*i);
+                  end loop;
+               when others =>
+                  for i in 0 to 1 loop
+                     r(32*i+31 downto 32*i)         := b(64*i+31 downto 64*i);
+                     r(32*(i+2)+31 downto 32*(i+2)) := a(64*i+31 downto 64*i);
+                  end loop;
+            end case;
+
+         when S_PEXT5 =>
+            -- RGBA5551 in each word, spread to a byte per channel: five bits
+            -- shifted up by three with zeros below, never replicated, and alpha
+            -- to bit 31.  The same expansion the GS applies to a 16-bit frame
+            -- buffer, minus the 0x80 that only a pixel read wants.
+            for k in 0 to 3 loop
+               r(32*k+31 downto 32*k) :=
+                  b(32*k+15) & "0000000"
+                  & b(32*k+14 downto 32*k+10) & "000"
+                  & b(32*k+9  downto 32*k+5)  & "000"
+                  & b(32*k+4  downto 32*k)    & "000";
+            end loop;
+
+         when S_PPAC5 =>
+            for k in 0 to 3 loop
+               r(32*k+31 downto 32*k) :=
+                  x"0000" & b(32*k+31) & b(32*k+23 downto 32*k+19)
+                  & b(32*k+15 downto 32*k+11) & b(32*k+7 downto 32*k+3);
+            end loop;
+
+         when S_PADSBH =>
+            -- The one instruction whose halves do different things: the low
+            -- four halfwords subtract and the upper four add.
+            for k in 0 to 3 loop
+               r(16*k+15 downto 16*k) := std_logic_vector(
+                  unsigned(a(16*k+15 downto 16*k)) - unsigned(b(16*k+15 downto 16*k)));
+            end loop;
+            for k in 4 to 7 loop
+               r(16*k+15 downto 16*k) := std_logic_vector(
+                  unsigned(a(16*k+15 downto 16*k)) + unsigned(b(16*k+15 downto 16*k)));
+            end loop;
+
+         when S_QFSRV =>
+            -- {rs, rt} shifted right by SA *bytes*, low 128 bits kept.  SA
+            -- counting bytes is what makes this the instruction for realigning
+            -- a quadword that straddles a boundary, and is why its shift amount
+            -- lives in a register rather than in the instruction word.
+            --
+            -- Written as sixteen byte-wide selections rather than as
+            -- shift_right on the 256-bit value.  The two are the same function
+            -- and not the same hardware: the shift builds a barrel shifter
+            -- sized for its operand, and this builds exactly what the
+            -- instruction needs, sixteen 16-to-1 byte multiplexers.  It is
+            -- worth 20 MHz on this core -- more than deleting QFSRV outright
+            -- was -- and is the same lesson the load and store alignment
+            -- networks taught: make the shifter the width of the answer, not
+            -- the width of the operand.
+            q := a & b;
+            for j in 0 to 15 loop
+               r(8*j+7 downto 8*j) :=
+                  q(8*(j + to_integer(unsigned(sa)))+7
+                    downto 8*(j + to_integer(unsigned(sa))));
             end loop;
       end case;
       return r;
@@ -495,6 +679,7 @@ begin
    dbg_hi    <= hi;
    dbg_lo    <= lo;
    dbg_hi1   <= hi1;
+   dbg_sa    <= sa_reg;
    dbg_lo1   <= lo1;
    dbg_traps <= traps;
 
@@ -508,6 +693,7 @@ begin
       variable tgt                    : unsigned(31 downto 0);
       variable ea                     : unsigned(63 downto 0);
       variable hi_f, lo_f             : std_logic_vector(63 downto 0);
+      variable sa_f                   : std_logic_vector(3 downto 0);
       variable hi1_f, lo1_f           : std_logic_vector(63 downto 0);
       variable hi_r, lo_r             : std_logic_vector(63 downto 0);
       variable ex_p1                  : std_logic;
@@ -529,7 +715,12 @@ begin
       variable ex_w128                : std_logic;
       variable par_v                  : std_logic_vector(127 downto 0);
       variable par_ok                 : boolean;
+      variable par_alu_on             : boolean;
+      variable par_o                  : par_op_t;
+      variable par_w                  : natural range 8 to 32;
       variable ex_hi_we, ex_lo_we     : std_logic;
+      variable ex_sa_we               : std_logic;
+      variable ex_sa                  : std_logic_vector(3 downto 0);
       variable ex_hi, ex_lo           : std_logic_vector(63 downto 0);
       variable ex_ismem, ex_isload    : std_logic;
       variable ex_width               : integer range 1 to 16;
@@ -719,7 +910,9 @@ begin
             lo_f  := lo;
             hi1_f := hi1;
             lo1_f := lo1;
+            sa_f  := sa_reg;
             if w_valid = '1' then
+               if w_sa_we = '1' then sa_f := w_sa; end if;
                if w_hi_we = '1' then
                   if w_p1 = '1' then hi1_f := w_hi; else hi_f := w_hi; end if;
                end if;
@@ -728,6 +921,7 @@ begin
                end if;
             end if;
             if m_valid = '1' then
+               if m_sa_we = '1' then sa_f := m_sa; end if;
                if m_hi_we = '1' then
                   if m_p1 = '1' then hi1_f := m_hi; else hi_f := m_hi; end if;
                end if;
@@ -759,6 +953,8 @@ begin
             ex_val    := (others => '0');
             ex_valhi  := (others => '0');
             ex_hi_we  := '0';
+            ex_sa_we  := '0';
+            ex_sa     := (others => '0');
             ex_lo_we  := '0';
             ex_hi     := (others => '0');
             ex_lo     := (others => '0');
@@ -885,6 +1081,10 @@ begin
                      when 43 => ex_we := '1'; ex_rd := rd;                         -- SLTU
                         if unsigned(a) < unsigned(b) then ex_val := (0 => '1', others => '0');
                         else ex_val := (others => '0'); end if;
+                     when 40 => ex_we := '1'; ex_rd := rd;                         -- MFSA
+                        ex_val := x"000000000000000" & sa_f;
+                     when 41 =>                                                    -- MTSA
+                        ex_sa_we := '1'; ex_sa := a(3 downto 0);
                      when 44 | 45 => ex_we := '1'; ex_rd := rd;                    -- DADD/DADDU
                         ex_val := std_logic_vector(signed(a) + signed(b));
                      when 46 | 47 => ex_we := '1'; ex_rd := rd;                    -- DSUB/DSUBU
@@ -912,6 +1112,18 @@ begin
                                 ex_take := signed(a) < 0;
                      when 17 => ex_we := '1'; ex_rd := 31; ex_val := d_link;
                                 ex_take := signed(a) >= 0;
+                     -- The two members of REGIMM that neither branch nor link:
+                     -- they set the shift-amount register.  The exclusive-or is
+                     -- what the manual specifies and is not a slip -- it lets a
+                     -- byte offset be flipped without a read-modify-write.
+                     when 24 =>                                  -- MTSAB
+                        ex_sa_we := '1';
+                        ex_sa := a(3 downto 0)
+                                 xor std_logic_vector(simm(3 downto 0));
+                     when 25 =>                                  -- MTSAH
+                        ex_sa_we := '1';
+                        ex_sa := (a(2 downto 0)
+                                  xor std_logic_vector(simm(2 downto 0))) & '0';
                      when others => ex_trap := true;
                   end case;
                   tgt := d_tgt;
@@ -975,55 +1187,79 @@ begin
                   ex_rd   := rd;
                   ex_w128 := '1';
                   if fn = 16#08# or fn = 16#28# then         -- MMI0 / MMI1
-                     -- The parallel ALU.  Every arm names its lane width as a
-                     -- literal so that the loop inside par128 has a static
-                     -- bound; the width multiplexer is what is left over.
+                     -- MMI0 and MMI1 hold two different kinds of instruction
+                     -- and they are built differently.  The arithmetic half
+                     -- selects an operation and a lane width as *values* and
+                     -- calls par_alu once, so one adder per width serves all of
+                     -- them; calling a generic function thirty times with
+                     -- literal arguments specialised each call and cost 2681
+                     -- LUTs for no clock.  The shuffle half is wires and
+                     -- multiplexers with nothing to share, so each arm names
+                     -- its own permutation.
                      --
-                     -- Before this existed, function 0x08 and 0x28 fell through
-                     -- to the MMI3 arm below and were decoded as POR, PNOR or
-                     -- PCPYUD.  Nothing noticed, because the generator emitted
-                     -- neither -- the same blind spot that hid MMI2 and MMI3
-                     -- themselves until 2026-09-11.
-                     par_v := (others => '0');
-                     par_ok := true;
+                     -- Before any of this existed, function 0x08 and 0x28 fell
+                     -- through to the MMI3 arm below and were decoded as POR,
+                     -- PNOR or PCPYUD.  Nothing noticed, because the generator
+                     -- emitted neither.
+                     par_v      := (others => '0');
+                     par_ok     := true;
+                     par_alu_on := false;
+                     par_o      := P_ADD;
+                     par_w      := 32;
                      if fn = 16#08# then                     -- MMI0
                         case sa is
-                           when 16#00# => par_v := par128(P_ADD,  a128, b128, 32);
-                           when 16#01# => par_v := par128(P_SUB,  a128, b128, 32);
-                           when 16#02# => par_v := par128(P_CGT,  a128, b128, 32);
-                           when 16#03# => par_v := par128(P_MAX,  a128, b128, 32);
-                           when 16#04# => par_v := par128(P_ADD,  a128, b128, 16);
-                           when 16#05# => par_v := par128(P_SUB,  a128, b128, 16);
-                           when 16#06# => par_v := par128(P_CGT,  a128, b128, 16);
-                           when 16#07# => par_v := par128(P_MAX,  a128, b128, 16);
-                           when 16#08# => par_v := par128(P_ADD,  a128, b128, 8);
-                           when 16#09# => par_v := par128(P_SUB,  a128, b128, 8);
-                           when 16#0A# => par_v := par128(P_CGT,  a128, b128, 8);
-                           when 16#10# => par_v := par128(P_ADDS, a128, b128, 32);
-                           when 16#11# => par_v := par128(P_SUBS, a128, b128, 32);
-                           when 16#14# => par_v := par128(P_ADDS, a128, b128, 16);
-                           when 16#15# => par_v := par128(P_SUBS, a128, b128, 16);
-                           when 16#18# => par_v := par128(P_ADDS, a128, b128, 8);
-                           when 16#19# => par_v := par128(P_SUBS, a128, b128, 8);
+                           when 16#00# => par_alu_on := true; par_o := P_ADD;  par_w := 32;
+                           when 16#01# => par_alu_on := true; par_o := P_SUB;  par_w := 32;
+                           when 16#02# => par_alu_on := true; par_o := P_CGT;  par_w := 32;
+                           when 16#03# => par_alu_on := true; par_o := P_MAX;  par_w := 32;
+                           when 16#04# => par_alu_on := true; par_o := P_ADD;  par_w := 16;
+                           when 16#05# => par_alu_on := true; par_o := P_SUB;  par_w := 16;
+                           when 16#06# => par_alu_on := true; par_o := P_CGT;  par_w := 16;
+                           when 16#07# => par_alu_on := true; par_o := P_MAX;  par_w := 16;
+                           when 16#08# => par_alu_on := true; par_o := P_ADD;  par_w := 8;
+                           when 16#09# => par_alu_on := true; par_o := P_SUB;  par_w := 8;
+                           when 16#0A# => par_alu_on := true; par_o := P_CGT;  par_w := 8;
+                           when 16#10# => par_alu_on := true; par_o := P_ADDS; par_w := 32;
+                           when 16#11# => par_alu_on := true; par_o := P_SUBS; par_w := 32;
+                           when 16#14# => par_alu_on := true; par_o := P_ADDS; par_w := 16;
+                           when 16#15# => par_alu_on := true; par_o := P_SUBS; par_w := 16;
+                           when 16#18# => par_alu_on := true; par_o := P_ADDS; par_w := 8;
+                           when 16#19# => par_alu_on := true; par_o := P_SUBS; par_w := 8;
+                           when 16#12# => par_v := par_shuf(S_PEXTL,  32, a128, b128, sa_f);
+                           when 16#13# => par_v := par_shuf(S_PPAC,   32, a128, b128, sa_f);
+                           when 16#16# => par_v := par_shuf(S_PEXTL,  16, a128, b128, sa_f);
+                           when 16#17# => par_v := par_shuf(S_PPAC,   16, a128, b128, sa_f);
+                           when 16#1A# => par_v := par_shuf(S_PEXTL,   8, a128, b128, sa_f);
+                           when 16#1B# => par_v := par_shuf(S_PPAC,    8, a128, b128, sa_f);
+                           when 16#1E# => par_v := par_shuf(S_PEXT5,  32, a128, b128, sa_f);
+                           when 16#1F# => par_v := par_shuf(S_PPAC5,  32, a128, b128, sa_f);
                            when others => par_ok := false;
                         end case;
                      else                                    -- MMI1
                         case sa is
-                           when 16#01# => par_v := par128(P_ABS,  a128, b128, 32);
-                           when 16#02# => par_v := par128(P_CEQ,  a128, b128, 32);
-                           when 16#03# => par_v := par128(P_MIN,  a128, b128, 32);
-                           when 16#05# => par_v := par128(P_ABS,  a128, b128, 16);
-                           when 16#06# => par_v := par128(P_CEQ,  a128, b128, 16);
-                           when 16#07# => par_v := par128(P_MIN,  a128, b128, 16);
-                           when 16#0A# => par_v := par128(P_CEQ,  a128, b128, 8);
-                           when 16#10# => par_v := par128(P_ADDU, a128, b128, 32);
-                           when 16#11# => par_v := par128(P_SUBU, a128, b128, 32);
-                           when 16#14# => par_v := par128(P_ADDU, a128, b128, 16);
-                           when 16#15# => par_v := par128(P_SUBU, a128, b128, 16);
-                           when 16#18# => par_v := par128(P_ADDU, a128, b128, 8);
-                           when 16#19# => par_v := par128(P_SUBU, a128, b128, 8);
+                           when 16#01# => par_alu_on := true; par_o := P_ABS;  par_w := 32;
+                           when 16#02# => par_alu_on := true; par_o := P_CEQ;  par_w := 32;
+                           when 16#03# => par_alu_on := true; par_o := P_MIN;  par_w := 32;
+                           when 16#05# => par_alu_on := true; par_o := P_ABS;  par_w := 16;
+                           when 16#06# => par_alu_on := true; par_o := P_CEQ;  par_w := 16;
+                           when 16#07# => par_alu_on := true; par_o := P_MIN;  par_w := 16;
+                           when 16#0A# => par_alu_on := true; par_o := P_CEQ;  par_w := 8;
+                           when 16#10# => par_alu_on := true; par_o := P_ADDU; par_w := 32;
+                           when 16#11# => par_alu_on := true; par_o := P_SUBU; par_w := 32;
+                           when 16#14# => par_alu_on := true; par_o := P_ADDU; par_w := 16;
+                           when 16#15# => par_alu_on := true; par_o := P_SUBU; par_w := 16;
+                           when 16#18# => par_alu_on := true; par_o := P_ADDU; par_w := 8;
+                           when 16#19# => par_alu_on := true; par_o := P_SUBU; par_w := 8;
+                           when 16#04# => par_v := par_shuf(S_PADSBH, 16, a128, b128, sa_f);
+                           when 16#12# => par_v := par_shuf(S_PEXTU,  32, a128, b128, sa_f);
+                           when 16#16# => par_v := par_shuf(S_PEXTU,  16, a128, b128, sa_f);
+                           when 16#1A# => par_v := par_shuf(S_PEXTU,   8, a128, b128, sa_f);
+                           when 16#1B# => par_v := par_shuf(S_QFSRV,   8, a128, b128, sa_f);
                            when others => par_ok := false;
                         end case;
+                     end if;
+                     if par_alu_on then
+                        par_v := par_alu(par_o, a128, b128, par_w);
                      end if;
                      if par_ok then
                         ex_val   := par_v(63 downto 0);
@@ -1031,6 +1267,7 @@ begin
                      else
                         ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                      end if;
+
                   elsif fn = 16#09# then                     -- MMI2
                      case sa is
                         when 16#12# =>                       -- PAND
@@ -1306,6 +1543,7 @@ begin
                      gpr(w_rd)(63 downto 0) <= w_val(63 downto 0);
                   end if;
                end if;
+               if w_sa_we = '1' then sa_reg <= w_sa; end if;
                if w_hi_we = '1' then
                   if w_p1 = '1' then hi1 <= w_hi; else hi <= w_hi; end if;
                end if;
@@ -1336,6 +1574,8 @@ begin
                w_c0_val <= m_c0_val;
                w_hi_we  <= m_hi_we;
                w_lo_we  <= m_lo_we;
+               w_sa_we  <= m_sa_we;
+               w_sa     <= m_sa;
                w_hi     <= m_hi;
                w_lo     <= m_lo;
                if m_isload = '1' and m_unal = '1' then
@@ -1457,6 +1697,8 @@ begin
                   m_c0_val <= ex_c0_val;
                   m_hi_we  <= ex_hi_we;
                   m_lo_we  <= ex_lo_we;
+                  m_sa_we  <= ex_sa_we;
+                  m_sa     <= ex_sa;
                   m_hi     <= ex_hi;
                   m_lo     <= ex_lo;
                   m_ismem  <= ex_ismem and d_valid;
@@ -1509,6 +1751,7 @@ begin
                   m_we    <= '0';        n_m_we    := '0';
                   m_hi_we <= '0';
                   m_lo_we <= '0';
+                  m_sa_we <= '0';
                   m_take  <= '0';
                   m_c0_we <= '0';
                   m_exc   <= '0';

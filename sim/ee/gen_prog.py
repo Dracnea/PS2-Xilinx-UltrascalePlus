@@ -31,9 +31,12 @@ SCRATCH = 0x2000          # well past any generated program
 # mirror sim/ee/r5900_ref.py's tables; the encodings are cross-checked against
 # PCSX2's tbl_MMI0 and tbl_MMI1.
 MMI0_SA = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
-           0x10, 0x11, 0x14, 0x15, 0x18, 0x19]
+           0x10, 0x11, 0x14, 0x15, 0x18, 0x19,
+           # the pack, extend and shuffle half
+           0x12, 0x13, 0x16, 0x17, 0x1A, 0x1B, 0x1E, 0x1F]
 MMI1_SA = [0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x0A,
-           0x10, 0x11, 0x14, 0x15, 0x18, 0x19]
+           0x10, 0x11, 0x14, 0x15, 0x18, 0x19,
+           0x04, 0x12, 0x16, 0x1A, 0x1B]
 
 # kind -> relative weight.  Weights, not cumulative thresholds: adding a kind
 # cannot silently starve the ones after it.
@@ -45,6 +48,7 @@ MIX = {
     "cop0":      3,
     "mmi_simd":  4,
     "mmi_par":   6,
+    "sa":        3,
     "mmi_p1":    3,
     "unaligned": 4,
     "quad":      4,
@@ -135,6 +139,20 @@ def emit(rng, kind, branches):
         op = 30 if rng.randrange(2) else 31
         off = SCRATCH + rng.randrange(0, 0x400)
         return (op << 26) | (0 << 21) | ((rd if op == 30 else rt) << 16) | (off & 0xFFFF)
+
+    if kind == "sa":
+        # The shift-amount register and its four instructions.  MTSAB and MTSAH
+        # exclusive-or their operand with the immediate rather than replacing
+        # it, MTSA takes a register, and MFSA reads it back -- which is the only
+        # way, apart from QFSRV, that the register is observable at all.
+        pick = rng.randrange(4)
+        if pick == 0:                                    # MTSAB: REGIMM rt = 24
+            return (1 << 26) | (rs << 21) | (24 << 16) | rng.randrange(0x10000)
+        if pick == 1:                                    # MTSAH: REGIMM rt = 25
+            return (1 << 26) | (rs << 21) | (25 << 16) | rng.randrange(0x10000)
+        if pick == 2:                                    # MTSA: SPECIAL fn 41
+            return (rs << 21) | 41
+        return (rd << 11) | 40                           # MFSA: SPECIAL fn 40
 
     if kind == "tail":
         if branches:

@@ -164,6 +164,95 @@ def parallel(op, w, a128, b128):
     return _join([_pop(op, x, y, w) for x, y in zip(la, lb)], w)
 
 
+# ---- MMI's pack, extend and shuffle group ----------------------------------
+#
+# These move lanes around rather than computing anything, and the three families
+# are each one rule at three widths:
+#
+#   PEXTL*  interleave the *low* half of rt and rs, rt first
+#   PEXTU*  the same from the upper half
+#   PPAC*   keep every other lane -- rt's into the low half, rs's into the upper
+#
+# PPAC is the truncating half of a pair: taking every other lane of a 2W-bit
+# value is the same as keeping the low W bits of each of its lanes, which is why
+# it is the natural partner of PEXT and why the two are encoded adjacently.
+
+def pext(w, a128, b128, upper):
+    """PEXTL/PEXTU at lane width w.  a128 is rs, b128 is rt."""
+    n = 128 // w
+    la, lb = _lanes(a128, w), _lanes(b128, w)
+    off = n // 2 if upper else 0
+    out = []
+    for i in range(n // 2):
+        out.append(lb[off + i])       # rt first: it supplies the even lanes
+        out.append(la[off + i])
+    return _join(out, w)
+
+
+def ppac(w, a128, b128):
+    """PPAC at lane width w: every other lane, rt's low half then rs's."""
+    n = 128 // w
+    la, lb = _lanes(a128, w), _lanes(b128, w)
+    return _join([lb[2 * i] for i in range(n // 2)]
+                 + [la[2 * i] for i in range(n // 2)], w)
+
+
+def pext5(b128):
+    """RGBA5551 in each 32-bit lane, spread to one byte per channel.
+
+    The same expansion the Graphics Synthesizer applies when it reads a 16-bit
+    frame buffer: five bits shifted up by three with zeros below, never
+    replicated.  Alpha lands in bit 31 rather than becoming 0x80, because this
+    is a register operation and not a pixel read.
+    """
+    out = []
+    for v in _lanes(b128, 32):
+        out.append(((v & 0x0000001F) << 3) | ((v & 0x000003E0) << 6)
+                   | ((v & 0x00007C00) << 9) | ((v & 0x00008000) << 16))
+    return _join(out, 32)
+
+
+def ppac5(b128):
+    """The inverse of pext5, and it truncates: bits 7:3, 15:11, 23:19 and 31."""
+    out = []
+    for v in _lanes(b128, 32):
+        out.append(((v >> 3) & 0x0000001F) | ((v >> 6) & 0x000003E0)
+                   | ((v >> 9) & 0x00007C00) | ((v >> 16) & 0x00008000))
+    return _join(out, 32)
+
+
+def padsbh(a128, b128):
+    """Parallel add/subtract halfword: the low four subtract, the upper four add.
+
+    The one instruction in MMI whose two halves do different things, which is
+    why it cannot be folded into the table above.
+    """
+    la, lb = _lanes(a128, 16), _lanes(b128, 16)
+    return _join([_pop("sub", la[i], lb[i], 16) for i in range(4)]
+                 + [_pop("add", la[i], lb[i], 16) for i in range(4, 8)], 16)
+
+
+def qfsrv(a128, b128, sa):
+    """Quadword funnel shift right variable: {rs, rt} >> (SA * 8), low 128 bits.
+
+    SA counts *bytes*, which is what makes this the instruction for realigning a
+    quadword that straddles a boundary -- and the reason the shift amount lives
+    in its own register rather than in the instruction word.
+    """
+    return ((b128 | (a128 << 128)) >> (8 * sa)) & M128
+
+
+# sa -> the shuffle operation, for the two tables that carry them.
+MMI0_SHUF = {0x12: ("pextl", 32), 0x13: ("ppac", 32),
+             0x16: ("pextl", 16), 0x17: ("ppac", 16),
+             0x1A: ("pextl", 8),  0x1B: ("ppac", 8),
+             0x1E: ("pext5", 0),  0x1F: ("ppac5", 0)}
+
+MMI1_SHUF = {0x04: ("padsbh", 0),
+             0x12: ("pextu", 32), 0x16: ("pextu", 16), 0x1A: ("pextu", 8),
+             0x1B: ("qfsrv", 0)}
+
+
 class R5900:
     def __init__(self, mem, pc=0):
         self.gpr = [0] * 32          # 128-bit each; integer ops touch the low 64
@@ -174,6 +263,15 @@ class R5900:
         # relatives are the ordinary multiply and divide aimed at HI1/LO1, so a
         # compiler can keep two multiply chains in flight without spilling.
         self.hi1 = self.lo1 = 0
+        # The shift-amount register, a byte offset within a quadword.  Only
+        # QFSRV reads it, and only MTSA, MTSAB and MTSAH write it.  Four bits:
+        # it indexes a byte in sixteen, and MTSAB and MTSAH already mask to that
+        # much.  MTSA takes a whole register on hardware and this model keeps
+        # the low four bits of it, which is the one place here that goes beyond
+        # what PCSX2 does -- it stores the full 32 bits and would disagree after
+        # an MTSA of something larger.  The generators never emit one, so the
+        # two models are not compared on it.
+        self.sa = 0
         # COP0, the system control coprocessor: 32 registers of 32 bits.  This
         # slice is the register file and MFC0/MTC0 only.  Count is deliberately
         # *not* free-running here, because this model has no notion of time and
@@ -378,9 +476,20 @@ class R5900:
             # bits of the destination.
             a128, b128 = self.r128(rs), self.r128(rt)
             tbl = MMI0_OPS if fn == 0x08 else MMI1_OPS
+            shuf = MMI0_SHUF if fn == 0x08 else MMI1_SHUF
             if sa in tbl:
                 w, pop = tbl[sa]
                 self.w128(rd, parallel(pop, w, a128, b128))
+            elif sa in shuf:
+                kind, w = shuf[sa]
+                if   kind == "pextl":  v = pext(w, a128, b128, False)
+                elif kind == "pextu":  v = pext(w, a128, b128, True)
+                elif kind == "ppac":   v = ppac(w, a128, b128)
+                elif kind == "pext5":  v = pext5(b128)
+                elif kind == "ppac5":  v = ppac5(b128)
+                elif kind == "padsbh": v = padsbh(a128, b128)
+                else:                  v = qfsrv(a128, b128, self.sa)
+                self.w128(rd, v)
             else:
                 self.traps.append(("unimplemented MMI%d sa %d"
                                    % (0 if fn == 0x08 else 1, sa), self.pc - 4))
@@ -518,6 +627,14 @@ class R5900:
         elif rt == 17:                                                # BGEZAL
             self.w(31, (nxt + 4) & M64)
             if v >= 0: self.branch(nxt + (simm << 2))
+        # The two odd members of REGIMM: they neither branch nor link, they set
+        # the shift-amount register.  The exclusive-or is what the manual
+        # specifies and is not a typo -- it lets a byte offset be flipped
+        # without a read-modify-write.
+        elif rt == 24:                                                # MTSAB
+            self.sa = (self.r(rs) & 0xF) ^ (simm & 0xF)
+        elif rt == 25:                                                # MTSAH
+            self.sa = ((self.r(rs) & 0x7) ^ (simm & 0x7)) << 1
 
     def _special(self, i, rs, rt, rd, sa, fn):
         a, b = self.r(rs), self.r(rt)
@@ -551,6 +668,8 @@ class R5900:
         elif fn == 39: self.w(rd, ~(a | b) & M64)                     # NOR
         elif fn == 42: self.w(rd, 1 if s64(a) < s64(b) else 0)        # SLT
         elif fn == 43: self.w(rd, 1 if a < b else 0)                  # SLTU
+        elif fn == 40: self.w(rd, self.sa)                            # MFSA
+        elif fn == 41: self.sa = a & 0xF                              # MTSA
         elif fn == 45: self.w(rd, (s64(a) + s64(b)) & M64)            # DADDU
         elif fn == 47: self.w(rd, (s64(a) - s64(b)) & M64)            # DSUBU
         elif fn == 56: self.w(rd, (b << sa) & M64)                    # DSLL
@@ -573,8 +692,8 @@ def dump(cpu, step, pc):
     # All 128 bits, because MMI writes the upper half and a trace that printed
     # only the low 64 would call two different machine states identical.
     regs = " ".join("r%02d=%032x" % (n, cpu.r128(n)) for n in range(1, 32))
-    return "%4d pc=%016x hi=%016x lo=%016x hi1=%016x lo1=%016x %s" % (
-        step, pc, cpu.hi, cpu.lo, cpu.hi1, cpu.lo1, regs)
+    return "%4d pc=%016x hi=%016x lo=%016x hi1=%016x lo1=%016x sa=%02x %s" % (
+        step, pc, cpu.hi, cpu.lo, cpu.hi1, cpu.lo1, cpu.sa, regs)
 
 
 def main():
