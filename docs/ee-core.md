@@ -922,10 +922,23 @@ only the six logical and copy forms (`PAND`, `PXOR`, `PCPYLD`, `POR`, `PNOR`,
 unaligned group — `LWL`, `LWR`, `SWL`, `SWR`, `LDL`, `LDR`, `SDL`, `SDR` — is
 done, and so are `LQ` and `SQ`.
 
-Timing was last measured at 283.5 MHz against a 294.912 MHz target, a factor of
-1.04, before the data port was widened to 128 bits. **That figure is now
-stale:** widening the port changes the load return path and the store
-alignment network, and no fit has been run since. Re-measure before quoting it.
+Timing: **253.2 MHz** against a 294.912 MHz target, a factor of 1.16
+(`xcu55n-fsvh2892-2LV-e`, out of context, constrained at 3.39 ns, WNS
+-0.559 ns, 2026-09-11). That is **down from 283.5 MHz**, so widening the data
+port to 128 bits cost about 30 MHz — a little over 10 %.
+
+The critical path did not move to the load return path, which is where the
+change would be expected to hurt. It is `m_val_reg[17] → m_val_reg[49]`, ten
+logic levels and **64 % routing**, with the next two paths starting at `fb_m`,
+the forward-select shadow the previous timing work introduced. So the datapath
+registers are further apart than they were rather than deeper, which is what a
+128-bit-wide `m_val` and a 128-bit store alignment network would do to
+placement.
+
+That diagnosis is from the timing report alone and is **not** confirmed by an
+experiment: no fit was run with the port widened and the alignment network left
+narrow, which is what would separate the two causes. Recorded as the next
+timing question rather than as a conclusion.
 
 IPC is better but not closed: CPI 1.78 on ordinary code, 2.15 on branch-heavy.
 What is left is multiply/divide latency (inherent), one stall per memory access,
