@@ -1006,10 +1006,44 @@ first measurement said how close behind it was. Two long paths in different
 parts of the design, one per-pixel and one per-triangle, and fixing the first
 buys the difference between them and no more.
 
-The setup divider is the next target, and it is a different kind of problem: it
-is arithmetic that genuinely takes a long time, so it wants more cycles rather
-than a register in the middle. It already runs once per triangle rather than
-once per pixel, which is what makes spending cycles there affordable.
+### The setup divider, and what the pattern turned out to be — 2026-09-11
+
+The seed numerator — `1024 * (c0*det + nx*(16x - X0) + ny*(16y - Y0))` — was one
+expression in one state: a subtraction, a multiply, a second multiply whose
+adder synthesis cascaded into the first through the DSP's `PCIN`, then carry
+chains into the divider's numerator register.
+
+Splitting the three products from the sum puts them side by side instead of in a
+chain, because once they land in registers there is nothing downstream for the
+tool to cascade into. It costs **one cycle per seed** — one per scanline per
+channel, against a division that takes sixty-four — so it is close to free.
+
+**117.3 → 121.5 MHz**, and the path moved again: `gif/t_regs_reg` to
+`gif/dr_empty_reg`, thirty levels with ten carry chains, which is the primitive
+setup in `gs_gif` — reading the register file and working out whether the
+primitive is empty after scissoring.
+
+Three cuts now, and the shape of the problem is clear:
+
+| | Fmax |
+|---|---|
+| as first fitted | 110.8 |
+| pixel path cut | 117.3 |
+| seed numerator split | 121.5 |
+
+**This is not a design with one long path; it is a design with a population of
+them**, each two to three nanoseconds over budget, in the per-primitive and
+per-scanline setup rather than in the pixel loop. Each cut buys four to six MHz
+and uncovers the next. That is worth stating plainly because it changes what the
+remaining work looks like: reaching the console's 147.456 MHz is not one more
+fix, it is a sustained pass over the setup path, and the honest estimate is
+several more cuts.
+
+**None of that blocks a board target.** 121.5 MHz is a perfectly good clock to
+bring the Graphics Synthesizer up on a card at — the console's clock is what
+full-speed emulation needs, not what proving the hardware works needs. The
+divider is no longer the limit, which was the thing worth fixing before the
+design left simulation.
 
 ## What is not started
 

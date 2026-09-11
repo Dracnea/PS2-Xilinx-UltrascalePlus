@@ -91,7 +91,7 @@ end entity;
 
 architecture arch of gs_chan_dda is
    type state_t is (S_IDLE, S_GLOAD, S_GDIV, S_GFIX, S_LANE,
-                    S_READY, S_SLOAD, S_SDIV, S_SFIX);
+                    S_READY, S_SMUL, S_SLOAD, S_SDIV, S_SFIX);
    signal state : state_t := S_IDLE;
 
    constant W : natural := 64;         -- the divider's width
@@ -122,6 +122,22 @@ architecture arch of gs_chan_dda is
    signal jq     : signed(W - 1 downto 0) := (others => '0');
    signal jcorr  : signed(W - 1 downto 0) := (others => '0');
    signal detp   : signed(W - 1 downto 0) := (others => '0');
+
+   -- The seed numerator's three products, held for a cycle.
+   --
+   -- The whole of seed = 1024*(c0*det + nx*(16x - X0) + ny*(16y - Y0)) used to
+   -- be one expression in one state, and after the per-pixel colour path was
+   -- pipelined it became the longest path in the Graphics Synthesizer: a
+   -- subtraction, then a multiply, then a second multiply whose adder was
+   -- cascaded into the first through the DSP's PCIN, then more carry chains
+   -- into the divider's numerator register.  Twenty-two logic levels and six
+   -- DSP stages.
+   --
+   -- Splitting the products from the sum costs one cycle per seed, which is one
+   -- cycle per scanline per channel against a division that takes sixty-four --
+   -- and it lets the three multipliers stand side by side instead of in a
+   -- chain, because nothing downstream of them is available to cascade into.
+   signal p_c, p_nx, p_ny : signed(W - 1 downto 0) := (others => '0');
 
    -- the restoring divider, shared between the gradient and every seed
    signal dv_n, dv_d, dv_q, dv_r : unsigned(W - 1 downto 0) := (others => '0');
@@ -274,7 +290,7 @@ begin
                      setup;
                   elsif sstart = '1' then
                      sbusy <= '1';
-                     state <= S_SLOAD;
+                     state <= S_SMUL;
                   elsif adv = '1' then
                      if lane_i = 7 then
                         lane_i <= 0;
@@ -284,13 +300,18 @@ begin
                      end if;
                   end if;
 
+               -- The three products of the seed numerator, in parallel.
+               when S_SMUL =>
+                  p_c  <= resize(signed('0' & c0) * detp, W);
+                  p_nx <= resize(nx * (shift_left(resize(sx, 20), 4)
+                                       - resize(x0, 20)), W);
+                  p_ny <= resize(ny * (shift_left(resize(sy, 20), 4)
+                                       - resize(y0, 20)), W);
+                  state <= S_SLOAD;
+
                when S_SLOAD =>
                   -- seed = floor(1024 * (c0*det + nx*(16x - X0) + ny*(16y - Y0)) / det)
-                  num := shift_left(
-                            resize(signed('0' & c0) * detp, W)
-                          + resize(nx * (shift_left(resize(sx, 20), 4) - resize(x0, 20)), W)
-                          + resize(ny * (shift_left(resize(sy, 20), 4) - resize(y0, 20)), W),
-                          FRAC);
+                  num := shift_left(p_c + p_nx + p_ny, FRAC);
                   dv_neg <= '1' when num < 0 else '0';
                   if num < 0 then dv_n <= unsigned(-num); else dv_n <= unsigned(num); end if;
                   dv_d   <= unsigned(detp);

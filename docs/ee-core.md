@@ -1241,6 +1241,35 @@ cold cache in front of HBM costs, and it is the first honest look at the number,
 since every CPI quoted on this page until now assumed memory that was always
 ready.
 
+### What the whole thing costs on the part — 2026-09-11
+
+`ee_top` fitted out of context on `xcu55n-fsvh2892-2LV-e`:
+
+| | |
+|---|---|
+| CLB LUTs | 16769 (1.92 %) |
+| CLB registers | 9089 (0.52 %) |
+| **Block RAM** | **8 tiles** |
+| UltraRAM | 0 |
+| **Fmax** | **201.3 MHz** |
+
+Two things worth keeping.
+
+**The cache is in block RAM.** `ee_ram.vhd` carries a long comment about an
+earlier version that synthesis refused to put in block RAM — "Infeasible
+attribute ram_style = block" — and that landed its 32 KB in distributed RAM at
+14208 LUTs. Eight block RAM tiles and no sign of that is the fix holding.
+
+**The memory subsystem costs nothing in clock.** The core alone measures 192.7
+MHz as a mean over three placement directives; the core with its cache, its
+arbiter, its fetch queue and an AXI master measures 201.3, and the critical path
+is still inside the core — `d_ir` to `m_val`, the same forwarding-and-result-mux
+region that has limited it all along. Nothing in the memory path is close.
+
+That is the useful half of the result. The EE's clock problem remains entirely a
+problem about MMI and the forwarding loop, and attaching real memory did not add
+to it.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
