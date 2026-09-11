@@ -1302,15 +1302,46 @@ shifts taking their amount from the wrong word. The directed program sweeps
 a wide write and the second HI/LO pair are exactly the two things that could be
 crossed.
 
+### PMULTW and PMULTUW, and a width that was wrong in silence — 2026-09-11
+
+The first two of the multiply group: two 32x32 products from words 0 and 2,
+into doublewords 0 and 1 of rd, with the low word of each product going to LO
+and the high word to HI, each sign-extended from 32 bits. **Three 128-bit
+destinations from one instruction**, which is what the wide HI/LO write was
+built for.
+
+The signed form worked at the first attempt and the unsigned form returned
+zeros. The cause is worth recording because nothing warned about it: a 32x32
+multiply already gives 64 bits, and resizing the operands to 64 first makes a
+*128-bit* product, which assigned to a 64-bit signal is a length mismatch that
+`xvhdl` does not flag and `xsim` answers with zeros. Zeros in rd, HI and LO
+together look exactly like an instruction that was never decoded, which is where
+the first half-hour went.
+
+The directed program caught it on the run it was added to, which is the useful
+part: `gen_mmi.py` already had the machinery to check that HI and LO move
+together and that a wide write does not disturb the second pair.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
 and the VUs. The integer subset is not complete: no TLB. **MMI0 and MMI1 are
-complete, and MMI2 and MMI3 are complete apart from their multiply-accumulate
-half** — `PMADDW`, `PMSUBW`, `PMULTW`, `PDIVW`, `PMADDH`, `PHMADH`, `PMSUBH`,
-`PHMSBH`, `PMULTH`, `PDIVBW`, `PMADDUW`, `PMULTUW` and `PDIVUW`. Those are a
-separate piece of work: they accumulate into the 128-bit HI/LO pair and carry
-the R5900's own division quirks. The unaligned group is done, and so are `LQ`
+complete, and MMI2 and MMI3 are complete apart from most of their
+multiply-accumulate half** — `PMADDW`, `PMSUBW`, `PDIVW`, `PMADDH`, `PHMADH`, `PMSUBH`, `PHMSBH`,
+`PMULTH`, `PDIVBW`, `PMADDUW` and `PDIVUW`; `PMULTW` and `PMULTUW` are done.
+
+Two reasons the rest is a separate piece of work, and the second is the
+interesting one. The **divides** need two 32-bit dividers sequenced the way the
+scalar `DIV` already is, which is machinery rather than semantics. The
+**accumulating forms carry hardware quirks nobody has explained**: PCSX2's
+`PMADDW` adds `0x70000000` under a condition its own comment calls "PlayStation
+2 division voodoo, for some reason only the lower half is affected", and divides
+by `0xFFFFFFFF` rather than shifting by 32 because "multiplication error on the
+PS2 causes this not to be exactly >> 32 (off by 1)". That is an emulator's model
+of an undocumented silicon bug, and no manual here describes it. Implementing it
+would mean copying behaviour nobody can derive, which is exactly the kind of
+claim this project tags rather than absorbs — so it waits for either a source
+that explains it or a console to measure. The unaligned group is done, and so are `LQ`
 and `SQ`.
 
 Timing, three placement directives per variant, against a 294.912 MHz target:

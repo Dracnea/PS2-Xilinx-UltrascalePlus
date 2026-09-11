@@ -1078,6 +1078,49 @@ MHz is about fourteen per cent more.
 bring the Graphics Synthesizer up on a card at — the console's clock is what
 full-speed emulation needs, not what proving the hardware works needs.
 
+## On a card — 2026-09-11
+
+`boards/c1100_gs.py` is the first board target for either of the two large
+blocks. It builds, and it **meets timing**: WNS +0.008 ns, zero failing
+endpoints of 91888, at 125 MHz on the C1100.
+
+| | |
+|---|---|
+| CLB LUTs | 26782 (3.07 %) |
+| CLB registers | 28562 (1.64 %) |
+| **UltraRAM** | **128 (20.00 %)** |
+| Block RAM | 27 tiles (PCIe and the CSR fabric) |
+| DSPs | 96 (1.61 %) |
+
+The whole image — the GS, a PCIe endpoint, the HBM controller that exists only
+to drive `hbm_cattrip`, and the CSR fabric — is three per cent of the part. The
+UltraRAM figure is the GS's 4 MB and nothing else's.
+
+**The GS runs in the sys clock domain at 125 MHz.** It closes at 129.1 MHz out
+of context, so it needs no clock of its own, and a design that does not cross a
+clock boundary cannot fail at one — which is worth having on a first bring-up.
+A real GS runs at 147.456 MHz and this does not; that is a performance question
+and nothing here is timed against a video output yet.
+
+The shape is the IOP's: a stream in and a window out. GIF packets arrive a
+quadword at a time through four CSR words and a push, which is slow and is the
+right trade, because it needs no DMA engine to be correct before the thing being
+tested can be tested at all. Local memory reads back through a second window one
+256-bit word at a time, which is what lets the host compute the very checksum
+`gs_ref.py` prints — so the comparison on the card is the comparison in
+simulation, against the same reference, with the same tooling.
+
+`tools/gs/gsrun.py` is that comparison: it feeds a stream, then diffs the
+register file, the pixel count and local memory against `sim/gs/gs_ref.py`.
+
+> **NOTE (unverified):** none of this has been on the card. The bitstream is
+> built and meets timing; that is all. The first run should be treated as
+> testing this target rather than testing the GS — a wrong CSR decode or a
+> handshake that never completes will look exactly like a rasteriser that draws
+> nothing.
+> *Verify by:* loading it and running `tools/gs/gsrun.py` with a stream the
+> simulation already agrees on, starting with one sprite.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture — and step 5, PCRTC.

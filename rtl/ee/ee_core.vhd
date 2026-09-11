@@ -655,6 +655,35 @@ architecture arch of ee_core is
       return r;
    end function;
 
+   -- PMULTW and PMULTUW: two 32x32 products, into rd, LO and HI at once.
+   -- Words 0 and 2 of each operand multiply into doublewords 0 and 1; the low
+   -- word of each product goes to LO and the high word to HI, each
+   -- sign-extended from 32 bits, while rd gets the products whole.  Three
+   -- 128-bit destinations from one instruction, which is what the wide HI/LO
+   -- write exists for.
+   procedure pmultw(signed_form : boolean;
+                    a, b : in  std_logic_vector(127 downto 0);
+                    rdv, lov, hiv : out std_logic_vector(127 downto 0)) is
+      variable p : signed(63 downto 0);
+   begin
+      for n in 0 to 1 loop
+         if signed_form then
+            p := signed(a(64*n+31 downto 64*n)) * signed(b(64*n+31 downto 64*n));
+         else
+            -- 32 x 32 already gives 64 bits.  Resizing the operands to 64
+            -- first makes a 128-bit product, and assigning that to a 64-bit
+            -- signal is a length mismatch that xvhdl does not flag and xsim
+            -- answers with zeros -- which looked exactly like an instruction
+            -- that had not been decoded.
+            p := signed(unsigned(a(64*n+31 downto 64*n))
+                        * unsigned(b(64*n+31 downto 64*n)));
+         end if;
+         rdv(64*n+63 downto 64*n) := std_logic_vector(p);
+         lov(64*n+63 downto 64*n) := sext32(std_logic_vector(p(31 downto 0)));
+         hiv(64*n+63 downto 64*n) := sext32(std_logic_vector(p(63 downto 32)));
+      end loop;
+   end procedure;
+
    function reads_rs(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
       variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
@@ -782,6 +811,7 @@ begin
       variable par_v                  : std_logic_vector(127 downto 0);
       variable par_ok                 : boolean;
       variable pv                     : std_logic_vector(127 downto 0);
+      variable plo, phi               : std_logic_vector(127 downto 0);
       variable par_alu_on             : boolean;
       variable par_o                  : par_op_t;
       variable par_w                  : natural range 8 to 32;
@@ -1355,6 +1385,12 @@ begin
                         when 16#0E# =>                       -- PCPYLD
                            ex_val   := b128(63 downto 0);
                            ex_valhi := a128(63 downto 0);
+                        when 16#0C# =>                       -- PMULTW
+                           pmultw(true, a128, b128, pv, plo, phi);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
+                           ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
+                           ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
                         when 16#02# =>                       -- PSLLVW
                            pv := pshiftv('l', a128, b128);
                            ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
@@ -1394,6 +1430,12 @@ begin
                         when 16#0E# =>                       -- PCPYUD
                            ex_val   := a128(127 downto 64);
                            ex_valhi := b128(127 downto 64);
+                        when 16#0C# =>                       -- PMULTUW
+                           pmultw(false, a128, b128, pv, plo, phi);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
+                           ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
+                           ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
                         when 16#03# =>                       -- PSRAVW
                            pv := pshiftv('a', a128, b128);
                            ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);

@@ -283,6 +283,32 @@ def permute(tbl, w, a128, b128):
     return _join([(la if src == "S" else lb)[i] for src, i in tbl], w)
 
 
+def pmultw(signed_form, a128, b128):
+    """PMULTW and PMULTUW: two 32x32 products into the 128-bit HI, LO and rd.
+
+    Words 0 and 2 of each operand multiply into doublewords 0 and 1 of the
+    result, and the halves of the product go to LO and HI *sign-extended from
+    32 bits* -- so LO holds the low word of each product and HI the high word,
+    each widened to sixty-four bits, while rd gets the products whole.
+
+    Returns (rd, lo, hi) as 128-bit values.  These are the first instructions
+    here that write three 128-bit destinations at once, which is why HI and LO
+    being one 128-bit pair rather than two independent halves matters.
+    """
+    rd = lo = hi = 0
+    for n in range(2):
+        x = (a128 >> (64 * n)) & M32
+        y = (b128 >> (64 * n)) & M32
+        if signed_form:
+            p = (s32(x) * s32(y)) & ((1 << 64) - 1)
+        else:
+            p = (x * y) & ((1 << 64) - 1)
+        rd |= p << (64 * n)
+        lo |= (sext32(p & M32) & M64) << (64 * n)
+        hi |= (sext32((p >> 32) & M32) & M64) << (64 * n)
+    return rd, lo, hi
+
+
 def pshiftv(kind, a128, b128):
     """PSLLVW, PSRLVW and PSRAVW.
 
@@ -568,6 +594,11 @@ class R5900:
                 elif sa == 0x13: self.w128(rd, a128 ^ b128)             # PXOR
                 elif sa == 0x0E:                                        # PCPYLD
                     self.w128(rd, ((a128 & M64) << 64) | (b128 & M64))
+                elif sa == 0x0C:                                        # PMULTW
+                    v, l, h = pmultw(True, a128, b128)
+                    self.w128(rd, v)
+                    self.lo, self.lo1 = l & M64, l >> 64
+                    self.hi, self.hi1 = h & M64, h >> 64
                 elif sa == 0x02: self.w128(rd, pshiftv("sll", a128, b128))
                 elif sa == 0x03: self.w128(rd, pshiftv("srl", a128, b128))
                 # HI and LO are 128 bits on the R5900, which is what the second
@@ -587,6 +618,11 @@ class R5900:
                 elif sa == 0x13: self.w128(rd, ~(a128 | b128) & M128)   # PNOR
                 elif sa == 0x0E:                                        # PCPYUD
                     self.w128(rd, ((b128 >> 64) << 64) | (a128 >> 64))
+                elif sa == 0x0C:                                        # PMULTUW
+                    v, l, h = pmultw(False, a128, b128)
+                    self.w128(rd, v)
+                    self.lo, self.lo1 = l & M64, l >> 64
+                    self.hi, self.hi1 = h & M64, h >> 64
                 elif sa == 0x03: self.w128(rd, pshiftv("sra", a128, b128))
                 elif sa == 0x08:                                        # PMTHI
                     self.hi, self.hi1 = a128 & M64, a128 >> 64

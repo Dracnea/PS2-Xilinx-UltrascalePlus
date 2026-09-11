@@ -40,8 +40,8 @@ MMI1_SHUF = [0x04, 0x12, 0x16, 0x1A]          # QFSRV is swept separately
 # shifts want them because a shift amount taken from the wrong word is a lane
 # error too.  PMFHI, PMFLO, PMTHI and PMTLO are swept separately, because they
 # are the only instructions here that touch HI and LO whole.
-MMI2_PERM = [0x02, 0x03, 0x0A, 0x1A, 0x1B, 0x1E, 0x1F]
-MMI3_PERM = [0x03, 0x0A, 0x1A, 0x1B, 0x1E]
+MMI2_PERM = [0x02, 0x03, 0x0A, 0x1A, 0x1B, 0x1E, 0x1F, 0x0C]
+MMI3_PERM = [0x03, 0x0A, 0x1A, 0x1B, 0x1E, 0x0C]
 
 # Every byte distinct, and the two registers distinguishable from each other, so
 # that a lane taken from the wrong operand or the wrong position is visible.
