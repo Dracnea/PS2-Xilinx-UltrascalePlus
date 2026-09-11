@@ -909,6 +909,47 @@ With that, all five depth mutations tried are caught — the clamp reverted to a
 mask, the depth block xor switched off, PSMZ16S given the plain block order, the
 half taken from the wrong address bit, and the half ignored on read.
 
+## The GS wired to its own memory — 2026-09-11
+
+`gs_gif` and `gs_lmem` had never been connected. Their ports were shaped for
+each other from the start — `gs_gif`'s own comment says "shaped for `gs_lmem`" —
+and each was verified against a testbench that modelled the other: `tb_gs.sv`
+models a memory with two clocks of latency because that is what the UltraRAM
+output registers give, and `sim/mem/tb_mem.sv` exercises the memory with no
+rasteriser in sight. Two halves proven separately and never joined.
+
+`rtl/gs/gs_top.vhd` joins them. The only thing in it that is not wiring is a
+read arbiter: `gs_lmem` has one read port and two customers — the rasteriser,
+which reads for the read-modify-write that FBMSK, blending and the depth test
+all need, and the host, which reads a finished buffer back. The rasteriser wins
+whenever it asks, because it is inside a half-drawn pixel and the host is not.
+Returning the data to the right customer is the part that needs care: a read
+takes two clocks and `rd_valid` does not say whose read it was, so ownership
+travels beside the request in a two-stage shift register. Handing the rasteriser
+the host's data mid-blend would look like a blender bug, not an arbiter bug.
+
+### One difference between the model and the memory, and it does not bite
+
+`tb_gs.sv` forwards a write to a read at the same address in the same cycle, and
+says so — it calls it a modelling artifact. **`gs_lmem` does not forward.** Its
+write is a VHDL signal assignment, so it lands at the end of the process and a
+read in that cycle sees the old contents. Eight 32-bit pixels share a 256-bit
+word, so consecutive pixels of a scanline *are* the same address, and whether
+the rasteriser ever reads a word in the cycle it writes one is not obvious from
+either side.
+
+Running the identical streams through both answers it: **11 of 11 pass against
+the real memory**, including the directed 16-bit program, which is the
+blending-heaviest thing in the suite and therefore the most likely to care. So
+the rasteriser never does read a word in the cycle it writes it — which is now a
+measured fact rather than an assumption, and the reason the model's forwarding
+was harmless.
+
+`sim/gs/run_top_diff.sh` runs any stream the ordinary differential takes, against
+`gs_top` instead of against the model, and reads the whole of local memory back
+through the host port to produce the same checksum. That read path is also the
+only thing exercising the arbiter.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture — and step 5, PCRTC.
