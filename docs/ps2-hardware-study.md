@@ -247,9 +247,67 @@ invisible at all. So the PS2's clock tree should come from **one VCO** with
 integer output dividers, the way `_IOPClocks` already derives the IOP's 1x, 2x
 and 3x — not from a per-block MMCM chosen for each block's convenience.
 
-Exactness, if it is ever wanted, is a board change rather than a logic one: an
-18.432 MHz (or 147.456 MHz) oscillator feeding the fabric makes every ratio
-exact. Worth knowing; not worth doing before the blocks close at their rates.
+### The oscillator can be synthesised, and better than the real one — 2026-09-11
+
+No oscillator needs adding to the card. Two cascaded MMCMs reach **0.90 ppm**
+with mathematically exact ratios, which is a *more accurate* clock than the
+console being copied.
+
+A search of the entire legal MMCM parameter space confirms there is no exact
+solution from 100 MHz for any of 18.432, 36.864, 147.456 or 294.912 — as the
+`5^5` predicts. The best a **single** MMCM can do while keeping the ratios exact
+is 295.000 / 147.500 / 36.875, which is 298 ppm fast and is what `_IOPClocks`
+settled for.
+
+Two do far better, by splitting the job:
+
+* **Stage 1 makes the 18.432 MHz base**, using the fractional output divider
+  that only `CLKOUT0` has: `DIVCLK 3`, `MULT 44.375`, `CLKOUT0 80.25`, from a
+  VCO of 1479.1667 MHz. That lands on 18.431983 MHz — **0.90 ppm** fast.
+* **Stage 2 multiplies that base by 64** to a VCO of 1179.647 MHz and divides by
+  4, 8 and 32. Those are integers, so EE : GS : IOP is 16 : 8 : 2 *exactly*, by
+  construction rather than by approximation.
+
+| clock | native | synthesised | error |
+|---|---|---|---|
+| EE | 294.912 | 294.911734 | 0.90 ppm |
+| GS | 147.456 | 147.455867 | 0.90 ppm |
+| IOP | 36.864 | 36.863967 | 0.90 ppm |
+
+A real PS2 crystal is typically 30 to 100 ppm, so the whole machine would be
+running about 0.9 ppm fast on a clock tree more stable than the original's.
+`boards/ps2_clocks.py` is the module; running it as a script prints the
+arithmetic without needing a toolchain.
+
+The error being **shared** is the part that matters. A uniform 0.9 ppm is a
+console running 0.9 ppm fast, which nothing can observe. Two blocks with
+different offsets would break the integer relationships between them, and that
+would be observable immediately.
+
+### What "fast enough" means here, which is not what it means in an emulator
+
+An emulator runs as fast as it can and throttles to wall-clock, so "faster than
+native" is useful and a limiter is needed. **A rebuild has no limiter and needs
+none.** The clock *is* the rate: an EE clocked at 294.912 MHz runs at exactly
+PlayStation 2 speed because every cycle does what a cycle of the real chip does.
+
+What the fabric must do is *close timing* at that rate — Fmax ≥ native. Fmax is
+the fastest the placed and routed design can be clocked; the design is then
+clocked at native and no faster. Headroom above native buys margin for
+temperature, voltage and process, and nothing else. Running the fabric faster
+and gating it with clock enables would be strictly worse: 147.456 is not an
+integer fraction of any convenient faster clock, so the enables would land
+unevenly and the effective clock would jitter, breaking the cycle relationships
+that a replication exists to preserve.
+
+So the remaining work is not "get faster so we can throttle", it is "close
+timing at the console's own rate":
+
+| block | needs | has | gap |
+|---|---|---|---|
+| GS | 147.456 | 129.1 | 12 % |
+| EE | 294.912 | 192.7 | 35 % |
+
 
 So a **cycle-accurate EE at native rate is the blocker**, exactly as the
 retro-cores note said. The options are (a) a half-rate EE (games run at half
