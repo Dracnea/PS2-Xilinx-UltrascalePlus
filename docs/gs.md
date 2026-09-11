@@ -699,8 +699,78 @@ suite would stay green only because the failing case had been removed from it.
 `gs_edge_dda.vhd` stands on its own and is unaffected — it is verified against
 the reference independently, which is precisely why it survives the revert.
 
+## The depth buffer was addressed as if it were colour — 2026-09-11
+
+The Z buffer work committed the day before used the same address function as
+the frame buffer. It should not have: **the depth formats use the same block
+table with the block address exclusive-ored by 24.**
+
+Two independent sources say so and agree exactly.
+
+* The GS User's Manual draws the block configuration for every format (8.3.1,
+  8.3.2). The PSMZ32 figure is the PSMCT32 figure with every entry xor 24 —
+  `0 1 4 5 16 17 20 21` becomes `24 25 28 29 8 9 12 13` — and PSMZ16 and
+  PSMZ16S stand in the same relation to PSMCT16 and PSMCT16S.
+* PCSX2 states it as a constructor argument rather than as a table:
+  `swizzle32Z {swizzleTables32, 0x18}` against `swizzle32 {swizzleTables32,
+  0x00}`, and likewise `swizzle16Z` and `swizzle16SZ`.
+
+PCSX2 applies the xor to the final block number where this model applies it to
+the index within the page. The two agree because `ZBUF.ZBP` counts pages, so
+the base is always a multiple of 32 blocks and the xor cannot carry into it.
+
+**Why the differential suite could not see it.** The reference and the RTL were
+wrong in exactly the same way, so nineteen passing runs — including the ones
+that deliberately overlapped the Z buffer with the frame buffer — agreed with
+each other about the wrong address. This is the limit of differential testing
+against one's own second implementation, and it is worth naming: a shared
+misreading of the source is invisible to it by construction. What found it was
+reading the manual's block figures while adding the 16-bit formats.
+
+**What it would have cost.** `hw/ps2probe/gsprobe.c` reads the Z buffer back
+through the Local→Host path, which addresses memory as PSMCT32. On a console
+the depth was written with the xor and is read back without it, so the readback
+is permuted in blocks of 8x8 pixels; this model would have returned it
+unpermuted. The first console run would have produced a scrambled Z image, and
+the obvious suspect would have been the one thing already flagged as unverified
+— the depth bias — which is in a different part of the pipeline entirely.
+
+The fix is one xor in each implementation, and it is now checked mechanically
+rather than by assertion: `tools/gs/xcheck_swizzle.py` reads the xor out of
+PCSX2's header, compares it with `gs_ref.BLK_Z`, checks every pixel of a page
+against the composed table, and checks the property that makes it matter —
+that no pixel addresses the same word as colour and as depth.
+
+## The 16-bit formats: addressing — 2026-09-11
+
+Step 2 of the order above, for PSMCT16, PSMCT16S, PSMZ16 and PSMZ16S. Only the
+addressing; the pixel path is not written yet.
+
+A 16-bit page is 64 x 64 pixels, a block 16 x 8, a column 16 x 2, and two
+pixels share a 32-bit word. Three things change and one does not, and the one
+that does not is the part worth stating: **the word within a block is the same
+interleave as PSMCT32's**, `column32(y & 7, x & 7)`. A column holds sixteen
+words either way, and the extra eight pixels of width go into the *upper half*
+of those same words rather than into more of them. So the only genuinely new
+arithmetic is which block — two tables, since PSMCT16 and PSMCT16S differ in
+block order — and which half, which is address bit 3 of x.
+
+`addr16p()` returns the word and the half separately rather than a half-word
+address, because every caller needs both and folding them would push the split
+onto each call site.
+
+*Checked exhaustively.* `tools/gs/xcheck_swizzle.py` now compares both block
+tables and the column table against PCSX2 entry by entry, then walks all 4096
+pixels of a page in all four 16-bit formats against the composed tables, and
+confirms no two pixels collide. PCSX2's `columnTable16` tabulates *pixel*
+indices within a block rather than word indices, which is the one place these
+can be misread; the tool compares `word * 2 + half` against it.
+
 ## What is not started
 
-The rest of step 4 — triangles (flat, then Gouraud, then textured), lines and
-points — and step 5, PCRTC. Local-to-host and local-to-local transfers, and
-pixel formats other than PSMCT32.
+The rest of step 4 — lines and points, and texture — and step 5, PCRTC.
+Local-to-host and local-to-local transfers. The 16-bit **pixel path**: the
+addressing above is done and verified, but nothing yet packs RGBA5551, masks a
+16-bit half within a word, blends in 16 bits, or transfers in PSMCT16, so
+PSMCT32 and PSMCT24 remain the only formats that can be drawn to. Dither waits
+on that, since it needs a 16-bit format to act on.

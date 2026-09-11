@@ -295,13 +295,25 @@ architecture arch of gs_gif is
       end if;
    end function;
 
+   -- The five bits after the page are the block index within it, and the six
+   -- after that the word within the block.  The depth formats use the same
+   -- tables with the block index exclusive-ored by 24 -- bits 3 and 4, which
+   -- are y(4) and x(5) here.  The GS User's Manual gives the PSMZ32 and PSMZ16
+   -- block figures as their colour figures with every entry xor 24, and PCSX2
+   -- says the same thing as `swizzle32Z {swizzleTables32, 0x18}`.
+   --
+   -- Getting this wrong is invisible in a differential test, because the
+   -- reference and the RTL are wrong together: it shows up only against silicon
+   -- or wherever a Z buffer shares memory with something addressed as colour --
+   -- which is exactly what reading the Z buffer back through Local->Host does.
    function pix_addr_page(pg : unsigned(8 downto 0); bw : unsigned(5 downto 0);
-                          x, y : unsigned(10 downto 0)) return unsigned is
+                          x, y : unsigned(10 downto 0);
+                          zblk : std_logic := '0') return unsigned is
       variable page : unsigned(8 downto 0);
    begin
       page := resize(pg + resize(y(10 downto 5) * bw, 9)
                      + resize(x(10 downto 6), 9), 9);
-      return page & x(5) & y(4) & x(4) & y(3) & x(3)
+      return page & (x(5) xor zblk) & (y(4) xor zblk) & x(4) & y(3) & x(3)
                   & y(2) & y(1) & x(2) & x(1) & y(0) & x(0);
    end function;
 
@@ -1038,7 +1050,7 @@ begin
                      -- after the colour would still produce the right picture
                      -- most of the time and the wrong one wherever FBMSK or the
                      -- blender touches a pixel that should not have survived.
-                     za   := pix_addr_page(dr_zbp, dr_fbw, dr_x, dr_y);
+                     za   := pix_addr_page(dr_zbp, dr_fbw, dr_x, dr_y, '1');
                      lane := to_integer(za(2 downto 0));
                      dr_zaddr <= za;
                      if dr_ztst = "00" then

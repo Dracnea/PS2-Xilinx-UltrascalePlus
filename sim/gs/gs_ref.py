@@ -164,23 +164,80 @@ def column32(y, x):
     return ((x & 1)) | ((y & 1) << 1) | ((x & 6) << 1) | ((y & 6) << 3)
 
 
-def addr32p(pagebase, bw, x, y):
+# The Z formats use the *same* block table as their colour counterparts with
+# the block address exclusive-ored by 24.  This is not a detail: it is the
+# difference between a depth buffer that lands where silicon puts it and one
+# that is permuted in blocks of 8x8 pixels.  Both the GS User's Manual (8.3.1,
+# 8.3.2 -- the PSMZ32 and PSMZ16 figures are their colour figures with every
+# entry xor 24) and PCSX2 say so, the latter as `swizzle32Z {swizzleTables32,
+# 0x18}` against `swizzle32 {swizzleTables32, 0x00}`.
+#
+# PCSX2 applies the xor to the *final* block number rather than to the index
+# within the page.  The two agree here because ZBUF's ZBP counts pages, so the
+# base is always a multiple of 32 blocks and the xor cannot carry into it.
+BLK_Z = 24
+
+
+def addr32p(pagebase, bw, x, y, blkxor=0):
     """Word address of pixel (x, y), from a base given in *pages*.
 
     The two register fields that point at a buffer do not agree on units --
     BITBLTBUF's DBP counts 256-byte blocks and FRAME's FBP counts 8 KB pages --
     so the conversion belongs at the two call sites rather than inside here,
     where a single "bp" argument would silently mean different things.
+
+    `blkxor` is BLK_Z for the depth formats and 0 for the colour ones.
     """
     page = pagebase + (y >> 5) * bw + (x >> 6)
     return (page * PAGE_WORDS
-            + block32((y >> 3) & 3, (x >> 3) & 7) * BLOCK_WORDS
+            + (block32((y >> 3) & 3, (x >> 3) & 7) ^ blkxor) * BLOCK_WORDS
             + column32(y & 7, x & 7))
 
 
 def addr32(bp, bw, x, y):
     """The same, from a BITBLTBUF-style pointer in 256-byte blocks."""
     return addr32p(bp >> 5, bw, x, y)
+
+
+# ---- the 16-bit formats ----------------------------------------------------
+#
+# A 16-bit page is 64 x 64 pixels, a block 16 x 8, a column 16 x 2, and two
+# pixels share a 32-bit word.  Three things change from PSMCT32 and one does
+# not, which is the part worth stating: **the word within a block is the same
+# interleave**, column32(y & 7, x & 7), because a column holds sixteen words
+# either way and the extra eight pixels of width go into the *upper half* of
+# those same words rather than into more of them.  So the only new arithmetic
+# is which block, and which half.
+#
+# PSMCT16 and PSMCT16S differ only in the order blocks are laid out in a page;
+# the manual draws both (8.3.2) and PCSX2 stores both.  The S form exists so
+# that a 16-bit buffer and a 32-bit one can share a page boundary usefully.
+
+def block16(by, bx):
+    """Block index within a page for PSMCT16/PSMZ16, blocks being 16x8 pixels."""
+    return ((by & 1)) | ((bx & 1) << 1) | ((by & 2) << 1) | \
+           ((bx & 2) << 2) | ((by & 4) << 2)
+
+
+def block16s(by, bx):
+    """The same for PSMCT16S/PSMZ16S, which permutes the middle bits."""
+    return ((by & 1)) | ((bx & 1) << 1) | ((by & 4)) | \
+           ((by & 2) << 2) | ((bx & 2) << 3)
+
+
+def addr16p(pagebase, bw, x, y, sform=False, blkxor=0):
+    """(word address, which 16-bit half) of pixel (x, y), base in *pages*.
+
+    The half is returned rather than folded into the address because every
+    caller needs both: the word is what local memory is addressed by, and the
+    half is which sixteen bits of it the pixel occupies.  A function that
+    returned a half-word address would push that split onto every call site.
+    """
+    page = pagebase + (y >> 6) * bw + (x >> 6)
+    blk = (block16s(( y >> 3) & 7, (x >> 4) & 3) if sform
+           else block16((y >> 3) & 7, (x >> 4) & 3)) ^ blkxor
+    return (page * PAGE_WORDS + blk * BLOCK_WORDS + column32(y & 7, x & 7),
+            (x >> 3) & 1)
 
 
 # ---- GIF -------------------------------------------------------------------
@@ -335,7 +392,7 @@ class GS:
             return True
         if zs["ztst"] == 0:                         # NEVER: nothing survives
             return False
-        a = addr32p(zs["zbp"], zs["fbw"], x, y)
+        a = addr32p(zs["zbp"], zs["fbw"], x, y, BLK_Z)
         if a >= VM_WORDS:
             return False
         m = zs["mask"]
