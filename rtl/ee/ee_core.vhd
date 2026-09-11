@@ -247,6 +247,12 @@ architecture arch of ee_core is
    signal m_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
    signal m_hi_we   : std_logic := '0';
    signal m_sa_we   : std_logic := '0';
+   -- PMTHI and PMTLO write HI or LO whole, and HI on the R5900 is 128 bits
+   -- -- which is exactly the pair this core already keeps as hi and hi1.
+   -- Every other writer touches one half, chosen by p1, so the wide write
+   -- is a flag beside the existing path rather than a change to it.
+   signal m_wide    : std_logic := '0';
+   signal m_hiu, m_lou : std_logic_vector(63 downto 0) := (others => '0');
    signal m_sa      : std_logic_vector(3 downto 0) := (others => '0');
    signal m_lo_we   : std_logic := '0';
    signal m_hi      : std_logic_vector(63 downto 0) := (others => '0');
@@ -294,6 +300,8 @@ architecture arch of ee_core is
    signal w_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
    signal w_hi_we   : std_logic := '0';
    signal w_sa_we   : std_logic := '0';
+   signal w_wide    : std_logic := '0';
+   signal w_hiu, w_lou : std_logic_vector(63 downto 0) := (others => '0');
    signal w_sa      : std_logic_vector(3 downto 0) := (others => '0');
    signal w_lo_we   : std_logic := '0';
    signal w_hi      : std_logic_vector(63 downto 0) := (others => '0');
@@ -589,6 +597,64 @@ architecture arch of ee_core is
       return r;
    end function;
 
+   -- ---- MMI2 and MMI3: the permutes ---------------------------------------
+   -- Pure lane selections, so they are one function driven by a table rather
+   -- than nine hand-written sets of assignments.  't' picks a lane of rt and
+   -- 's' a lane of rs; the tables read lowest lane first, as the manual and
+   -- PCSX2's MMI.cpp both list them.
+   type perm_sel_t is array (natural range <>) of integer;
+   type perm_src_t is array (natural range <>) of character;
+
+   function perm_h(srcs : perm_src_t; sel : perm_sel_t;
+                   a, b : std_logic_vector(127 downto 0))
+      return std_logic_vector is
+      variable r : std_logic_vector(127 downto 0);
+   begin
+      for i in 0 to 7 loop
+         if srcs(i) = 's' then
+            r(16*i+15 downto 16*i) := a(16*sel(i)+15 downto 16*sel(i));
+         else
+            r(16*i+15 downto 16*i) := b(16*sel(i)+15 downto 16*sel(i));
+         end if;
+      end loop;
+      return r;
+   end function;
+
+   function perm_w(sel : perm_sel_t; b : std_logic_vector(127 downto 0))
+      return std_logic_vector is
+      variable r : std_logic_vector(127 downto 0);
+   begin
+      for i in 0 to 3 loop
+         r(32*i+31 downto 32*i) := b(32*sel(i)+31 downto 32*sel(i));
+      end loop;
+      return r;
+   end function;
+
+   -- PSLLVW, PSRLVW and PSRAVW: words 0 and 2 of rt, shifted by the low five
+   -- bits of the matching word of rs, each sign-extended to a doubleword.  A
+   -- 128-bit register in and out, but only half the lanes read and the widths
+   -- different on each side, which is why these are not part of the parallel
+   -- ALU's table.
+   function pshiftv(kind : character; a, b : std_logic_vector(127 downto 0))
+      return std_logic_vector is
+      variable r  : std_logic_vector(127 downto 0);
+      variable v  : unsigned(31 downto 0);
+      variable sh : natural range 0 to 31;
+      variable q  : unsigned(31 downto 0);
+   begin
+      for n in 0 to 1 loop
+         v  := unsigned(b(64*n+31 downto 64*n));
+         sh := to_integer(unsigned(a(64*n+4 downto 64*n)));
+         case kind is
+            when 'l'    => q := shift_left(v, sh);
+            when 'r'    => q := shift_right(v, sh);
+            when others => q := unsigned(shift_right(signed(v), sh));
+         end case;
+         r(64*n+63 downto 64*n) := sext32(std_logic_vector(q));
+      end loop;
+      return r;
+   end function;
+
    function reads_rs(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
       variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
@@ -715,11 +781,14 @@ begin
       variable ex_w128                : std_logic;
       variable par_v                  : std_logic_vector(127 downto 0);
       variable par_ok                 : boolean;
+      variable pv                     : std_logic_vector(127 downto 0);
       variable par_alu_on             : boolean;
       variable par_o                  : par_op_t;
       variable par_w                  : natural range 8 to 32;
       variable ex_hi_we, ex_lo_we     : std_logic;
       variable ex_sa_we               : std_logic;
+      variable ex_wide                : std_logic;
+      variable ex_hiu, ex_lou         : std_logic_vector(63 downto 0);
       variable ex_sa                  : std_logic_vector(3 downto 0);
       variable ex_hi, ex_lo           : std_logic_vector(63 downto 0);
       variable ex_ismem, ex_isload    : std_logic;
@@ -914,19 +983,23 @@ begin
             if w_valid = '1' then
                if w_sa_we = '1' then sa_f := w_sa; end if;
                if w_hi_we = '1' then
-                  if w_p1 = '1' then hi1_f := w_hi; else hi_f := w_hi; end if;
+                  if w_wide = '1' then hi_f := w_hi; hi1_f := w_hiu;
+                  elsif w_p1 = '1' then hi1_f := w_hi; else hi_f := w_hi; end if;
                end if;
                if w_lo_we = '1' then
-                  if w_p1 = '1' then lo1_f := w_lo; else lo_f := w_lo; end if;
+                  if w_wide = '1' then lo_f := w_lo; lo1_f := w_lou;
+                  elsif w_p1 = '1' then lo1_f := w_lo; else lo_f := w_lo; end if;
                end if;
             end if;
             if m_valid = '1' then
                if m_sa_we = '1' then sa_f := m_sa; end if;
                if m_hi_we = '1' then
-                  if m_p1 = '1' then hi1_f := m_hi; else hi_f := m_hi; end if;
+                  if m_wide = '1' then hi_f := m_hi; hi1_f := m_hiu;
+                  elsif m_p1 = '1' then hi1_f := m_hi; else hi_f := m_hi; end if;
                end if;
                if m_lo_we = '1' then
-                  if m_p1 = '1' then lo1_f := m_lo; else lo_f := m_lo; end if;
+                  if m_wide = '1' then lo_f := m_lo; lo1_f := m_lou;
+                  elsif m_p1 = '1' then lo1_f := m_lo; else lo_f := m_lo; end if;
                end if;
             end if;
             -- MFC0 reads a register MTC0 may have written two instructions
@@ -954,6 +1027,9 @@ begin
             ex_valhi  := (others => '0');
             ex_hi_we  := '0';
             ex_sa_we  := '0';
+            ex_wide   := '0';
+            ex_hiu    := (others => '0');
+            ex_lou    := (others => '0');
             ex_sa     := (others => '0');
             ex_lo_we  := '0';
             ex_hi     := (others => '0');
@@ -1279,6 +1355,31 @@ begin
                         when 16#0E# =>                       -- PCPYLD
                            ex_val   := b128(63 downto 0);
                            ex_valhi := a128(63 downto 0);
+                        when 16#02# =>                       -- PSLLVW
+                           pv := pshiftv('l', a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#03# =>                       -- PSRLVW
+                           pv := pshiftv('r', a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#08# =>                       -- PMFHI
+                           ex_val := hi_f; ex_valhi := hi1_f;
+                        when 16#09# =>                       -- PMFLO
+                           ex_val := lo_f; ex_valhi := lo1_f;
+                        when 16#0A# =>                       -- PINTH
+                           pv := perm_h("tstststs", (0,4,1,5,2,6,3,7), a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#1A# =>                       -- PEXEH
+                           pv := perm_h("tttttttt", (2,1,0,3,6,5,4,7), a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#1B# =>                       -- PREVH
+                           pv := perm_h("tttttttt", (3,2,1,0,7,6,5,4), a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#1E# =>                       -- PEXEW
+                           pv := perm_w((2,1,0,3), b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#1F# =>                       -- PROT3W
+                           pv := perm_w((1,2,0,3), b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
                         when others =>
                            ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                      end case;
@@ -1293,6 +1394,29 @@ begin
                         when 16#0E# =>                       -- PCPYUD
                            ex_val   := a128(127 downto 64);
                            ex_valhi := b128(127 downto 64);
+                        when 16#03# =>                       -- PSRAVW
+                           pv := pshiftv('a', a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#08# =>                       -- PMTHI
+                           ex_we := '0'; ex_w128 := '0';
+                           ex_hi_we := '1'; ex_wide := '1';
+                           ex_hi := a128(63 downto 0); ex_hiu := a128(127 downto 64);
+                        when 16#09# =>                       -- PMTLO
+                           ex_we := '0'; ex_w128 := '0';
+                           ex_lo_we := '1'; ex_wide := '1';
+                           ex_lo := a128(63 downto 0); ex_lou := a128(127 downto 64);
+                        when 16#0A# =>                       -- PINTEH
+                           pv := perm_h("tstststs", (0,0,2,2,4,4,6,6), a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#1A# =>                       -- PEXCH
+                           pv := perm_h("tttttttt", (0,2,1,3,4,6,5,7), a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#1B# =>                       -- PCPYH
+                           pv := perm_h("tttttttt", (0,0,0,0,4,4,4,4), a128, b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                        when 16#1E# =>                       -- PEXCW
+                           pv := perm_w((0,2,1,3), b128);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
                         when others =>
                            ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                      end case;
@@ -1545,10 +1669,16 @@ begin
                end if;
                if w_sa_we = '1' then sa_reg <= w_sa; end if;
                if w_hi_we = '1' then
-                  if w_p1 = '1' then hi1 <= w_hi; else hi <= w_hi; end if;
+                  if w_wide = '1' then
+                     hi <= w_hi; hi1 <= w_hiu;
+                  elsif w_p1 = '1' then hi1 <= w_hi;
+                  else hi <= w_hi; end if;
                end if;
                if w_lo_we = '1' then
-                  if w_p1 = '1' then lo1 <= w_lo; else lo <= w_lo; end if;
+                  if w_wide = '1' then
+                     lo <= w_lo; lo1 <= w_lou;
+                  elsif w_p1 = '1' then lo1 <= w_lo;
+                  else lo <= w_lo; end if;
                end if;
                if w_c0_we = '1' then
                   cop0(w_c0_idx) <= w_c0_val;
@@ -1575,6 +1705,9 @@ begin
                w_hi_we  <= m_hi_we;
                w_lo_we  <= m_lo_we;
                w_sa_we  <= m_sa_we;
+               w_wide   <= m_wide;
+               w_hiu    <= m_hiu;
+               w_lou    <= m_lou;
                w_sa     <= m_sa;
                w_hi     <= m_hi;
                w_lo     <= m_lo;
@@ -1698,6 +1831,9 @@ begin
                   m_hi_we  <= ex_hi_we;
                   m_lo_we  <= ex_lo_we;
                   m_sa_we  <= ex_sa_we;
+                  m_wide   <= ex_wide;
+                  m_hiu    <= ex_hiu;
+                  m_lou    <= ex_lou;
                   m_sa     <= ex_sa;
                   m_hi     <= ex_hi;
                   m_lo     <= ex_lo;

@@ -1039,11 +1039,44 @@ remaining work looks like: reaching the console's 147.456 MHz is not one more
 fix, it is a sustained pass over the setup path, and the honest estimate is
 several more cuts.
 
-**None of that blocks a board target.** 121.5 MHz is a perfectly good clock to
+### The sprite setup, and the end of the setup work — 2026-09-11
+
+The last of the setup paths, and the largest gain of the three. Everything from
+the arriving quadword to `dr_empty` happened on one edge: the register file
+read, the vertex minus `XYOFFSET`, the divide by sixteen, the swap that orders
+the corners, four clamps against the scissor, and the test for whether anything
+survived. Thirty logic levels with ten carry chains.
+
+It is three cycles now — the coordinates, then the clamps, then the test. A
+sprite covers hundreds of pixels, so two extra cycles per primitive is not a cost
+worth measuring, which is the general reason the *setup* paths are the right ones
+to cut and the pixel loop is not.
+
+**121.5 → 129.1 MHz.** One thing had to be fixed alongside it and is worth
+naming: `gif_ready` is a function of the state, and the two new states were not
+in its list, so the GIF went on accepting quadwords while a sprite was being set
+up. Every stream failed immediately, which is the good kind of failure — a
+handshake that stays ready during a new state is otherwise the sort of thing
+that shows up much later as one dropped primitive.
+
+**The setup work is done**, and the measurement says so rather than a judgement
+call: the critical path has left the setup entirely and returned to the write
+path — `dr_addr` to `wr_data`, twenty-three levels — which is the per-pixel side
+again.
+
+| | Fmax |
+|---|---|
+| as first fitted | 110.8 |
+| pixel path cut | 117.3 |
+| seed numerator split | 121.5 |
+| **sprite setup split** | **129.1** |
+
+Sixteen per cent over four cuts, and the remaining gap to the console's 147.456
+MHz is about fourteen per cent more.
+
+**None of this blocks a board target.** 129.1 MHz is a perfectly good clock to
 bring the Graphics Synthesizer up on a card at — the console's clock is what
-full-speed emulation needs, not what proving the hardware works needs. The
-divider is no longer the limit, which was the thing worth fixing before the
-design left simulation.
+full-speed emulation needs, not what proving the hardware works needs.
 
 ## What is not started
 

@@ -242,6 +242,68 @@ def qfsrv(a128, b128, sa):
     return ((b128 | (a128 << 128)) >> (8 * sa)) & M128
 
 
+# ---- MMI2 and MMI3: the permutes, the variable shifts and the HI/LO moves ---
+#
+# The permutes are pure lane selections, so they are written as tables of
+# (which register, which lane) rather than as nine hand-written expressions.
+# Reading them back out of PCSX2's MMI.cpp one assignment at a time is exactly
+# the sort of transcription that goes wrong silently, and a table can at least
+# be looked at and counted.
+#
+# 'T' is rt and 'S' is rs.  Halfword tables have eight entries and word tables
+# four, lowest lane first.
+
+PERM_H = {
+    # MMI2
+    "PINTH":  [("T", 0), ("S", 4), ("T", 1), ("S", 5),
+               ("T", 2), ("S", 6), ("T", 3), ("S", 7)],
+    "PEXEH":  [("T", 2), ("T", 1), ("T", 0), ("T", 3),
+               ("T", 6), ("T", 5), ("T", 4), ("T", 7)],
+    "PREVH":  [("T", 3), ("T", 2), ("T", 1), ("T", 0),
+               ("T", 7), ("T", 6), ("T", 5), ("T", 4)],
+    # MMI3
+    "PINTEH": [("T", 0), ("S", 0), ("T", 2), ("S", 2),
+               ("T", 4), ("S", 4), ("T", 6), ("S", 6)],
+    "PEXCH":  [("T", 0), ("T", 2), ("T", 1), ("T", 3),
+               ("T", 4), ("T", 6), ("T", 5), ("T", 7)],
+    "PCPYH":  [("T", 0), ("T", 0), ("T", 0), ("T", 0),
+               ("T", 4), ("T", 4), ("T", 4), ("T", 4)],
+}
+
+PERM_W = {
+    "PEXEW":  [("T", 2), ("T", 1), ("T", 0), ("T", 3)],
+    "PROT3W": [("T", 1), ("T", 2), ("T", 0), ("T", 3)],
+    "PEXCW":  [("T", 0), ("T", 2), ("T", 1), ("T", 3)],
+}
+
+
+def permute(tbl, w, a128, b128):
+    """Select lanes of width w from rs (a128, 'S') and rt (b128, 'T')."""
+    la, lb = _lanes(a128, w), _lanes(b128, w)
+    return _join([(la if src == "S" else lb)[i] for src, i in tbl], w)
+
+
+def pshiftv(kind, a128, b128):
+    """PSLLVW, PSRLVW and PSRAVW.
+
+    These are the odd ones of the group: they read words 0 and 2 of rt, shift
+    each by the low five bits of the matching word of rs, and write the results
+    *sign-extended to sixty-four bits* into doublewords 0 and 1.  So a 128-bit
+    register goes in and a 128-bit register comes out, but only half the lanes
+    are read and the widths on each side differ -- which is why they cannot join
+    the parallel ALU's table.
+    """
+    out = 0
+    for n in range(2):
+        v = (b128 >> (64 * n)) & M32              # rt word 0, then word 2
+        sh = ((a128 >> (64 * n)) & M32) & 0x1F
+        if kind == "sll":   r = (v << sh) & M32
+        elif kind == "srl": r = (v & M32) >> sh
+        else:               r = (s32(v) >> sh) & M32
+        out |= (sext32(r) & M64) << (64 * n)
+    return out
+
+
 # sa -> the shuffle operation, for the two tables that carry them.
 MMI0_SHUF = {0x12: ("pextl", 32), 0x13: ("ppac", 32),
              0x16: ("pextl", 16), 0x17: ("ppac", 16),
@@ -499,11 +561,25 @@ class R5900:
             # field, not in fn, which is why they cannot share the dispatch
             # above.
             a128, b128 = self.r128(rs), self.r128(rt)
+            hilo = (self.hi1 << 64) | (self.hi & M64)
+            lolo = (self.lo1 << 64) | (self.lo & M64)
             if fn == 0x09:                              # MMI2
                 if   sa == 0x12: self.w128(rd, a128 & b128)             # PAND
                 elif sa == 0x13: self.w128(rd, a128 ^ b128)             # PXOR
                 elif sa == 0x0E:                                        # PCPYLD
                     self.w128(rd, ((a128 & M64) << 64) | (b128 & M64))
+                elif sa == 0x02: self.w128(rd, pshiftv("sll", a128, b128))
+                elif sa == 0x03: self.w128(rd, pshiftv("srl", a128, b128))
+                # HI and LO are 128 bits on the R5900, which is what the second
+                # pair this model already keeps *is*: HI = hi1:hi.  These four
+                # are the only instructions that see them whole.
+                elif sa == 0x08: self.w128(rd, hilo)                    # PMFHI
+                elif sa == 0x09: self.w128(rd, lolo)                    # PMFLO
+                elif sa == 0x0A: self.w128(rd, permute(PERM_H["PINTH"], 16, a128, b128))
+                elif sa == 0x1A: self.w128(rd, permute(PERM_H["PEXEH"], 16, a128, b128))
+                elif sa == 0x1B: self.w128(rd, permute(PERM_H["PREVH"], 16, a128, b128))
+                elif sa == 0x1E: self.w128(rd, permute(PERM_W["PEXEW"], 32, a128, b128))
+                elif sa == 0x1F: self.w128(rd, permute(PERM_W["PROT3W"], 32, a128, b128))
                 else:
                     self.traps.append(("unimplemented MMI2 sa %d" % sa, self.pc - 4))
             else:                                       # MMI3
@@ -511,6 +587,15 @@ class R5900:
                 elif sa == 0x13: self.w128(rd, ~(a128 | b128) & M128)   # PNOR
                 elif sa == 0x0E:                                        # PCPYUD
                     self.w128(rd, ((b128 >> 64) << 64) | (a128 >> 64))
+                elif sa == 0x03: self.w128(rd, pshiftv("sra", a128, b128))
+                elif sa == 0x08:                                        # PMTHI
+                    self.hi, self.hi1 = a128 & M64, a128 >> 64
+                elif sa == 0x09:                                        # PMTLO
+                    self.lo, self.lo1 = a128 & M64, a128 >> 64
+                elif sa == 0x0A: self.w128(rd, permute(PERM_H["PINTEH"], 16, a128, b128))
+                elif sa == 0x1A: self.w128(rd, permute(PERM_H["PEXCH"], 16, a128, b128))
+                elif sa == 0x1B: self.w128(rd, permute(PERM_H["PCPYH"], 16, a128, b128))
+                elif sa == 0x1E: self.w128(rd, permute(PERM_W["PEXCW"], 32, a128, b128))
                 else:
                     self.traps.append(("unimplemented MMI3 sa %d" % sa, self.pc - 4))
         elif op == 28:                                  # MMI

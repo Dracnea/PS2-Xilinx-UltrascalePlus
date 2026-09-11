@@ -1270,17 +1270,48 @@ That is the useful half of the result. The EE's clock problem remains entirely a
 problem about MMI and the forwarding loop, and attaching real memory did not add
 to it.
 
+## MMI2 and MMI3: the permutes, the variable shifts, and HI/LO whole — 2026-09-11
+
+Three groups, leaving only the multiply-accumulate half of those two tables.
+
+**The permutes** — `PINTH`, `PINTEH`, `PEXEH`, `PEXCH`, `PREVH`, `PCPYH`,
+`PEXEW`, `PEXCW`, `PROT3W` — are pure lane selections, so they are one function
+driven by a table rather than nine sets of hand-written assignments. Reading
+nine of these out of someone else's source one assignment at a time is exactly
+the transcription that goes wrong silently, and a table can at least be counted.
+
+**The variable shifts** — `PSLLVW`, `PSRLVW`, `PSRAVW` — are the odd ones. They
+read words 0 and 2 of `rt`, shift each by the low five bits of the matching word
+of `rs`, and write the results *sign-extended to sixty-four bits* into
+doublewords 0 and 1. A 128-bit register in and out, but only half the lanes read
+and different widths on each side, which is why they cannot join the parallel
+ALU's table.
+
+**`PMFHI`, `PMFLO`, `PMTHI` and `PMTLO` see HI and LO whole**, and HI on the
+R5900 is 128 bits — which is exactly the second pair this core already keeps.
+`HI` is `hi1:hi`. Every other writer touches one half, chosen by `p1`, so the
+wide write is a flag beside the existing path rather than a change to it, and
+the forwarding network learned the same distinction.
+
+*Checked by eight mutations, all caught:* `PCPYH` broadcasting one halfword
+instead of two, `PREVH` reversing all eight instead of within halves, `PSRAVW`
+shifting logically, `PMTHI` writing only the low half, `PMFHI` reading LO,
+`PINTH` taking the wrong half of `rs`, `PEXCW` leaving the words alone, and the
+shifts taking their amount from the wrong word. The directed program sweeps
+`PMTHI`/`PMFHI` with both halves distinct and follows them with a `MULT1`, since
+a wide write and the second HI/LO pair are exactly the two things that could be
+crossed.
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
 and the VUs. The integer subset is not complete: no TLB. **MMI0 and MMI1 are
-complete.** What remains of MMI is the rest of MMI2 and MMI3 — the
-multiply-accumulate forms (`PMADD*`, `PMSUB*`, `PHMADH`), `PMULTW`/`PDIVW`, the
-shifts and rotates (`PSLLVW`, `PSRLVW`, `PSRAVW`, `PROT3W`), and the remaining
-interleaves (`PINTH`, `PCPYH`, `PEXEH`, `PEXEW`, `PREVH`, `PMFHI`, `PMFLO`) —
-of which only `PAND`, `PXOR`, `PCPYLD`, `POR`, `PNOR` and `PCPYUD` exist. The
-unaligned group — `LWL`, `LWR`, `SWL`, `SWR`, `LDL`, `LDR`, `SDL`, `SDR` — is
-done, and so are `LQ` and `SQ`.
+complete, and MMI2 and MMI3 are complete apart from their multiply-accumulate
+half** — `PMADDW`, `PMSUBW`, `PMULTW`, `PDIVW`, `PMADDH`, `PHMADH`, `PMSUBH`,
+`PHMSBH`, `PMULTH`, `PDIVBW`, `PMADDUW`, `PMULTUW` and `PDIVUW`. Those are a
+separate piece of work: they accumulate into the 128-bit HI/LO pair and carry
+the R5900's own division quirks. The unaligned group is done, and so are `LQ`
+and `SQ`.
 
 Timing, three placement directives per variant, against a 294.912 MHz target:
 

@@ -77,6 +77,7 @@ architecture arch of gs_gif is
    signal pixels  : unsigned(31 downto 0) := (others => '0');
 
    type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
+                    S_SPR_CLAMP, S_SPR_TEST,
                     S_DRAW, S_DRAWRD,
                     S_TRI_SET, S_TRI_WAIT, S_TRI_SCAN, S_TRI_STEP,
                     S_TRI_SEED, S_ZRD);
@@ -145,6 +146,23 @@ architecture arch of gs_gif is
    signal t_z : sv32_a := (others => (others => '0'));
    signal dr_x, dr_y : unsigned(10 downto 0) := (others => '0');
    signal dr_x0      : unsigned(10 downto 0) := (others => '0');
+
+   -- A sprite's bounds, held between the three cycles that now compute them.
+   --
+   -- Everything from the arriving quadword to dr_empty used to happen on one
+   -- edge: the register file read, the vertex minus XYOFFSET, the divide by
+   -- sixteen, the swap that puts the corners in order, four clamps against the
+   -- scissor, and the test for whether anything survived.  Thirty logic levels
+   -- with ten carry chains, and after the pixel path and the seed numerator
+   -- were cut it was the longest path in the Graphics Synthesizer.
+   --
+   -- It is now three: the coordinates, then the clamps, then the test.  A
+   -- sprite covers hundreds of pixels, so two extra cycles per primitive is not
+   -- a cost worth measuring -- which is the general reason the *setup* paths are
+   -- the right ones to cut and the pixel loop is not.
+   signal k_ax, k_ay, k_bx, k_by     : integer range -131072 to 131071 := 0;
+   signal k_sx0, k_sx1, k_sy0, k_sy1 : integer range 0 to 2047 := 0;
+   signal k_ok  : std_logic := '0';
    signal dr_x1      : unsigned(10 downto 0) := (others => '0');
    signal dr_y1      : unsigned(10 downto 0) := (others => '0');
    signal dr_rgba    : std_logic_vector(31 downto 0) := (others => '0');
@@ -519,6 +537,7 @@ begin
    -- stops to do some work, which is the one case that matters.
    gif_ready <= '0' when reset = '1' else
                 '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
+                         or state = S_SPR_CLAMP or state = S_SPR_TEST
                          or state = S_TRI_SET or state = S_TRI_WAIT
                          or state = S_TRI_SCAN or state = S_TRI_STEP
                          or state = S_TRI_SEED or state = S_ZRD
@@ -811,15 +830,19 @@ begin
                         by := (to_integer(unsigned(w_data(31 downto 16))) - ofy) / 16;
                         if ax > bx then t := ax; ax := bx; bx := t; end if;
                         if ay > by then t := ay; ay := by; by := t; end if;
-                        sx0 := to_integer(unsigned(reg(16#40# + ctxi)(10 downto 0)));
-                        sx1 := to_integer(unsigned(reg(16#40# + ctxi)(26 downto 16)));
-                        sy0 := to_integer(unsigned(reg(16#40# + ctxi)(42 downto 32)));
-                        sy1 := to_integer(unsigned(reg(16#40# + ctxi)(58 downto 48)));
-                        if ax < sx0 then ax := sx0; end if;
-                        if ay < sy0 then ay := sy0; end if;
-                        bx := bx - 1;  by := by - 1;
-                        if bx > sx1 then bx := sx1; end if;
-                        if by > sy1 then by := sy1; end if;
+                        -- the corners and the scissor, held for the clamp that
+                        -- now happens on the next edge
+                        k_ax  <= ax;      k_ay  <= ay;
+                        k_bx  <= bx - 1;  k_by  <= by - 1;
+                        k_sx0 <= to_integer(unsigned(reg(16#40# + ctxi)(10 downto 0)));
+                        k_sx1 <= to_integer(unsigned(reg(16#40# + ctxi)(26 downto 16)));
+                        k_sy0 <= to_integer(unsigned(reg(16#40# + ctxi)(42 downto 32)));
+                        k_sy1 <= to_integer(unsigned(reg(16#40# + ctxi)(58 downto 48)));
+                        if fb_drawable(reg(16#4C# + ctxi)(29 downto 24)) then
+                           k_ok <= '1';
+                        else
+                           k_ok <= '0';
+                        end if;
 
                         dr_fbp   <= unsigned(reg(16#4C# + ctxi)(8 downto 0));
                         dr_fbw   <= unsigned(reg(16#4C# + ctxi)(21 downto 16));
@@ -850,22 +873,10 @@ begin
                         -- an integer: there is no DDA behind it at all
                         dr_z     <= w_data(63 downto 32);
                         dr_zdone <= '0';
-                        dr_x0    <= to_unsigned(ax, 11);
-                        dr_x     <= to_unsigned(ax, 11);
-                        dr_x1    <= to_unsigned(bx, 11);
-                        dr_y     <= to_unsigned(ay, 11);
-                        dr_y1    <= to_unsigned(by, 11);
-                        if ax > bx or ay > by or ax < 0 or ay < 0
-                           or not fb_drawable(reg(16#4C# + ctxi)(29 downto 24)) then
-                           dr_empty <= '1';       -- nothing to draw, or a format
-                                                  -- this rasteriser cannot write
-                        else
-                           dr_empty <= '0';
-                        end if;
                         v_cnt  <= (others => '0');
                         dr_ret <= S_PACKED;
                         if last then dr_ret <= S_TAG; end if;
-                        state  <= S_DRAW;
+                        state  <= S_SPR_CLAMP;
                      elsif tkick then
                         ctxi := 0;
                         if reg(0)(9) = '1' then ctxi := 1; end if;
@@ -1175,6 +1186,32 @@ begin
                         state <= S_DRAW;
                      end if;
                   end if;
+
+               -- Clamp the sprite's corners against the scissor.  Four
+               -- comparisons on registers, and nothing else on the edge.
+               when S_SPR_CLAMP =>
+                  if k_ax < k_sx0 then k_ax <= k_sx0; end if;
+                  if k_ay < k_sy0 then k_ay <= k_sy0; end if;
+                  if k_bx > k_sx1 then k_bx <= k_sx1; end if;
+                  if k_by > k_sy1 then k_by <= k_sy1; end if;
+                  state <= S_SPR_TEST;
+
+               -- Did anything survive?  The test is on the clamped corners, so
+               -- it has to wait for them.
+               when S_SPR_TEST =>
+                  dr_x0 <= to_unsigned(k_ax, 11);
+                  dr_x  <= to_unsigned(k_ax, 11);
+                  dr_x1 <= to_unsigned(k_bx, 11);
+                  dr_y  <= to_unsigned(k_ay, 11);
+                  dr_y1 <= to_unsigned(k_by, 11);
+                  if k_ax > k_bx or k_ay > k_by or k_ax < 0 or k_ay < 0
+                     or k_ok = '0' then
+                     dr_empty <= '1';      -- nothing to draw, or a format this
+                                           -- rasteriser cannot write
+                  else
+                     dr_empty <= '0';
+                  end if;
+                  state <= S_DRAW;
 
                when S_DRAW =>
                   if dr_empty = '1' or dr_y > dr_y1 then

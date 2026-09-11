@@ -30,6 +30,12 @@ SCRATCH = 0x2000          # well past any generated program
 # The defined sub-opcodes of MMI0 and MMI1, which live in the sa field.  These
 # mirror sim/ee/r5900_ref.py's tables; the encodings are cross-checked against
 # PCSX2's tbl_MMI0 and tbl_MMI1.
+# MMI2 and MMI3: the logical and copy forms, the variable shifts, the 128-bit
+# HI/LO moves and the permutes.  The multiply-accumulate half of both tables is
+# not implemented and is not listed.
+MMI2_SA = [0x12, 0x13, 0x0E, 0x02, 0x03, 0x08, 0x09, 0x0A, 0x1A, 0x1B, 0x1E, 0x1F]
+MMI3_SA = [0x12, 0x13, 0x0E, 0x03, 0x08, 0x09, 0x0A, 0x1A, 0x1B, 0x1E]
+
 MMI0_SA = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
            0x10, 0x11, 0x14, 0x15, 0x18, 0x19,
            # the pack, extend and shuffle half
@@ -96,9 +102,11 @@ def emit(rng, kind, branches):
         # matter most -- they are what moves data into the upper half in the
         # first place, so without them every other MMI operation would only
         # ever see zeroes up there.
-        fn = 0x09 if rng.randrange(2) else 0x29
+        if rng.randrange(2):
+            return ((28 << 26) | (rs << 21) | (rt << 16) | (rd << 11)
+                    | (rng.choice(MMI2_SA) << 6) | 0x09)
         return ((28 << 26) | (rs << 21) | (rt << 16) | (rd << 11)
-                | (rng.choice([0x12, 0x13, 0x0E]) << 6) | fn)
+                | (rng.choice(MMI3_SA) << 6) | 0x29)
 
     if kind == "mmi_par":
         # MMI0 and MMI1: the parallel ALU, over 4 x 32, 8 x 16 or 16 x 8 lanes.

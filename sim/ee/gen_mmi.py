@@ -35,6 +35,14 @@ MMI1_SA = [0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x0A,
 MMI0_SHUF = [0x12, 0x13, 0x16, 0x17, 0x1A, 0x1B, 0x1E, 0x1F]
 MMI1_SHUF = [0x04, 0x12, 0x16, 0x1A]          # QFSRV is swept separately
 
+# MMI2 and MMI3's permutes and variable shifts.  The permutes want the same
+# lane-distinct operands the MMI0/MMI1 shuffles do, for the same reason; the
+# shifts want them because a shift amount taken from the wrong word is a lane
+# error too.  PMFHI, PMFLO, PMTHI and PMTLO are swept separately, because they
+# are the only instructions here that touch HI and LO whole.
+MMI2_PERM = [0x02, 0x03, 0x0A, 0x1A, 0x1B, 0x1E, 0x1F]
+MMI3_PERM = [0x03, 0x0A, 0x1A, 0x1B, 0x1E]
+
 # Every byte distinct, and the two registers distinguishable from each other, so
 # that a lane taken from the wrong operand or the wrong position is visible.
 SHUF_A = (0x0F0E0D0C0B0A0908, 0x0706050403020100)
@@ -129,6 +137,39 @@ def main():
                 o += [or_(3, 6, 0)]
                 o += [mmi(fn, sa, 3, 5, 4)]
                 o += [or_(10, 3, 0)]
+
+    # ---- MMI2 and MMI3: permutes and variable shifts --------------------
+    for (ahi, alo), (bhi, blo) in ((SHUF_A, SHUF_B), (SHUF_C, SHUF_D)):
+        o += load128(4, ahi, alo)
+        o += load128(5, bhi, blo)
+        o += load128(6, 0xA5A5A5A5A5A5A5A5, 0x5A5A5A5A5A5A5A5A)
+        for fn, tbl in ((0x09, MMI2_PERM), (0x29, MMI3_PERM)):
+            for sa in tbl:
+                o += [or_(3, 6, 0)]
+                o += [mmi(fn, sa, 3, 4, 5)]
+                o += [or_(17, 3, 0)]
+                o += [or_(3, 6, 0)]
+                o += [mmi(fn, sa, 3, 5, 4)]
+                o += [or_(18, 3, 0)]
+
+    # ---- HI and LO, whole ----------------------------------------------
+    # PMTHI and PMTLO write all 128 bits of a register that every other
+    # instruction here touches one half of at a time, and PMFHI and PMFLO read
+    # it back.  Writing one and reading the other is what would catch the two
+    # being crossed; writing a value with both halves distinct is what would
+    # catch only one half moving.
+    for (hhi, hlo) in ((SHUF_A[0], SHUF_B[1]), (0xFFFFFFFFFFFFFFFF, 0), (0, 0xFFFFFFFFFFFFFFFF)):
+        o += load128(4, hhi, hlo)
+        o += [mmi(0x29, 0x08, 0, 4, 0)]        # PMTHI rs=r4
+        o += [mmi(0x09, 0x08, 19, 0, 0)]       # PMFHI rd=r19
+        o += [mmi(0x09, 0x09, 20, 0, 0)]       # PMFLO rd=r20 -- must be untouched
+        o += [mmi(0x29, 0x09, 0, 4, 0)]        # PMTLO rs=r4
+        o += [mmi(0x09, 0x09, 21, 0, 0)]       # PMFLO rd=r21
+        o += [mmi(0x09, 0x08, 22, 0, 0)]       # PMFHI rd=r22 -- still the same
+        # and a pipeline-1 multiply after them, to check the second HI/LO pair
+        # and the wide write have not been crossed
+        o += [(28 << 26) | (4 << 21) | (5 << 16) | 24]     # MULT1 rs=r4, rt=r5
+        o += [mmi(0x09, 0x08, 23, 0, 0)]       # PMFHI rd=r23
 
     # ---- QFSRV, at every shift amount ----------------------------------
     # SA counts bytes, so there are exactly sixteen answers and all of them are
