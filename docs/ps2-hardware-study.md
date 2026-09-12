@@ -221,14 +221,19 @@ depends on.
 | block | native | measured | short by |
 |---|---|---|---|
 | EE (`ee_top`, core + cache) | 294.912 MHz | 203.9 (mean, three directives) | **31 %** |
-| GS (`gs_top`) | 147.456 MHz | **152.5** (mean, three directives; worst 151.1) | **met** |
+| GS (`gs_top`) | 147.456 MHz | **runs on the card at 147.456** | **met** |
 | IOP | 36.864 MHz | runs on the card | met |
 
-**The GS meets its native clock as of 2026-09-12.** Six cuts took it from 110.8
-to 152.5 MHz, every one of them a *setup* path split into more cycles and
-none of them touching the pixel loop — see [gs.md](gs.md). What that does not
-mean is that it has been *run* at 147.456: the board target still builds at 125
-MHz and moving it onto the two-stage MMCM below is a separate step.
+**The GS runs at its native clock on the card as of 2026-09-12**: 14 of 14
+streams agreeing by full 4 MB checksum, a byte-identical picture, and the clock
+itself measured at +2 ppm. Six cuts took it from 110.8 MHz to 152.5 mean over
+three directives, every one of them a *setup* path split into more cycles and
+none of them touching the pixel loop — see [gs.md](gs.md).
+
+What that does **not** mean is that the GS is finished. It draws one pixel per
+clock against the console's sixteen, so its fill rate is a sixteenth of the real
+thing and no amount of clock accuracy changes that. The clock question is closed;
+the throughput question is open and is the larger of the two.
 
 The EE is the remaining blocker, exactly as this section has said since it was
 written. It is closer than the table used to show, but only because a

@@ -1469,6 +1469,29 @@ number. An UltraScale+ MMCME4 multiplies by up to 128, and the answer was inside
 the difference. The tree is now 294.912 / 147.456 / 36.864 at 0 ppm with integer
 feedback multipliers in both stages.
 
+### It runs at 147.456 MHz — 2026-09-12
+
+With the GS in `cd_gs` and the CSR interface crossing the boundary:
+
+* **14 of 14 streams pass**, each compared by a full 4 MB FNV-1a checksum of
+  local memory against `sim/gs/gs_ref.py` — the first-light stream, the 16-bit
+  directed case, and twelve random GIF streams of forty tags each.
+* **The picture is byte-identical.** The scene renders on the card, comes back
+  over PCIe, and the PNG file matches the model's byte for byte.
+
+Nothing about the Graphics Synthesizer's behaviour changed when its clock did,
+which is the expected answer and is worth having measured rather than assumed:
+the block is synchronous and its correctness should not depend on the rate, but
+"should not" is what the previous two sessions would have said about the clock
+tree as well.
+
+**What this does and does not establish.** The GS now runs at the rate the
+specification names, and the clock it runs at is exact. It is still one pixel
+per clock against the console's sixteen, so the *fill rate* is a sixteenth of a
+real GS and no amount of clock accuracy changes that; and there is still no
+PCRTC video path, no texture unit, and no lines or points. The clock question is
+closed. The throughput question is not, and it is the larger of the two.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture. PCRTC's sync generator, and
