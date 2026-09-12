@@ -1170,9 +1170,22 @@ path was the colour DDA's seed: a vertex coordinate, through the subtraction
 attacked, so the obvious fix was the same one — register the difference, spend a
 cycle, start the multiply from a value instead of a carry chain.
 
-**It cost twenty megahertz.** 152.6 → 132.3 on the Default directive, with the
-control re-fitted in the same session to the same WNS it gave before, so this is
-a measurement and not a placement. Reverted.
+**It cost fifteen megahertz**, over three placement directives:
+
+| | Default | Explore | ExtraNetDelay | mean | spread |
+|---|---|---|---|---|---|
+| control | 152.6 | 153.8 | 151.1 | **152.5** | 2.7 |
+| difference registered | 132.3 | 130.8 | 148.0 | **137.0** | 17.2 |
+
+Reverted. Two things make this a measurement rather than a placement: the
+control was re-fitted in the same session and reproduced all three of its
+earlier numbers to the picosecond, and every directive of the change is worse
+than every directive of the control.
+
+The spread is the other half of the result and is worth as much as the mean. The
+control varies by 2.7 MHz across placements and the change by 17.2 — so this did
+not merely make the design slower, it made it *harder to place*, which is what a
+netlist with more fabric logic and less of it inside hard blocks looks like.
 
 The mechanism is worth more than the attempt was. The DSP48 has a **pre-adder**,
 and the tool was already using it: `nx · (16·sx − x0)` was mapping with the
