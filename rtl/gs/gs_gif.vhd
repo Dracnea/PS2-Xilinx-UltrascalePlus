@@ -554,6 +554,17 @@ begin
       variable vdet                        : signed(47 downto 0);
       variable za                          : unsigned(19 downto 0);
 
+      -- How many pixels the current step retires.  One, except on the wide
+      -- write path below, where a whole memory word's worth of a span goes out
+      -- at once.  A variable and not a signal, because next_px is called at the
+      -- bottom of this same process and has to see what the case statement
+      -- above it decided.
+      variable px_run                      : integer range 1 to 4;
+      variable nrun                        : integer range 1 to 4;
+      variable wbe                         : unsigned(31 downto 0);
+      variable ai                          : unsigned(19 downto 0);
+      variable wide                        : boolean;
+
       -- Retiring a pixel: the same three lines whichever way the pixel ended,
       -- so they live in one place and are reached from one condition.  px_step
       -- decides *whether*, this decides *what*, and because px_step is
@@ -562,7 +573,10 @@ begin
       procedure next_px is
       begin
          dr_zdone <= '0';
-         if dr_x = dr_x1 then
+         -- resize before adding: dr_x + px_run can reach 2048, which wraps an
+         -- eleven-bit unsigned to zero and would read as "not the end of the
+         -- scanline" on the very last pixel of the widest possible span.
+         if resize(dr_x, 12) + px_run > resize(dr_x1, 12) then
             -- end of a scanline: a sprite goes back to the same left edge, a
             -- triangle asks its edges for the next
             if tri_mode = '1' then
@@ -580,7 +594,7 @@ begin
                state <= S_DRAW;
             end if;
          else
-            dr_x  <= dr_x + 1;
+            dr_x  <= dr_x + px_run;
             state <= S_DRAW;
          end if;
       end procedure;
@@ -629,6 +643,7 @@ begin
          wr_en     <= '0';
          rd_en     <= '0';
          e_step    <= '0';
+         px_run    := 1;      -- one pixel a step, unless the wide path says more
 
          if reset = '1' then
             state    <= S_TAG;
@@ -1286,6 +1301,9 @@ begin
                      end if;
                      lane := to_integer(wa(2 downto 0));
                      if dr_fbmsk = x"00000000" and dr_abe = '0' then
+                        -- the wide path needs a flat primitive and no depth
+                        -- write interleaved with the colour one
+                        wide := tri_mode = '0' and dr_fb16 = '0' and dr_zon = '0';
                         -- nothing to preserve, so no read is needed: the common
                         -- case stays one pixel per clock.  At 16 bits the byte
                         -- enables protect the *other* pixel sharing the word,
@@ -1298,12 +1316,54 @@ begin
                            wr_be   <= std_logic_vector(shift_left(
                                          resize(unsigned'("11"), 32),
                                          4 * lane + 2 * half));
-                        else
+                        elsif not wide then
                            wr_data <= spread32(src_rgba);
                            wr_be   <= std_logic_vector(shift_left(
                                          resize(unsigned'(x"F"), 32), 4 * lane));
+                        else
+                           -- ---- the wide write ------------------------------
+                           --
+                           -- A 256-bit memory word holds a 4 x 2 block of
+                           -- PSMCT32 pixels, so four consecutive pixels of a
+                           -- span share one word -- and writing them one at a
+                           -- time spends four cycles where one would do.  The
+                           -- byte enables already select which lanes are
+                           -- written and the colour is already replicated into
+                           -- all of them, so the only new work is deciding how
+                           -- far the run reaches and or-ing four enables
+                           -- together.
+                           --
+                           -- The run stops at whichever comes first: the end of
+                           -- the memory word, or the end of the span.  Both
+                           -- matter -- the first because the next word is a
+                           -- different address, the second because a span is
+                           -- not a multiple of four and drawing past its right
+                           -- edge would be a scissor violation that no test
+                           -- with a 64-wide sprite would ever notice.
+                           --
+                           -- Sprites only, for now.  A triangle steps its
+                           -- colour and depth interpolators once per pixel, and
+                           -- they have no interface for advancing four at a
+                           -- time; a sprite's colour is constant across the
+                           -- span, so there is nothing to step.
+                           nrun := 4 - to_integer(dr_x(1 downto 0));
+                           if resize(dr_x, 13) + nrun > resize(dr_x1, 13) then
+                              nrun := to_integer(dr_x1 - dr_x) + 1;
+                           end if;
+                           wbe := (others => '0');
+                           for i in 0 to 3 loop
+                              if i < nrun then
+                                 ai := pix_addr_page(dr_fbp, dr_fbw,
+                                                     dr_x + i, dr_y);
+                                 wbe := wbe or shift_left(resize(unsigned'(x"F"), 32),
+                                                          4 * to_integer(ai(2 downto 0)));
+                              end if;
+                           end loop;
+                           wr_data <= spread32(src_rgba);
+                           wr_be   <= std_logic_vector(wbe);
+                           px_run  := nrun;
                         end if;
-                        pixels  <= pixels + 1;
+                        pixels  <= pixels + px_run;
                      else
                         rd_en   <= '1';
                         rd_addr <= std_logic_vector(wa(19 downto 3));
