@@ -1492,6 +1492,70 @@ real GS and no amount of clock accuracy changes that; and there is still no
 PCRTC video path, no texture unit, and no lines or points. The clock question is
 closed. The throughput question is not, and it is the larger of the two.
 
+## Fill rate: measured, then quadrupled — 2026-09-12
+
+"One pixel per clock" was an intention. `tools/gs/gsfill.py` makes it a
+measurement: it reads the pixel counter and the GS-domain clock counter around
+a single sprite, sweeps the sprite's size, and takes the slope, so the PCIe
+round trip in the window subtracts out and what is left is the fill rate.
+
+| | before | after | a real GS |
+|---|---|---|---|
+| plain | 1.00 clk/px, 147.8 Mpixel/s | **0.25 clk/px, 596.2 Mpixel/s** | 2360 |
+| alpha blended | 4.00 clk/px, 36.9 Mpixel/s | **1.25 clk/px, 118.1 Mpixel/s** | 2360 |
+| depth-tested | 2.00 clk/px, 73.8 Mpixel/s | 2.00 clk/px, 73.7 Mpixel/s | — |
+
+Against a 640 × 448 screen at 60 Hz, that is **34.7 full-screen passes per frame
+plain and 6.9 blended**, up from 8.6 and 2.1. All fourteen streams still agree
+by full 4 MB checksum and the picture is still byte-identical to the model.
+
+### Why blending was the number that mattered
+
+A real GS blends at full rate, because it has sixteen pixel pipelines and the
+bandwidth to feed them. This rasteriser was taking *four* clocks for a blended
+pixel against one for a plain one, so its deficit on blending was not sixteen
+times but sixty-four — and blending is not an edge case in PS2 software, it is
+most of what a frame is made of. That is why the read-modify-write came before
+the pipeline width.
+
+### Four pixels, because that is what a memory word holds
+
+A 256-bit word is a 4 × 2 block of PSMCT32 pixels, so four consecutive pixels of
+a span share one word. The byte enables already name the lanes and the colour
+was already replicated into all of them, so a plain write of four costs exactly
+what a write of one did. The read-modify-write shares one memory round trip
+between four blends.
+
+Sprites only. A triangle steps its colour and depth interpolators once per pixel
+and they have no interface for advancing four; a sprite's colour is constant
+across its span, so there is nothing to step. Widening the interpolators is what
+would lift the restriction, and it is a larger piece of work than this was.
+
+### It did not fit in one cycle, and the fix cost a quarter of the gain
+
+Four blenders, a mask and a lane-place in the same clock as the memory's answer
+missed 147.456 MHz by **0.36 ns** in context. Explore placement with physical
+optimisation at both stages brought that to 0.14 and no further, which is what
+said the logic was too deep rather than badly placed. Blending and writing are
+separate cycles now: five clocks per four pixels instead of four, +0.020 ns, met.
+
+Two things about that are worth keeping. **The critical path was never the new
+blender** — it was the depth DDA's seed multiply, tipped over by congestion;
+this design uses three per cent of the part, so what makes the GS marginal in
+context is being placed around the PCIe and HBM hard blocks, not area. And the
+first attempt to raise the implementation effort returned a WNS *identical to
+the digit*, because those directives are arguments to the toolchain's `build()`
+rather than attributes of it: setting them on the object raises nothing and is
+silently overwritten by the defaults.
+
+### What is still sixteen times short
+
+The pixel loop. Plain fill is now a quarter of a clock per pixel because four
+pixels share a memory word, but a real GS does sixteen per clock *and* blends
+and depth-tests at the same rate. The next steps are the depth path, which is
+still one pixel at a time, and the interpolators, which are what keeps triangles
+out of all of this.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture. PCRTC's sync generator, and
