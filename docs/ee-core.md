@@ -1553,25 +1553,22 @@ first guess was the divides that had just gone in.
 
 ## What is not started
 
-Hazards and pipelining — the core is still one instruction at a time. The FPU
-and the VUs. The integer subset is not complete: no TLB. **MMI0 and MMI1 are
-complete, and MMI2 and MMI3 are complete apart from two instructions** —
-`PMADDW` and `PMSUBW`, which wait for a console. Everything else in both tables
-is done: the halfword multiply-accumulate group, `PMADDUW`, and all five
-multiplies and divides.
+This section had drifted and said the opposite of the page above it — that the
+core "is still one instruction at a time", written before it was pipelined and
+never revisited. It is a five-stage single-issue pipeline; what is missing is
+below.
 
-What is left of MMI is three instructions, and the reason they are a separate
-piece of work is that the **word-wide accumulating forms carry hardware quirks
-nobody has explained**: PCSX2's
-`PMADDW` adds `0x70000000` under a condition its own comment calls "PlayStation
-2 division voodoo, for some reason only the lower half is affected", and divides
-by `0xFFFFFFFF` rather than shifting by 32 because "multiplication error on the
-PS2 causes this not to be exactly >> 32 (off by 1)". That is an emulator's model
-of an undocumented silicon bug, and no manual here describes it. Implementing it
-would mean copying behaviour nobody can derive, which is exactly the kind of
-claim this project tags rather than absorbs — so it waits for either a source
-that explains it or a console to measure. The unaligned group is done, and so are `LQ`
-and `SQ`.
+**The big pieces.** The FPU (COP1) and the two vector units. No TLB.
+
+**The pipeline itself.** Single issue against the R5900's dual, and no branch
+predictor — the R5900 has a BTAC and this does not, so every taken branch pays
+a full fetch refill. Both are the deeper-pipeline work that the clock gap
+eventually needs and neither is a small change.
+
+**Two instructions of MMI**, `PMADDW` and `PMSUBW`, described above: they carry
+quirks derivable from nothing and checkable against nothing but the emulator
+they came from, so they wait for a console. Everything else in MMI0, MMI1, MMI2
+and MMI3 is done, along with the unaligned group, `LQ` and `SQ`.
 
 Timing, three placement directives per variant, against a 294.912 MHz target:
 
@@ -1579,13 +1576,24 @@ Timing, three placement directives per variant, against a 294.912 MHz target:
 |---|---|---|
 | before MMI0/MMI1 | 272.7 | 10571 |
 | + the parallel ALU, per-width adders | 214.1 | 13916 |
-| **+ the pack, extend and shuffle group** | **192.7** | 15612 |
+| + the pack, extend and shuffle group | 192.7 | 15612 |
+| **+ all of MMI2 and MMI3** | **190.8** | 17038 |
 
-So MMI has cost 80 MHz and half as many LUTs again as the rest of the core put
-together, and it is where the clock now goes. The memory port costs about 6 MHz
-by comparison. Both remaining items are known: the parallel ALU's saturating
-forms sit in the same single-cycle path as the scalar ALU and could move into
-A2, and the shuffle group's multiplexers are all in the result mux.
+The last row is the correction to what the first three imply. It is easy to read
+this table as "MMI costs clock", and then to expect every further MMI
+instruction to cost more — the permutes, the variable shifts, HI and LO whole,
+five multiplies, three divides, the halfword multiply-accumulate group and
+`PMADDUW` between them cost **two megahertz**.
+
+The 80 MHz was never MMI in general. It was specifically the **parallel ALU and
+the shuffle group**, which are single-cycle and sit in the same result mux as
+the scalar ALU. Everything added since is multi-cycle and therefore nowhere near
+that path, which is also why `PMULTW` was worth sixty megahertz the moment it
+stopped being an exception to that rule.
+
+So the remaining clock problem is two structures and they are the original two:
+the parallel ALU's saturating forms, which could move into A2, and the shuffle
+group's multiplexers. The memory port costs about 6 MHz by comparison.
 
 IPC is better but not closed: CPI 1.78 on ordinary code, 2.15 on branch-heavy.
 What is left is multiply/divide latency (inherent), one stall per memory access,

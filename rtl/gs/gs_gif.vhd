@@ -81,7 +81,8 @@ architecture arch of gs_gif is
    type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
                     S_SPR_CLAMP, S_SPR_TEST,
                     S_DRAW, S_DRAWRD,
-                    S_TRI_SET, S_TRI_WAIT, S_TRI_SCAN, S_TRI_CLAMP,
+                    S_TRI_SET, S_TRI_CEIL, S_TRI_GO, S_TRI_WAIT,
+                    S_TRI_SCAN, S_TRI_CLAMP,
                     S_TRI_TEST, S_TRI_STEP,
                     S_TRI_SEED, S_ZRD);
    signal state : state_t := S_TAG;
@@ -172,6 +173,17 @@ architecture arch of gs_gif is
    -- maximum at its initial -4096 and then subtracts one from it.
    signal q_lft, q_rgt : integer range -4097 to 4095 := 0;
    signal q_sx0, q_sx1 : integer range 0 to 2047 := 0;
+
+   -- The triangle's vertical extent, carried across the three states that used
+   -- to be one.  In context on the card -- with PCIe and HBM competing for the
+   -- same die -- the path from a vertex's y through the three-way minimum, the
+   -- ceiling, the scissor clamp and the emptiness test was the *entire* timing
+   -- failure: 436 endpoints, all of them this one comparison fanning out to the
+   -- reset pins of a register bank, ten carry chains deep.
+   signal q_ylo, q_yhi : integer range -65536 to 65535 := 0;
+   signal q_tya, q_tyb : integer range -65536 to 65535 := 0;
+   signal q_sy0, q_sy1 : integer range 0 to 2047 := 0;
+   signal q_detnz      : std_logic := '0';
    signal k_ok  : std_logic := '0';
    signal dr_x1      : unsigned(10 downto 0) := (others => '0');
    signal dr_y1      : unsigned(10 downto 0) := (others => '0');
@@ -504,7 +516,8 @@ begin
    gif_ready <= '0' when reset = '1' else
                 '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
                          or state = S_SPR_CLAMP or state = S_SPR_TEST
-                         or state = S_TRI_SET or state = S_TRI_WAIT
+                         or state = S_TRI_SET or state = S_TRI_CEIL
+                         or state = S_TRI_GO or state = S_TRI_WAIT
                          or state = S_TRI_SCAN or state = S_TRI_CLAMP
                          or state = S_TRI_TEST or state = S_TRI_STEP
                          or state = S_TRI_SEED or state = S_ZRD
@@ -1000,16 +1013,10 @@ begin
                      if to_integer(t_y(k)) < ylo then ylo := to_integer(t_y(k)); end if;
                      if to_integer(t_y(k)) > yhi then yhi := to_integer(t_y(k)); end if;
                   end loop;
-                  sy0 := to_integer(unsigned(reg(16#40# + ctxi)(42 downto 32)));
-                  sy1 := to_integer(unsigned(reg(16#40# + ctxi)(58 downto 48)));
-                  -- ceil(y/16) is floor((y+15)/16), and floor is an arithmetic
-                  -- shift.  Integer division truncates toward zero instead,
-                  -- which differs as soon as a coordinate is negative -- and a
-                  -- vertex above or left of XYOFFSET is exactly that.
-                  tya := to_integer(shift_right(to_signed(ylo + 15, 24), 4));
-                  tyb := to_integer(shift_right(to_signed(yhi + 15, 24), 4)) - 1;
-                  if tya < sy0 then tya := sy0; end if;
-                  if tyb > sy1 then tyb := sy1; end if;
+                  q_ylo <= ylo;
+                  q_yhi <= yhi;
+                  q_sy0 <= to_integer(unsigned(reg(16#40# + ctxi)(42 downto 32)));
+                  q_sy1 <= to_integer(unsigned(reg(16#40# + ctxi)(58 downto 48)));
                   for k in 0 to 2 loop
                      ka := k;
                      kb := (k + 1) mod 3;
@@ -1025,17 +1032,6 @@ begin
                         e_yen(k) <= resize(shift_right(t_y(ka) + 15, 4), 13);
                      end if;
                   end loop;
-                  if tya > tyb or tya < 0 then
-                     dr_empty <= '1';
-                     dr_y  <= (others => '0');
-                     dr_y1 <= (others => '0');
-                  else
-                     dr_y  <= to_unsigned(tya, 11);
-                     dr_y1 <= to_unsigned(tyb, 11);
-                  end if;
-                  e_ytop   <= to_signed(tya, 14);
-                  e_start  <= '1';
-
                   -- The plane the four colour channels share.  Its determinant
                   -- is handed over already positive, with c_sgn saying whether
                   -- it had to be negated, so each channel's divider only ever
@@ -1055,23 +1051,61 @@ begin
                      c_det <= vdet;
                      c_sgn <= '0';
                   end if;
+                  if vdet /= 0 then
+                     q_detnz <= '1';
+                  else
+                     q_detnz <= '0';
+                  end if;
+                  state <= S_TRI_CEIL;
+
+               -- ceil(y/16) is floor((y+15)/16), and floor is an arithmetic
+               -- shift.  Integer division truncates toward zero instead, which
+               -- differs as soon as a coordinate is negative -- and a vertex
+               -- above or left of XYOFFSET is exactly that.
+               --
+               -- The scissor clamp rides along here rather than waiting for a
+               -- state of its own: both of its comparisons take the value this
+               -- state has just produced, so they are a carry chain after a
+               -- shift, not after a three-way minimum as well.
+               when S_TRI_CEIL =>
+                  tya := to_integer(shift_right(to_signed(q_ylo + 15, 24), 4));
+                  tyb := to_integer(shift_right(to_signed(q_yhi + 15, 24), 4)) - 1;
+                  if tya < q_sy0 then tya := q_sy0; end if;
+                  if tyb > q_sy1 then tyb := q_sy1; end if;
+                  q_tya <= tya;
+                  q_tyb <= tyb;
+                  state <= S_TRI_GO;
+
+               -- Did anything survive, and start the interpolators.  This is
+               -- one comparison on two registered values; before the split it
+               -- was that comparison on top of everything above, and its
+               -- fan-out to a register bank's reset pins was every failing
+               -- endpoint in the design.
+               when S_TRI_GO =>
+                  if q_tya > q_tyb or q_tya < 0 then
+                     dr_empty <= '1';
+                     dr_y    <= (others => '0');
+                     dr_y1   <= (others => '0');
+                     dr_ytop <= (others => '0');
+                  else
+                     dr_y    <= to_unsigned(q_tya, 11);
+                     dr_y1   <= to_unsigned(q_tyb, 11);
+                     -- the primitive's first scanline, which the depth bias's
+                     -- y term is exempt on
+                     dr_ytop <= to_unsigned(q_tya, 11);
+                  end if;
+                  e_ytop  <= to_signed(q_tya, 14);
+                  e_start <= '1';
                   -- A degenerate triangle has no plane; it also covers no
                   -- pixels, so the interpolators are simply left alone rather
                   -- than started on a division by zero.
-                  if vdet /= 0 then
+                  if q_detnz = '1' then
                      if dr_iip = '1' then
                         c_start <= '1';
                      end if;
                      if dr_zon = '1' then
                         z_start <= '1';
                      end if;
-                  end if;
-                  -- the primitive's first scanline, which the depth bias's y
-                  -- term is exempt on
-                  if tya > tyb or tya < 0 then
-                     dr_ytop <= (others => '0');
-                  else
-                     dr_ytop <= to_unsigned(tya, 11);
                   end if;
 
                   tri_mode <= '1';
