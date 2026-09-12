@@ -51,6 +51,29 @@ class Card:
         fcntl.ioctl(self.fd, LITEPCIE_IOCTL_REG,
                     struct.pack("IIB3x", addr, val & 0xFFFFFFFF, 1))
 
+
+    def check_link(self):
+        """Refuse to report anything off a dead PCIe link.
+
+        A card that was JTAG-programmed and not re-enumerated answers every
+        register with 0xFFFFFFFF and raises no error.  Read as pixel data that
+        is a white frame; read as a checksum it is a mismatch that looks like a
+        Graphics Synthesizer bug.  Two patterns, because a stuck-high bus
+        passes a test that only writes ones.
+        """
+        for probe in (0xA5A55A5A, 0x0F0FF0F0):
+            self.wr("ctrl_scratch", probe)
+            got = self.rd("ctrl_scratch")
+            if got != probe:
+                msg = (f"the PCIe link is not answering: wrote 0x{probe:08x}, "
+                       f"read 0x{got:08x}")
+                if got == 0xFFFFFFFF:
+                    msg += ("\n  all ones is the signature of a card that was "
+                            "JTAG-programmed and not re-enumerated;"
+                            "\n  run: sudo tools/pcie-bringup.sh c1100_gs")
+                raise SystemExit("FAIL  " + msg)
+        self.wr("ctrl_scratch", 0x12345678)      # LiteX's reset value, put back
+
     def reset(self):
         self.wr("gs_reset", 1)
         self.wr("gs_reset", 0)
@@ -138,6 +161,7 @@ def main():
         if not a.csr:
             sys.exit("--csr is needed unless --model-only")
         card = Card(a.dev, a.csr)
+        card.check_link()
         card.reset()
         for qw in qwords:
             card.push(qw)

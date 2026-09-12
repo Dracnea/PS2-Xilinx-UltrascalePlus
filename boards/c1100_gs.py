@@ -19,12 +19,28 @@
 #     prints.  The comparison on the card is then the comparison in simulation,
 #     against the same reference, with the same tooling.
 #
-# The GS runs in the *sys* clock domain at 125 MHz.  It closes at 129.1 MHz out
-# of context (docs/gs.md), so it needs no clock of its own -- which removes a
-# whole class of bring-up problem, since a design that does not cross a clock
-# boundary cannot fail at one.  A real GS runs at 147.456 MHz and this does not;
-# that is a performance question and not a correctness one, and nothing here is
-# timed against a video output yet.
+# The GS runs in the *sys* clock domain, and sys is the console's own clock:
+# 147.455867 MHz, 0.90 ppm off 147.456, out of the two cascaded MMCMs in
+# boards/ps2_clocks.py.
+#
+# Two things about that are deliberate.
+#
+# **It is the specification, not a speed.**  This is a rebuild of the machine.
+# A Graphics Synthesizer at 125 MHz is not a slow GS and one at 150 MHz is not a
+# fast one; both are a GS with the wrong clock, and the integer relationships
+# between the GS, the EE and the IOP are part of what the software depends on.
+# 147.456 MHz is the only right answer, and the card can make it: an MMCM
+# synthesises from the 100 MHz reference with a fractional multiplier, so there
+# is no grid of 25 MHz steps to land on.
+#
+# **The GS still does not cross a clock boundary.**  Running it in its own
+# domain beside a 125 MHz sys would mean a clock-domain crossing on every CSR,
+# the push handshake and the read-back path -- new logic, between a block that
+# is verified and a host that is trusted, at exactly the moment the clock
+# changes.  Making *sys itself* the console clock avoids all of it: nothing in
+# this design crosses a boundary that did not already cross one, and the PCIe
+# bridge's own crossing is unchanged and already tested.  What it costs is that
+# the PCIe and HBM glue must now close at 147.456 rather than 125.
 #
 # SPDX-License-Identifier: BSD-2-Clause
 
@@ -44,7 +60,9 @@ from litepcie.software import generate_litepcie_software
 
 import xilinx_c1100
 from hbm_common import HBM
-from c1100_ps2_iop import _CRG
+from litex.soc.cores.clock import USPMMCM
+from migen.genlib.resetsync import AsyncResetSynchronizer
+from ps2_clocks import PS2Clocks
 
 REPO_ROOT = join(dirname(abspath(__file__)), "..")
 
@@ -55,6 +73,62 @@ def add_gs_sources(platform, root=REPO_ROOT):
     for f in ("gs_addr_pkg.vhd", "gs_edge_dda.vhd", "gs_chan_dda.vhd", "gs_gif.vhd",
               "gs_lmem.vhd", "gs_top.vhd"):
         platform.add_source(join(rtl, f), language="vhdl")
+
+
+class _GSCRG(LiteXModule):
+    """The console's clock as `sys`, and the three clocks the HBM IP wants.
+
+    Two MMCMs, for two different jobs.  The LiteX one makes the HBM reference,
+    the APB clock and the 250 MHz AXI clock, none of which has anything to do
+    with a PlayStation 2 and all of which are happy on integer ratios from
+    100 MHz.  PS2Clocks makes the console's clock family, and its GS output is
+    renamed to `sys` here so that the Graphics Synthesizer and every CSR that
+    talks to it share one domain.
+
+    The two are unrelated, so every sys <-> axi and sys <-> apb path is declared
+    asynchronous; they already were when sys came from the LiteX MMCM, because
+    250 and 100 MHz were never related to 125 either.
+    """
+    def __init__(self, platform):
+        self.rst        = Signal()
+        self.cd_sys     = ClockDomain()
+        self.cd_hbm_ref = ClockDomain()
+        self.cd_apb     = ClockDomain()
+        self.cd_axi     = ClockDomain()
+        self.clk100     = Signal()
+
+        pads   = platform.request("clk100")
+        clk_se = Signal()
+        self.specials += Instance("IBUFDS", i_I=pads.p, i_IB=pads.n, o_O=clk_se)
+        self.specials += Instance("BUFG",   i_I=clk_se, o_O=self.clk100)
+
+        self.mmcm = mmcm = USPMMCM(speedgrade=-2, name="sys_mmcm")
+        self.comb += mmcm.reset.eq(self.rst)
+        mmcm.register_clkin(self.clk100, 100e6)
+        mmcm.create_clkout(self.cd_hbm_ref, 100e6, margin=0)
+        mmcm.create_clkout(self.cd_apb,     100e6, margin=0)
+        mmcm.create_clkout(self.cd_axi,     250e6, margin=0)
+
+        # The GS output becomes sys.  PS2Clocks builds only the domain asked
+        # for: the EE's 294.912 and the IOP's 36.864 come off the same second
+        # MMCM and will be wanted when those blocks join this image, but a
+        # clock domain that drives nothing is a period constraint on nothing.
+        self.ps2 = PS2Clocks(platform, self.clk100, self.rst,
+                             domains={"gs": self.cd_sys})
+
+        platform.add_period_constraint(pads.p, 1e9 / 100e6)
+
+        # Named by MMCM pin, not by net: a net name that no longer exists makes
+        # Vivado print "No clocks matched" and apply nothing, which is the trap
+        # c1100_ps2_iop.py's comment records hitting three times.  After a
+        # build, grep the log for "No clocks matched" and for 12-4739.
+        platform.toolchain.pre_placement_commands.append(
+            "set_clock_groups -asynchronous "
+            "-group [get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT1]] "
+            "-group [get_clocks -of_objects [get_pins ps2_mmcm1/CLKOUT0]] "
+            "-group [get_clocks -of_objects [get_pins {{sys_mmcm/CLKOUT0 "
+            "sys_mmcm/CLKOUT1 sys_mmcm/CLKOUT2}}]] "
+            "-group [get_clocks clk100_p]")
 
 
 class GSBringup(LiteXModule, AutoCSR):
@@ -74,7 +148,7 @@ class GSBringup(LiteXModule, AutoCSR):
               meant to change.
     unknown   writes to register addresses the manual does not define.
     """
-    def __init__(self, platform):
+    def __init__(self, platform, clk_locked=None):
         self.reset    = CSRStorage(1, reset=1, description="1 holds the GS in reset")
         self.gif_w0   = CSRStorage(32, description="quadword bits 31:0")
         self.gif_w1   = CSRStorage(32, description="quadword bits 63:32")
@@ -95,6 +169,30 @@ class GSBringup(LiteXModule, AutoCSR):
         self.dbg_sel  = CSRStorage(7,  description="which general register to show")
         self.dbg_lo   = CSRStatus(32, description="that register, bits 31:0")
         self.dbg_hi   = CSRStatus(32, description="that register, bits 63:32")
+
+        # ---- is this actually the console's clock? -------------------------
+        #
+        # Everything else in this file asserts 147.456 MHz; these two CSRs are
+        # the only things that can *show* it.  Without them "the GS runs at the
+        # console's clock" is a statement about a constraint file -- the MMCM
+        # parameters have never been through a synthesiser until now, let alone
+        # locked on this card, and a PLL that fails to lock does not announce
+        # itself, it just leaves the design on a clock that never ticks or one
+        # that ticks at the wrong rate.
+        #
+        #   locked   both MMCMs have locked.  0 means the clock tree did not
+        #            come up and nothing else on this page means anything.
+        #   ticks    a free-running counter in the sys domain.  Read it twice a
+        #            known wall-clock apart and the difference is the frequency,
+        #            measured rather than assumed.  It wraps every 29 seconds at
+        #            this rate, which is far longer than any sensible gap.
+        self.clk_locked = CSRStatus(1, description="both PS2 MMCMs are locked")
+        self.clk_ticks  = CSRStatus(32, description="free-running sys-domain counter")
+        ticks = Signal(32)
+        self.sync += ticks.eq(ticks + 1)
+        self.comb += self.clk_ticks.status.eq(ticks)
+        if clk_locked is not None:
+            self.comb += self.clk_locked.status.eq(clk_locked)
 
         # ---- the GS itself ------------------------------------------------
         gif_valid = Signal()
@@ -163,12 +261,20 @@ class GSBringup(LiteXModule, AutoCSR):
         add_gs_sources(platform)
 
 
+# 147.455867 MHz is what the two MMCMs actually produce; the nominal is what
+# the console runs at.  The difference is 0.90 ppm and the constraint is derived
+# by Vivado from the MMCM anyway, so this number is only ever used for LiteX's
+# own bookkeeping -- but writing the real one keeps it from reading as if the
+# card were making 147.456 exactly.
+GS_CLK_FREQ = 147.455867e6
+
+
 class GSSoC(SoCMini):
-    def __init__(self, platform, speed="gen3", nlanes=4, sys_clk_freq=125e6):
+    def __init__(self, platform, speed="gen3", nlanes=4, sys_clk_freq=GS_CLK_FREQ):
         SoCMini.__init__(self, platform, sys_clk_freq,
                          ident=f"C1100 GS bring-up x{nlanes} {speed}")
 
-        self.crg = _CRG(platform, sys_clk_freq)
+        self.crg = _GSCRG(platform)
 
         # The GS keeps its 4 MB in UltraRAM and wants nothing from HBM, but
         # hbm_cattrip still has to be driven or the satellite controller powers
@@ -192,7 +298,7 @@ class GSSoC(SoCMini):
                       with_dma_buffering = True, dma_buffering_depth=1024,
                       with_dma_loopback  = False)
 
-        self.gs = GSBringup(platform)
+        self.gs = GSBringup(platform, clk_locked=self.crg.ps2.locked)
 
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_axi.clk)
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_apb.clk)

@@ -58,12 +58,31 @@ class PS2Clocks(LiteXModule):
     `ref` is the buffered 100 MHz board reference; `rst` holds both MMCMs.
     `locked` is high when *both* have locked, because a design that starts on
     one of two clocks is worse than one that does not start at all.
+
+    `domains` maps "ee", "gs" and "iop" to the ClockDomain each should drive,
+    and selects which of the three to build.  The second MMCM always drives all
+    three outputs -- they cost nothing, and keeping them makes the *ratios* a
+    property of this one instance rather than of how it was configured -- but a
+    domain nobody uses would still collect a period constraint and a reset
+    synchroniser, so only the ones asked for get a BUFG.
+
+    A value of None means "create the ClockDomain here"; passing one in is for
+    the caller that has to own it.  That is not a hypothetical: LiteX expects
+    the clock-and-reset generator itself to own `sys`, so a board whose sys
+    clock *is* the console's GS clock hands its own `cd_sys` in.
     """
-    def __init__(self, platform, ref, rst, name="ps2"):
-        self.cd_ee  = ClockDomain()
-        self.cd_gs  = ClockDomain()
-        self.cd_iop = ClockDomain()
+    def __init__(self, platform, ref, rst, name="ps2", domains=None):
+        if domains is None:
+            domains = {"ee": None, "gs": None, "iop": None}
         self.locked = Signal()
+        made = {}
+        for d, cd in domains.items():
+            if d not in ("ee", "gs", "iop"):
+                raise ValueError(f"PS2Clocks has no {d} domain")
+            if cd is None:
+                cd = ClockDomain(d)
+                setattr(self, f"cd_{d}", cd)     # created here, so owned here
+            made[d] = cd
 
         base   = Signal()
         base_b = Signal()
@@ -95,9 +114,17 @@ class PS2Clocks(LiteXModule):
             p_CLKIN1_PERIOD   = 1e3 / 18.431983,
             p_DIVCLK_DIVIDE   = STAGE2["divclk"],
             p_CLKFBOUT_MULT_F = STAGE2["mult"],
-            p_CLKOUT0_DIVIDE  = STAGE2["ee"],
-            p_CLKOUT1_DIVIDE  = STAGE2["gs"],
-            p_CLKOUT2_DIVIDE  = STAGE2["iop"],
+            # CLKOUT0 is the one output with a fractional divider, so its
+            # parameter is CLKOUT0_DIVIDE_F and CLKOUT0_DIVIDE does not exist:
+            # synthesis rejects the integer name outright ("parameter
+            # 'CLKOUT0_DIVIDE' ... does not exist"), which is how this was
+            # found -- the arithmetic in this file had been checked since it
+            # was written, and the instance had never been through a
+            # synthesiser.  A whole number in the fractional parameter is still
+            # an exact integer divide, so the ratios below are unaffected.
+            p_CLKOUT0_DIVIDE_F = float(STAGE2["ee"]),
+            p_CLKOUT1_DIVIDE   = STAGE2["gs"],
+            p_CLKOUT2_DIVIDE   = STAGE2["iop"],
             i_CLKIN1   = base_b,
             i_RST      = rst,
             i_CLKFBIN  = fb2,
@@ -107,11 +134,12 @@ class PS2Clocks(LiteXModule):
             o_CLKOUT2  = c2[2],
             o_LOCKED   = lock2,
         )
-        for sig, cd in zip(c2, (self.cd_ee, self.cd_gs, self.cd_iop)):
-            self.specials += Instance("BUFG", i_I=sig, o_O=cd.clk)
+        for sig, key in zip(c2, ("ee", "gs", "iop")):
+            if key in made:
+                self.specials += Instance("BUFG", i_I=sig, o_O=made[key].clk)
 
         self.comb += self.locked.eq(lock1 & lock2)
-        for cd in (self.cd_ee, self.cd_gs, self.cd_iop):
+        for cd in made.values():
             self.specials += AsyncResetSynchronizer(cd, rst | ~self.locked)
 
 
