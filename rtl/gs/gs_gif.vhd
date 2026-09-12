@@ -1272,6 +1272,25 @@ begin
                   state <= S_DRAW;
 
                when S_DRAW =>
+                  -- Four consecutive pixels of a span share one 256-bit memory
+                  -- word, and that is true of the depth buffer as much as of
+                  -- the colour one, so both steps of a pixel can take four at a
+                  -- time.  The restrictions are the same for both -- a flat
+                  -- primitive and a 32-bit buffer -- plus, for depth, that the
+                  -- test is one that needs no read: ZTST = ALWAYS writes every
+                  -- pixel, so there is no per-lane pass mask to build.
+                  -- GEQUAL and GREATER stay one at a time until there is.
+                  wide := tri_mode = '0' and dr_fb16 = '0'
+                          and (dr_zon = '0'
+                               or (dr_ztst = "01" and dr_z16 = '0'));
+                  if wide then
+                     nrun := 4 - to_integer(dr_x(1 downto 0));
+                     if resize(dr_x, 13) + nrun > resize(dr_x1, 13) then
+                        nrun := to_integer(dr_x1 - dr_x) + 1;
+                     end if;
+                  else
+                     nrun := 1;
+                  end if;
                   if dr_empty = '1' or dr_y > dr_y1 then
                      state <= dr_ret;
                   elsif dr_zon = '1' and dr_zdone = '0' then
@@ -1304,10 +1323,35 @@ begin
                               wr_be   <= std_logic_vector(shift_left(
                                             resize(unsigned'("11"), 32),
                                             4 * lane + 2 * half));
-                           else
+                           elsif not wide then
                               wr_data <= spread32(src_zc);
                               wr_be   <= std_logic_vector(shift_left(
                                             resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
+                           else
+                              -- A sprite's depth is one number for the whole
+                              -- primitive, so the four lanes of a word take the
+                              -- same value and only the enables differ.
+                              --
+                              -- The depth block exclusive-or is passed here for
+                              -- consistency with the address above, and makes no
+                              -- difference: it flips bits 3 and 4 of the block
+                              -- index and the lane is the low *three* bits, so
+                              -- the two forms give the same lane for every
+                              -- pixel.  Measured, not assumed -- passing '0'
+                              -- instead is a mutation the directed test cannot
+                              -- tell apart, and this is why.
+                              wbe := (others => '0');
+                              for i in 0 to 3 loop
+                                 if i < nrun then
+                                    ai := pix_addr_page(dr_zbp, dr_fbw,
+                                                        dr_x + i, dr_y, '1');
+                                    wbe := wbe or shift_left(
+                                              resize(unsigned(zbe(dr_zmask)), 32),
+                                              4 * to_integer(ai(2 downto 0)));
+                                 end if;
+                              end loop;
+                              wr_data <= spread32(src_zc);
+                              wr_be   <= std_logic_vector(wbe);
                            end if;
                         end if;
                      else
@@ -1325,21 +1369,6 @@ begin
                         half := 0;
                      end if;
                      lane := to_integer(wa(2 downto 0));
-                     -- Four consecutive pixels of a span share one 256-bit
-                     -- memory word, so both the plain write and the
-                     -- read-modify-write can take them together.  The
-                     -- restriction is the same for both: a flat primitive, a
-                     -- 32-bit buffer, and no depth write interleaved with the
-                     -- colour one.
-                     wide := tri_mode = '0' and dr_fb16 = '0' and dr_zon = '0';
-                     if wide then
-                        nrun := 4 - to_integer(dr_x(1 downto 0));
-                        if resize(dr_x, 13) + nrun > resize(dr_x1, 13) then
-                           nrun := to_integer(dr_x1 - dr_x) + 1;
-                        end if;
-                     else
-                        nrun := 1;
-                     end if;
                      if dr_fbmsk = x"00000000" and dr_abe = '0' then
                         -- nothing to preserve, so no read is needed: the common
                         -- case stays one pixel per clock.  At 16 bits the byte

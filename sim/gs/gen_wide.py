@@ -52,12 +52,21 @@ ZBUF_OFF     = 1 << 32                      # ZMSK = 1
 ALPHA_LERP = 0 | (1 << 2) | (2 << 4) | (1 << 6) | (0x40 << 32)
 
 
-def sprite(out, rgba, x0, y0, x1, y1, fbw=1, abe=0, msk=0, alpha=0):
+# A depth buffer at page 2, immediately after the 64 x 64 colour buffer, so one
+# dump covers both.  ZMSK = 0 means depth is actually written; with ZTST =
+# ALWAYS that is the case the wide depth write handles, and it is also the
+# common one -- a full-screen clear writes depth without testing it.
+ZBUF_WRITE = 2          # ZBP = 2, PSMZ32, ZMSK = 0
+
+
+def sprite(out, rgba, x0, y0, x1, y1, fbw=1, abe=0, msk=0, alpha=0,
+           zbuf=None, z=0):
     items = [(0x4C, 0 | (fbw << 16) | (0 << 24) | (msk << 32)),   # FRAME_1, PSMCT32
              (0x18, 0),                                           # XYOFFSET_1
              (0x40, 0 | (63 << 16) | (0 << 32) | (63 << 48)),     # SCISSOR_1
              (0x42, alpha), (0x46, 1),
-             (0x4E, ZBUF_OFF), (0x47, ZTEST_ALWAYS),
+             (0x4E, ZBUF_OFF if zbuf is None else zbuf),
+             (0x47, ZTEST_ALWAYS),
              (0x01, rgba),
              (0x00, 6 | (abe << 6))]                              # PRIM: sprite
     regs = 0
@@ -67,8 +76,10 @@ def sprite(out, rgba, x0, y0, x1, y1, fbw=1, abe=0, msk=0, alpha=0):
     for a, d in items:
         out.append((d & ((1 << 64) - 1)) | (a << 64))
     out.append(tag(1, 1, 0xEE, 2))
-    out.append(((x0 << 4) | ((y0 << 4) << 16)) | (0x05 << 64))
-    out.append(((x1 << 4) | ((y1 << 4) << 16)) | (0x05 << 64))
+    # A sprite's depth is the second vertex's; the first carries a different one
+    # so that a unit reading the wrong vertex is visible.
+    out.append(((x0 << 4) | ((y0 << 4) << 16) | ((z ^ 0x5A5A) << 32)) | (0x05 << 64))
+    out.append(((x1 << 4) | ((y1 << 4) << 16) | (z << 32)) | (0x05 << 64))
 
 
 def gouraud(out, v0, v1, v2):
@@ -154,6 +165,24 @@ def main():
         for w in (1, 4, 6):
             sprite(out, 0xFFFFFFFF, x0 + 8 * (w // 5), 52,
                    x0 + 8 * (w // 5) + w, 54, msk=0x00FF00FF)
+
+    # ---- the depth buffer, written four at a time ------------------------
+    #
+    # ZTST = ALWAYS with ZMSK = 0 writes every pixel's depth without reading
+    # any, which is the case the wide depth write handles and is also what a
+    # screen clear does.  The depth goes to page 2, straight after the colour
+    # buffer, so one dump covers both.
+    #
+    # Each sprite carries a distinct depth, so a lane that took its value from
+    # the wrong sprite -- or a run that wrote one pixel too many -- shows up as
+    # a depth belonging to a different rectangle.
+    for x0 in range(4):
+        for w in (1, 2, 3, 4, 5, 8):
+            sprite(out, 0x00010203, x0 + 12 * (w // 5), 8 + 2 * x0,
+                   x0 + 12 * (w // 5) + w, 10 + 2 * x0,
+                   zbuf=ZBUF_WRITE, z=0x00110000 | (x0 << 8) | w)
+    # and a full-page depth clear, which is the shape that matters in a frame
+    sprite(out, 0x04050607, 0, 20, 64, 28, zbuf=ZBUF_WRITE, z=0x00BEEF00)
 
     # y 56..63 -- a Gouraud triangle under exactly the conditions that enable
     # the wide path, which is what says the path must *not* take them.
