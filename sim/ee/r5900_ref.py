@@ -33,6 +33,10 @@ so a diff between the two files points at an instruction rather than a symptom.
 """
 import argparse, sys
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ps2_float as PF
+
 M64 = (1 << 64) - 1
 M32 = (1 << 32) - 1
 M128 = (1 << 128) - 1
@@ -57,6 +61,12 @@ IMEM_MASK = 0xFFFF
 def s64(x):
     x &= M64
     return x - (1 << 64) if x >> 63 else x
+
+
+def sext16_(x):
+    """A 16-bit immediate read as signed."""
+    x &= 0xFFFF
+    return x - (1 << 16) if x >> 15 else x
 
 
 def sext16(x):
@@ -496,6 +506,12 @@ class R5900:
         # timer behaviour belongs with the exception path, which is where a
         # cycle count starts to mean something.
         self.cop0 = [0] * 32
+        # COP1: thirty-two single-precision registers, the accumulator the
+        # multiply-add forms use, and the control/status word that carries the
+        # condition bit and the cause and sticky flags.
+        self.fpr   = [0] * 32
+        self.acc   = 0
+        self.fcr31 = 0
         self.cop0[15] = PRID          # PRId is read-only and identifies the core
         self.exceptions = 0           # taken, for a test that would otherwise
                                       # pass by never reaching the handler
@@ -675,6 +691,14 @@ class R5900:
                 self.w128(rt, self.mem.load(a, 16))
             else:
                 self.mem.store(a, 16, self.r128(rt))
+        elif op == 17:                                  # COP1, the FPU
+            self._cop1(i, rs, rt, rd, fn)
+        elif op == 49:                                  # LWC1
+            self.fpr[rt] = self.mem.load(
+                (self.r(rs) + sext16_(i & 0xFFFF)) & M64, 4) & M32
+        elif op == 57:                                  # SWC1
+            self.mem.store((self.r(rs) + sext16_(i & 0xFFFF)) & M64, 4,
+                           self.fpr[rt])
         elif op == 16:                                  # COP0
             if rs == 0:                                 # MFC0
                 self.w(rt, sext32(self.cop0[rd] & M32))
@@ -891,6 +915,80 @@ class R5900:
             self.hi1, self.lo1 = hi, lo
         else:
             self.hi, self.lo = hi, lo
+
+    def _cop1(self, i, rs, rt, rd, fn):
+        """COP1: the FPU's moves, compares, branches and arithmetic.
+
+        Every arithmetic result goes through sim/ee/ps2_float.py, which computes
+        in exact rationals and truncates -- see docs/ee-fpu.md for why a host
+        float cannot stand in for this machine's.
+
+        The structure here is what is verifiable today; what is not is the last
+        bit of MUL, DIV and SQRT on silicon, and that is a probe entry rather
+        than a guess made here.
+        """
+        # ---- the moves, which do not touch the number at all --------------
+        if rs == 0:                                     # MFC1
+            self.w(rt, sext32(self.fpr[rd])); return
+        if rs == 4:                                     # MTC1
+            self.fpr[rd] = self.r(rt) & M32; return
+        if rs == 2:                                     # CFC1
+            self.w(rt, sext32(self.fcr31 if rd == 31 else 0x2E00)); return
+        if rs == 6:                                     # CTC1
+            if rd == 31:
+                self.fcr31 = self.r(rt) & M32
+            return
+        if rs == 8:                                     # BC1F / BC1T
+            want = (rt & 1) == 1
+            if ((self.fcr31 >> 23) & 1) == want:
+                self.branch(self.pc + (sext16_(i & 0xFFFF) << 2))
+            return
+
+        # ---- the arithmetic, all single precision -------------------------
+        if rs != 16:                                    # only the S format
+            self.traps.append(("unimplemented COP1 rs %d" % rs, self.pc - 4))
+            return
+        fs, ft, fd = rd, (i >> 16) & 0x1F, (i >> 6) & 0x1F
+        a, b = self.fpr[fs], self.fpr[ft]
+
+        # The cause bits are cleared by every arithmetic instruction and the
+        # sticky ones accumulate; what an operation raises is or-ed into both.
+        def done(res, flags=0):
+            self.fcr31 &= ~(PF.CAUSE_I | PF.CAUSE_D | PF.CAUSE_O | PF.CAUSE_U)
+            self.fcr31 |= flags
+            self.fcr31 |= (flags >> 11) & (PF.STICKY_I | PF.STICKY_D
+                                           | PF.STICKY_O | PF.STICKY_U)
+            if res is not None:
+                self.fpr[fd] = res & M32
+
+        if   fn == 0x00: done(*PF.add(a, b))                      # ADD.S
+        elif fn == 0x01: done(*PF.sub(a, b))                      # SUB.S
+        elif fn == 0x02: done(*PF.mul(a, b))                      # MUL.S
+        elif fn == 0x03: done(*PF.div(a, b))                      # DIV.S
+        elif fn == 0x04: done(*PF.sqrt_(b))                       # SQRT.S
+        elif fn == 0x05: done(PF.cond(a) & 0x7FFFFFFF)            # ABS.S
+        elif fn == 0x06: done(PF.cond(a))                         # MOV.S
+        elif fn == 0x07: done(PF.cond(a) ^ 0x80000000)            # NEG.S
+        elif fn == 0x28: done(PF.fmax(a, b))                      # MAX.S
+        elif fn == 0x29: done(PF.fmin(a, b))                      # MIN.S
+        elif fn == 0x18:                                          # ADDA.S
+            self.acc, fl = PF.add(a, b); done(None, fl)
+        elif fn == 0x19:
+            self.acc, fl = PF.sub(a, b); done(None, fl)           # SUBA.S
+        elif fn == 0x1A:
+            self.acc, fl = PF.mul(a, b); done(None, fl)           # MULA.S
+        elif fn in (0x30, 0x32, 0x34):                            # C.F/C.EQ/C.LT
+            self.fcr31 &= ~PF.FLAG_C
+            va, vb = PF.value(a), PF.value(b)
+            c = {0x30: False, 0x32: va == vb, 0x34: va < vb}[fn]
+            if c:
+                self.fcr31 |= PF.FLAG_C
+        elif fn == 0x36:                                          # C.LE
+            self.fcr31 &= ~PF.FLAG_C
+            if PF.value(a) <= PF.value(b):
+                self.fcr31 |= PF.FLAG_C
+        else:
+            self.traps.append(("unimplemented COP1 fn 0x%02X" % fn, self.pc - 4))
 
     def _regimm(self, rs, rt, simm, nxt):
         v = s64(self.r(rs))
