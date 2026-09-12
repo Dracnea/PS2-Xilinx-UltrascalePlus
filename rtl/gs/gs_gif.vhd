@@ -184,6 +184,13 @@ architecture arch of gs_gif is
    signal q_tya, q_tyb : integer range -65536 to 65535 := 0;
    signal q_sy0, q_sy1 : integer range 0 to 2047 := 0;
    signal q_detnz      : std_logic := '0';
+
+   -- How many pixels the read-modify-write in flight covers, and whether it was
+   -- issued as a wide one.  Both have to survive the two cycles the memory
+   -- takes to answer, which is why they are signals and not the variables the
+   -- same numbers are computed into.
+   signal dr_run  : integer range 1 to 4 := 1;
+   signal dr_wide : std_logic := '0';
    signal k_ok  : std_logic := '0';
    signal dr_x1      : unsigned(10 downto 0) := (others => '0');
    signal dr_y1      : unsigned(10 downto 0) := (others => '0');
@@ -564,6 +571,9 @@ begin
       variable wbe                         : unsigned(31 downto 0);
       variable ai                          : unsigned(19 downto 0);
       variable wide                        : boolean;
+      variable nw                          : std_logic_vector(255 downto 0);
+      variable opx, bl                     : std_logic_vector(31 downto 0);
+      variable li                          : integer range 0 to 7;
 
       -- Retiring a pixel: the same three lines whichever way the pixel ended,
       -- so they live in one place and are reached from one condition.  px_step
@@ -1300,10 +1310,22 @@ begin
                         half := 0;
                      end if;
                      lane := to_integer(wa(2 downto 0));
+                     -- Four consecutive pixels of a span share one 256-bit
+                     -- memory word, so both the plain write and the
+                     -- read-modify-write can take them together.  The
+                     -- restriction is the same for both: a flat primitive, a
+                     -- 32-bit buffer, and no depth write interleaved with the
+                     -- colour one.
+                     wide := tri_mode = '0' and dr_fb16 = '0' and dr_zon = '0';
+                     if wide then
+                        nrun := 4 - to_integer(dr_x(1 downto 0));
+                        if resize(dr_x, 13) + nrun > resize(dr_x1, 13) then
+                           nrun := to_integer(dr_x1 - dr_x) + 1;
+                        end if;
+                     else
+                        nrun := 1;
+                     end if;
                      if dr_fbmsk = x"00000000" and dr_abe = '0' then
-                        -- the wide path needs a flat primitive and no depth
-                        -- write interleaved with the colour one
-                        wide := tri_mode = '0' and dr_fb16 = '0' and dr_zon = '0';
                         -- nothing to preserve, so no read is needed: the common
                         -- case stays one pixel per clock.  At 16 bits the byte
                         -- enables protect the *other* pixel sharing the word,
@@ -1333,23 +1355,6 @@ begin
                            -- far the run reaches and or-ing four enables
                            -- together.
                            --
-                           -- The run stops at whichever comes first: the end of
-                           -- the memory word, or the end of the span.  Both
-                           -- matter -- the first because the next word is a
-                           -- different address, the second because a span is
-                           -- not a multiple of four and drawing past its right
-                           -- edge would be a scissor violation that no test
-                           -- with a 64-wide sprite would ever notice.
-                           --
-                           -- Sprites only, for now.  A triangle steps its
-                           -- colour and depth interpolators once per pixel, and
-                           -- they have no interface for advancing four at a
-                           -- time; a sprite's colour is constant across the
-                           -- span, so there is nothing to step.
-                           nrun := 4 - to_integer(dr_x(1 downto 0));
-                           if resize(dr_x, 13) + nrun > resize(dr_x1, 13) then
-                              nrun := to_integer(dr_x1 - dr_x) + 1;
-                           end if;
                            wbe := (others => '0');
                            for i in 0 to 3 loop
                               if i < nrun then
@@ -1370,6 +1375,8 @@ begin
                         dr_addr <= wa;
                         dr_half <= half;
                         dr_src  <= src_rgba;
+                        dr_run  <= nrun;
+                        dr_wide <= '1' when wide else '0';
                         state   <= S_DRAWRD;
                      end if;
                   end if;
@@ -1399,7 +1406,55 @@ begin
                   end if;
 
                when S_DRAWRD =>
-                  if rd_valid = '1' then
+                  if rd_valid = '1' and dr_wide = '1' then
+                     -- ---- the wide read-modify-write -----------------------
+                     --
+                     -- One read, up to four blends, one write.  This is where
+                     -- the four-times matters most: a blended pixel costs a
+                     -- read, two clocks of memory latency and a write, and
+                     -- measured on the card that is four clocks per pixel
+                     -- against one for a plain write.  Sharing the round trip
+                     -- between the four pixels of a memory word turns that back
+                     -- into one clock per pixel.
+                     --
+                     -- The blender is instantiated four times over rather than
+                     -- reused, because the four pixels differ only in their
+                     -- destination: the source colour is the same for all of
+                     -- them, which is exactly why this is restricted to flat
+                     -- primitives.
+                     wbe := (others => '0');
+                     -- Starting from the word that was read is belt and braces:
+                     -- the byte enables below only enable the lanes this run
+                     -- covers, so the rest are never written whatever they
+                     -- hold.  Measured, not assumed -- zeroing them instead is
+                     -- a mutation the directed test cannot tell apart.
+                     nw  := rd_data;
+                     for i in 0 to 3 loop
+                        if i < dr_run then
+                           ai := pix_addr_page(dr_fbp, dr_fbw, dr_x + i, dr_y);
+                           li := to_integer(ai(2 downto 0));
+                           opx := rd_data(32 * li + 31 downto 32 * li);
+                           if dr_abe = '1' then
+                              bl := blend_px(dr_src, opx, dr_alpha, dr_fix,
+                                             dr_clamp);
+                           else
+                              bl := dr_src;
+                           end if;
+                           nw(32 * li + 31 downto 32 * li) :=
+                              (opx and dr_fbmsk) or (bl and not dr_fbmsk);
+                           wbe := wbe or shift_left(resize(unsigned'(x"F"), 32),
+                                                    4 * li);
+                        end if;
+                     end loop;
+                     wr_en   <= '1';
+                     wr_addr <= std_logic_vector(dr_addr(19 downto 3));
+                     wr_data <= nw;
+                     wr_be   <= std_logic_vector(wbe);
+                     pixels  <= pixels + dr_run;
+                     px_run  := dr_run;
+                     -- next_px sets the state, as it does for every other way a
+                     -- pixel can end
+                  elsif rd_valid = '1' then
                      lane := to_integer(dr_addr(2 downto 0));
                      oldpx := std_logic_vector(
                                  shift_right(unsigned(rd_data), 32 * lane)(31 downto 0));

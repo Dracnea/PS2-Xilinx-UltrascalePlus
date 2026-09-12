@@ -42,11 +42,21 @@ ZTEST_ALWAYS = (1 << 16) | (1 << 17)
 ZBUF_OFF     = 1 << 32                      # ZMSK = 1
 
 
-def sprite(out, rgba, x0, y0, x1, y1, fbw=1, abe=0, msk=0):
+# ALPHA: A = Cs, B = Cd, C = FIX, D = Cd, so Cv = (Cs - Cd) * FIX >> 7 + Cd.
+#
+# The first version of this file used ALPHA = 0, copied from the clear stream
+# where it does not matter.  That decodes to (Cs - Cs) * As >> 7 + Cs = Cs -- a
+# blend that returns the source and never reads the destination at all.  Three
+# mutations of the wide read-modify-write survived because of it, including one
+# that skipped the blender entirely.
+ALPHA_LERP = 0 | (1 << 2) | (2 << 4) | (1 << 6) | (0x40 << 32)
+
+
+def sprite(out, rgba, x0, y0, x1, y1, fbw=1, abe=0, msk=0, alpha=0):
     items = [(0x4C, 0 | (fbw << 16) | (0 << 24) | (msk << 32)),   # FRAME_1, PSMCT32
              (0x18, 0),                                           # XYOFFSET_1
              (0x40, 0 | (63 << 16) | (0 << 32) | (63 << 48)),     # SCISSOR_1
-             (0x42, 0), (0x46, 1),
+             (0x42, alpha), (0x46, 1),
              (0x4E, ZBUF_OFF), (0x47, ZTEST_ALWAYS),
              (0x01, rgba),
              (0x00, 6 | (abe << 6))]                              # PRIM: sprite
@@ -119,14 +129,31 @@ def main():
             sprite(out, 0x80000000 | (x0 << 16) | w,
                    x0 + 12 * (w // 4), 32, x0 + 12 * (w // 4) + w, 40)
 
-    # y 44..55 -- blending on, which takes the *other* path, the
-    # read-modify-write.  Kept to its own rows so that it cannot paint over the
-    # wide path's evidence, which is exactly what the first version did.
-    sprite(out, 0x40302010, 0, 44, 64, 48, abe=1)
+    # y 44..55 -- the read-modify-write path, which is the other half of the
+    # wide write and the half that matters for a frame's cost.  Kept to its own
+    # rows so that it cannot paint over the wide path's evidence, which is
+    # exactly what the first version did.
+    #
+    # **The destination has to vary across the four pixels of a word**, or a
+    # blender that read every lane's old value from lane zero would be right
+    # anyway.  So each column gets its own colour first, one pixel wide.
+    for x in range(24):
+        sprite(out, 0x01010101 * (x + 3), x, 44, x + 1, 56)
+
+    # now blend over it, at every alignment and width
     for x0 in range(4):
-        for w in (1, 4, 7):
-            sprite(out, 0x20000000 | (x0 << 8) | w,
-                   x0 + 16 * (w // 5), 50, x0 + 16 * (w // 5) + w, 52, abe=1)
+        for w in (1, 2, 3, 4, 5, 7, 8):
+            sprite(out, 0x20406080, x0 + 8 * (w // 5), 44 + 2 * x0,
+                   x0 + 8 * (w // 5) + w, 46 + 2 * x0,
+                   abe=1, alpha=ALPHA_LERP)
+
+    # and a masked write with no blending, which reaches the same path by the
+    # other route: FBMSK non-zero means the destination is read to preserve the
+    # bits the mask protects.
+    for x0 in range(4):
+        for w in (1, 4, 6):
+            sprite(out, 0xFFFFFFFF, x0 + 8 * (w // 5), 52,
+                   x0 + 8 * (w // 5) + w, 54, msk=0x00FF00FF)
 
     # y 56..63 -- a Gouraud triangle under exactly the conditions that enable
     # the wide path, which is what says the path must *not* take them.
