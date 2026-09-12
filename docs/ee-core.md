@@ -1591,9 +1591,42 @@ the scalar ALU. Everything added since is multi-cycle and therefore nowhere near
 that path, which is also why `PMULTW` was worth sixty megahertz the moment it
 stopped being an exception to that rule.
 
-So the remaining clock problem is two structures and they are the original two:
-the parallel ALU's saturating forms, which could move into A2, and the shuffle
-group's multiplexers. The memory port costs about 6 MHz by comparison.
+The memory port costs about 6 MHz by comparison.
+
+### The parallel ALU is not where the clock went — measured, 2026-09-12
+
+This page said for three sessions that the way forward was to move the parallel
+ALU's saturating forms out of the single-cycle path and into A2. That was a
+guess and it is wrong, and the experiment is cheap enough that it should have
+been run when the sentence was first written.
+
+The parallel ALU was given its own two cycles behind the existing multiply
+interlock — which needs no new hazard logic, because that interlock is already
+longer than the forwarding distance. Correctness is unaffected: 19 of 19.
+
+| | Fmax mean (3 directives) | `gen_mmi` CPI | other programs |
+|---|---|---|---|
+| control | 190.8 | 1.00 | 1.23 / 1.11 |
+| parallel ALU registered | **199.3** | **1.54** | 1.23 / 1.11 |
+
+**+8.5 MHz for +54 % cycles on SIMD code.** Reverted.
+
+The interesting part is why the gain is so small. Adding the parallel ALU cost
+58 MHz when it went in; taking it *entirely* off the single-cycle path gives
+back 8.5. So its depth was never the problem — what it did was widen the
+datapath to 128 bits and add thirty arms to the result multiplexer, and
+registering the ALU shrinks neither.
+
+The new critical path says the same thing outright: `m_p1` to `m_lou[63]`, nine
+logic levels and **77 % routing**. That is wire between two 128-bit pipeline
+latches. There is no arithmetic left in it to split.
+
+**So the EE's clock problem is width and fan-out, not any one unit**, and
+splitting units one at a time will keep returning single-digit megahertz. The
+deeper-pipeline work should start from the register file, the forwarding
+network and the result mux — the things that are 128 bits wide and fan out
+everywhere — rather than from any arithmetic block. That is a different and
+larger piece of work than this page has been assuming.
 
 IPC is better but not closed: CPI 1.78 on ordinary code, 2.15 on branch-heavy.
 What is left is multiply/divide latency (inherent), one stall per memory access,
