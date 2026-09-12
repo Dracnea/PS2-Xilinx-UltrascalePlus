@@ -900,6 +900,16 @@ architecture arch of ee_core is
       return op = 28 and (fn = 16#09# or fn = 16#29#) and sa = 16#0C#;
    end function;
 
+   -- PMADDUW (MMI3): the same two unsigned products as PMULTUW, accumulated
+   -- into a 64-bit value assembled from one word of LO and one of HI.
+   function is_pmadduw(ir : std_logic_vector(31 downto 0)) return boolean is
+      variable op : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
+      variable sa : integer := to_integer(unsigned(ir(10 downto 6)));
+   begin
+      return op = 28 and fn = 16#29# and sa = 16#00#;
+   end function;
+
    -- PDIVBW is MMI2's other divide: four words by one halfword.
    function is_pdivbw(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
@@ -948,7 +958,8 @@ architecture arch of ee_core is
    begin
       if op /= 0 and op /= 28 then return false; end if;
       if fn >= 24 and fn <= 27 then return true; end if;
-      return is_pdiv(ir) or is_pdivbw(ir) or is_pmultw(ir) or is_hmac(ir);
+      return is_pdiv(ir) or is_pdivbw(ir) or is_pmultw(ir) or is_hmac(ir)
+             or is_pmadduw(ir);
    end function;
 
    -- The dividers work in magnitudes; this puts the sign back on and widens
@@ -1039,6 +1050,7 @@ begin
       variable dvd2_mag, dvsr2_mag    : unsigned(31 downto 0);
       variable div_shift, div2_shift  : unsigned(32 downto 0);
       variable pdiv, psgn, pdivbw, pmul, hmul : boolean;
+      variable acc64                  : unsigned(63 downto 0);
       variable bw_dvsr                : std_logic_vector(31 downto 0);
       variable bw_lo, bw_hi           : integer;
 
@@ -1675,6 +1687,30 @@ begin
                            ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
                            ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
                            ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
+                        when 16#00# =>                       -- PMADDUW
+                           -- The accumulator is not a doubleword of HI or LO
+                           -- but one word of *each*: LO's word holds the low
+                           -- half and HI's the high, which is the same shape
+                           -- PMULTUW leaves behind and is what makes the two
+                           -- compose into a running 64-bit product sum.
+                           for n in 0 to 1 loop
+                              if n = 0 then
+                                 acc64 := unsigned(hi_f(31 downto 0))
+                                          & unsigned(lo_f(31 downto 0));
+                                 acc64 := acc64 + unsigned(mul_p(63 downto 0));
+                                 ex_lo    := sext32(std_logic_vector(acc64(31 downto 0)));
+                                 ex_hi    := sext32(std_logic_vector(acc64(63 downto 32)));
+                                 ex_val   := std_logic_vector(acc64);
+                              else
+                                 acc64 := unsigned(hi1_f(31 downto 0))
+                                          & unsigned(lo1_f(31 downto 0));
+                                 acc64 := acc64 + unsigned(mul2_p(63 downto 0));
+                                 ex_lou   := sext32(std_logic_vector(acc64(31 downto 0)));
+                                 ex_hiu   := sext32(std_logic_vector(acc64(63 downto 32)));
+                                 ex_valhi := std_logic_vector(acc64);
+                              end if;
+                           end loop;
+                           ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
                         when 16#0D# =>                       -- PDIVUW
                            -- Unsigned division, but the 32-bit results are
                            -- still sign-extended into their 64-bit halves:
@@ -2193,7 +2229,10 @@ begin
             if a2_adv and d_valid = '1' and is_muldiv(d_ir) then
                pdiv   := is_pdiv(d_ir);
                pdivbw := is_pdivbw(d_ir);
-               pmul   := is_pmultw(d_ir);
+               -- PMADDUW loads the multipliers exactly as PMULTUW does --
+               -- both words, both unsigned -- and differs only in what happens
+               -- to the products at retire, so it shares the kick-off.
+               pmul   := is_pmultw(d_ir) or is_pmadduw(d_ir);
                hmul   := is_hmac(d_ir);
                psgn   := fn = 16#09#;        -- MMI2 is PDIVW, MMI3 is PDIVUW
                if ex_cnt = 0 then

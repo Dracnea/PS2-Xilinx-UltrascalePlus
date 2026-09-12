@@ -44,6 +44,7 @@ GROUP = [PMULTH, PMADDH, PHMADH, PMSUBH, PHMSBH]
 
 PMFHI, PMFLO = 0x08, 0x09          # MMI2
 PMTHI, PMTLO = 0x08, 0x09          # MMI3
+PMULTUW, PMADDUW = 0x0C, 0x00      # MMI3
 
 # Operand pairs. Every halfword in a register is distinct, and the two
 # registers of a pair are distinguishable, so any lane taken from the wrong
@@ -130,6 +131,37 @@ def main():
         o += [mmi(0x29, PMTLO, 0, 6, 0), mmi(0x29, PMTHI, 0, 7, 0)]
         o += [mmi(0x09, PMULTH, 0, 4, 5)]
         o += [mmi(0x09, PMFLO, 25, 0, 0), mmi(0x09, PMFHI, 26, 0, 0)]
+
+    # ---- PMADDUW, whose accumulator is a word of LO and a word of HI ------
+    #
+    # Unlike every other accumulator on this page, PMADDUW's is not a
+    # doubleword of one register: the low half comes from LO and the high half
+    # from HI, which is the shape PMULTUW leaves behind and is what lets the
+    # two compose into a running sum of 32x32 products.  So the test builds
+    # exactly that composition -- a PMULTUW and then PMADDUWs onto it -- and
+    # separately seeds LO and HI with values whose *halves* are distinguishable,
+    # so an accumulator assembled from the wrong two words is visible.
+    for ahi, alo in ((0xFFFFFFFF_FFFFFFFF, 0xFFFFFFFF_FFFFFFFF),
+                     (0x80000000_00000001, 0x7FFFFFFF_FFFFFFFF),
+                     (0x00010002_00030004, 0x0005CAFE_00060007),
+                     (0xDEADBEEF_12345678, 0x9ABCDEF0_0FEDCBA9)):
+        for bhi, blo in ((0x00000002_00000003, 0x00000005_00000007),
+                         (0xFFFFFFFF_00000001, 0x80000000_FFFFFFFF)):
+            o += load128(4, ahi, alo)
+            o += load128(5, bhi, blo)
+            # LO and HI seeded so that every one of their four words differs
+            o += load128(6, 0x11111111_22222222, 0x33333333_44444444)
+            o += load128(7, 0x55555555_66666666, 0x77777777_88888888)
+            o += [mmi(0x29, PMTLO, 0, 6, 0), mmi(0x29, PMTHI, 0, 7, 0)]
+            o += [mmi(0x29, PMADDUW, 27, 4, 5)]
+            o += [mmi(0x09, PMFLO, 28, 0, 0), mmi(0x09, PMFHI, 29, 0, 0)]
+            # and the composition the instruction exists for: a product, then
+            # three accumulations onto it, carrying between the halves
+            o += [mmi(0x29, PMULTUW, 0, 4, 5)]
+            o += [mmi(0x29, PMADDUW, 0, 4, 5)]
+            o += [mmi(0x29, PMADDUW, 0, 5, 4)]
+            o += [mmi(0x29, PMADDUW, 30, 4, 5)]
+            o += [mmi(0x09, PMFLO, 31, 0, 0), mmi(0x09, PMFHI, 2, 0, 0)]
 
     for w in o:
         print("%08x" % (w & 0xFFFFFFFF))

@@ -765,6 +765,24 @@ class R5900:
                     self.w128(rd, v)
                     self.lo, self.lo1 = l & M64, l >> 64
                     self.hi, self.hi1 = h & M64, h >> 64
+                elif sa == 0x00:                                        # PMADDUW
+                    # The accumulator is one word of LO and one of HI -- the low
+                    # and high halves of a 64-bit value -- which is exactly the
+                    # shape PMULTUW leaves behind, so the two compose into a
+                    # running sum of products.
+                    v = l = h = 0
+                    for n in range(2):
+                        w = 32 * 2 * n
+                        acc = (((self.lo1 if n else self.lo) & M32)
+                               | (((self.hi1 if n else self.hi) & M32) << 32))
+                        acc = (acc + (((a128 >> (64 * n)) & M32)
+                                      * ((b128 >> (64 * n)) & M32))) & M64
+                        v |= acc << (64 * n)
+                        l |= (sext32(acc & M32) & M64) << (64 * n)
+                        h |= (sext32(acc >> 32) & M64) << (64 * n)
+                    self.w128(rd, v)
+                    self.lo, self.lo1 = l & M64, l >> 64
+                    self.hi, self.hi1 = h & M64, h >> 64
                 elif sa == 0x0D:                                        # PDIVUW
                     l, h = pdivw(False, a128, b128)
                     self.lo, self.lo1 = l & M64, l >> 64

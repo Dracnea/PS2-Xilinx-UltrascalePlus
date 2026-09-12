@@ -1486,6 +1486,36 @@ retire. That is expected: the second stage exists so the tool has a register to
 push into the DSP's own output pipeline, exactly as the scalar `MULT`'s does.
 It is a timing structure, and a functional test cannot see a timing structure.
 
+### PMADDUW, and a deferral that had grown twice — 2026-09-12
+
+Re-reading the deferral once shrank it from "the multiply-accumulate half" to
+"the word-wide forms". Reading the actual code it refers to shrinks it again:
+**`PMADDUW` has no quirk either.** It is a plain unsigned accumulate, and the
+only thing unusual about it is the shape of its accumulator.
+
+That accumulator is not a doubleword of `HI` or `LO` like every other one here.
+It is **one word of each** — `LO`'s word holds the low half of a 64-bit value
+and `HI`'s the high — which is exactly the shape `PMULTUW` leaves behind, and
+is what lets the two compose into a running sum of 32 × 32 products. So the
+directed test builds that composition, and separately seeds `HI` and `LO` with
+four distinguishable words so that an accumulator assembled from the wrong two
+is visible. Eight mutations, eight caught.
+
+So MMI is down to **two** instructions, and for the first time the reason is
+narrowed to exactly what it is rather than inherited. `PMADDW` and `PMSUBW`
+divide by `0xFFFFFFFF` where a shift by 32 belongs, because — per the only
+account of it — the PS2's multiplier is off by one; and `PMADDW` adds
+`0x70000000` when `rt`'s low 31 bits are all zero or all one and `rs /= rt`,
+but only in the low half. Neither is derivable from anything, both come from a
+GPL-3 emulator this project uses as an oracle and never as a source, and
+implementing them would mean writing down behaviour that cannot be checked
+against anything except the thing it was copied from. They wait for a console.
+
+**Twice now, re-reading a deferral has made it smaller.** A deferral inherits
+its justification from whatever was in view when it was written, and nothing
+re-narrows it later unless someone goes back and asks which parts the reason
+actually covers.
+
 ## PMULTW was costing sixty megahertz, unmeasured — 2026-09-12
 
 A fit of `ee_top` after the parallel divides came back at **140.1 MHz**, against
@@ -1525,10 +1555,10 @@ first guess was the divides that had just gone in.
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
 and the VUs. The integer subset is not complete: no TLB. **MMI0 and MMI1 are
-complete, and MMI2 and MMI3 are complete apart from three instructions** —
-`PMADDW`, `PMSUBW` and `PMADDUW`. Everything else in both tables is done,
-including the whole halfword multiply-accumulate group and all five multiplies
-and divides.
+complete, and MMI2 and MMI3 are complete apart from two instructions** —
+`PMADDW` and `PMSUBW`, which wait for a console. Everything else in both tables
+is done: the halfword multiply-accumulate group, `PMADDUW`, and all five
+multiplies and divides.
 
 What is left of MMI is three instructions, and the reason they are a separate
 piece of work is that the **word-wide accumulating forms carry hardware quirks
