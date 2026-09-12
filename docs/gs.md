@@ -1162,6 +1162,38 @@ rate. Each cut exposed the next longest path, and the next longest path was
 always in setup again — right up until the last one, which left the part with
 its critical path at a colour DDA's seed multiply and the clock above spec.
 
+### A cut that made it worse, and the mechanism — measured, 2026-09-12
+
+The in-context build met 147.456 MHz by **0.007 ns**, which is not margin. The
+path was the colour DDA's seed: a vertex coordinate, through the subtraction
+`16·sx − x0`, straight into a multiplier. Exactly the shape the last three cuts
+attacked, so the obvious fix was the same one — register the difference, spend a
+cycle, start the multiply from a value instead of a carry chain.
+
+**It cost twenty megahertz.** 152.6 → 132.3 on the Default directive, with the
+control re-fitted in the same session to the same WNS it gave before, so this is
+a measurement and not a placement. Reverted.
+
+The mechanism is worth more than the attempt was. The DSP48 has a **pre-adder**,
+and the tool was already using it: `nx · (16·sx − x0)` was mapping with the
+subtraction *inside the DSP*, free and off the fabric. Registering the
+difference by hand took it back out, into carry chains and 603 more LUTs, and
+the tool could no longer fold anything. The evidence is direct — the control's
+timing report names `DSP_PREADD_DATA` twelve times and the modified one names it
+zero, on the same 96 DSPs.
+
+So the rule that produced four good cuts has a precise boundary:
+
+* `(a ± b) · c` — **leave it alone.** One DSP absorbs the add and the multiply,
+  and splitting it by hand is strictly worse.
+* `a·c ± b·d` — **split it.** No DSP can absorb a subtraction *between* two
+  products, so that one is genuinely in the fabric, and registering the products
+  first is what the plane-numerator cut did for 5 MHz.
+
+The way to tell them apart before spending an hour on a fit is to look for
+`DSP_PREADD_DATA` in the path being attacked. If it is there, the tool has
+already done the work.
+
 **What this does not close.** The GS now *meets* 147.456 MHz in a fit; it has not
 been run at it. The board target still builds at 125 MHz in the `sys` domain,
 and moving it onto the two-stage MMCM from `boards/ps2_clocks.py` — which
