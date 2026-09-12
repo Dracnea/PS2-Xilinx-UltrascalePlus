@@ -143,6 +143,26 @@ if they come back complemented, an undocumented quirk becomes a measured one.
 Worth doing in the same session as the others, because it needs nothing the
 `ps2link` setup above does not already provide.
 
+## The FPU's last bit, which is the whole of its arithmetic
+
+Not yet buildable -- there is no FPU -- but recorded now because it decides how
+the FPU gets written. See `docs/ee-fpu.md`.
+
+The PS2's FPU rounds toward zero and its multiplier is, by the only accounts
+that exist, not quite exact. The obvious oracle cannot settle it: **PCSX2
+computes with host floats**, which round to nearest, so it models the format and
+the flags faithfully and the arithmetic only approximately. A differential test
+against it would disagree in the last bit of nearly every result for reasons
+that mean nothing.
+
+The probe is a sweep rather than a picture: a few thousand operand pairs chosen
+to straddle rounding boundaries -- products that need bit 24 to round, quotients
+that are repeating binary fractions, sums that cancel to a denormal -- run
+through `ADD.S`, `MUL.S`, `DIV.S` and `SQRT.S` on a console with every result
+dumped as a raw word. One run settles the last bit of every arithmetic
+instruction at once, and until it does, only the structural half of the FPU is
+verified.
+
 ## Two more that a console has to answer, added with PCRTC
 
 Writing the video block's read circuit left two things that cannot be settled
