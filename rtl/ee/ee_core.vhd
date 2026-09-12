@@ -356,6 +356,22 @@ architecture arch of ee_core is
    signal mul2_a, mul2_b  : signed(32 downto 0) := (others => '0');
    signal mul2_p1, mul2_p : signed(65 downto 0) := (others => '0');
 
+   -- Eight more, sixteen bits wide, for MMI's halfword multiply-accumulate
+   -- group: PMULTH, PMADDH, PHMADH, PMSUBH and PHMSBH all form the same eight
+   -- products of rs and rt taken as signed halfwords, and differ only in what
+   -- they do with them afterwards.  Eight multipliers is what the R5900 has
+   -- and it is what makes these single instructions rather than loops; on this
+   -- part they are DSP48s, which the core has plenty of spare.
+   --
+   -- They are pipelined for three cycles like every other multiply here, and
+   -- that is not an optimisation but the lesson from PMULTW: a multiply left
+   -- combinationally in the cycle its result is written cost this core sixty
+   -- megahertz and went unnoticed for two sessions.
+   type hprod_t is array (0 to 7) of signed(31 downto 0);
+   type hop_t   is array (0 to 7) of signed(15 downto 0);
+   signal hm_a, hm_b   : hop_t   := (others => (others => '0'));
+   signal hm_p1, hm_p  : hprod_t := (others => (others => '0'));
+
    function sext32(v : std_logic_vector(31 downto 0)) return std_logic_vector is
    begin
       return std_logic_vector'(31 downto 0 => v(31)) & v;
@@ -715,6 +731,67 @@ architecture arch of ee_core is
       end loop;
    end procedure;
 
+   -- The halfword group's destination map, which is the whole of what
+   -- distinguishes these five instructions from eight independent multiplies.
+   --
+   -- The eight products are dealt out to HI and LO in *pairs*, alternating
+   -- between them and working up the register:
+   --
+   --     p0 p1 -> LO words 0,1      p2 p3 -> HI words 0,1
+   --     p4 p5 -> LO words 2,3      p6 p7 -> HI words 2,3
+   --
+   -- and rd gets the first word of each pair -- LO0, HI0, LO2, HI2 -- which is
+   -- why it is written here rather than assembled by the caller. Four groups,
+   -- one loop, and the five instructions differ only in the two values each
+   -- group produces:
+   --
+   --     PMULTH  v0 = p(2g)             v1 = p(2g+1)
+   --     PMADDH  v0 = LO/HI + p(2g)     v1 = LO/HI + p(2g+1)
+   --     PMSUBH  v0 = LO/HI - p(2g)     v1 = LO/HI - p(2g+1)
+   --     PHMADH  v0 = p(2g+1) + p(2g)   v1 = p(2g+1)
+   --     PHMSBH  v0 = p(2g+1) - p(2g)   v1 = NOT p(2g+1)
+   --
+   -- > **UNVERIFIED:** `PHMSBH`'s second word is the *complement* of the
+   -- > product, not the product.  No manual this project has says so; it is
+   -- > PCSX2's behaviour, marked in its own source as undocumented, and this
+   -- > is the only account of it anywhere. It is implemented because a guess
+   -- > that matches the only known description is better than a different
+   -- > guess, and it is tagged because it is still a guess. See
+   -- > hw/ps2probe/README.md.
+   procedure hmac(form : integer; p : in hprod_t;
+                  curlo, curhi : in std_logic_vector(127 downto 0);
+                  rdv, lov, hiv : out std_logic_vector(127 downto 0)) is
+      variable v0, v1 : signed(31 downto 0);
+      variable c0, c1 : signed(31 downto 0);
+      variable w      : integer;
+   begin
+      for g in 0 to 3 loop
+         w := 64 * (g / 2);          -- bit offset of this group's first word
+         if g mod 2 = 0 then
+            c0 := signed(curlo(w + 31 downto w));
+            c1 := signed(curlo(w + 63 downto w + 32));
+         else
+            c0 := signed(curhi(w + 31 downto w));
+            c1 := signed(curhi(w + 63 downto w + 32));
+         end if;
+         case form is
+            when 16#1C# => v0 := p(2*g);            v1 := p(2*g+1);       -- PMULTH
+            when 16#10# => v0 := c0 + p(2*g);       v1 := c1 + p(2*g+1);  -- PMADDH
+            when 16#14# => v0 := c0 - p(2*g);       v1 := c1 - p(2*g+1);  -- PMSUBH
+            when 16#11# => v0 := p(2*g+1) + p(2*g); v1 := p(2*g+1);       -- PHMADH
+            when others => v0 := p(2*g+1) - p(2*g); v1 := not p(2*g+1);   -- PHMSBH
+         end case;
+         if g mod 2 = 0 then
+            lov(w + 31 downto w)      := std_logic_vector(v0);
+            lov(w + 63 downto w + 32) := std_logic_vector(v1);
+         else
+            hiv(w + 31 downto w)      := std_logic_vector(v0);
+            hiv(w + 63 downto w + 32) := std_logic_vector(v1);
+         end if;
+         rdv(32 * g + 31 downto 32 * g) := std_logic_vector(v0);
+      end loop;
+   end procedure;
+
    function reads_rs(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
       variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
@@ -802,6 +879,18 @@ architecture arch of ee_core is
       return op = 28 and (fn = 16#09# or fn = 16#29#) and sa = 16#0D#;
    end function;
 
+   -- MMI2's halfword multiply-accumulate group, all five of which want the
+   -- same eight products and so share one kick-off.
+   function is_hmac(ir : std_logic_vector(31 downto 0)) return boolean is
+      variable op : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
+      variable sa : integer := to_integer(unsigned(ir(10 downto 6)));
+   begin
+      return op = 28 and fn = 16#09#
+             and (sa = 16#10# or sa = 16#11# or sa = 16#14#
+                  or sa = 16#15# or sa = 16#1C#);
+   end function;
+
    -- PMULTW (MMI2) and PMULTUW (MMI3): two 32x32 products, multi-cycle.
    function is_pmultw(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
@@ -859,7 +948,7 @@ architecture arch of ee_core is
    begin
       if op /= 0 and op /= 28 then return false; end if;
       if fn >= 24 and fn <= 27 then return true; end if;
-      return is_pdiv(ir) or is_pdivbw(ir) or is_pmultw(ir);
+      return is_pdiv(ir) or is_pdivbw(ir) or is_pmultw(ir) or is_hmac(ir);
    end function;
 
    -- The dividers work in magnitudes; this puts the sign back on and widens
@@ -949,7 +1038,7 @@ begin
       variable dvd_mag, dvsr_mag      : unsigned(31 downto 0);
       variable dvd2_mag, dvsr2_mag    : unsigned(31 downto 0);
       variable div_shift, div2_shift  : unsigned(32 downto 0);
-      variable pdiv, psgn, pdivbw, pmul : boolean;
+      variable pdiv, psgn, pdivbw, pmul, hmul : boolean;
       variable bw_dvsr                : std_logic_vector(31 downto 0);
       variable bw_lo, bw_hi           : integer;
 
@@ -1503,6 +1592,19 @@ begin
                         when 16#0C# =>                       -- PMULTW
                            pmultw(mul_p(63 downto 0), mul2_p(63 downto 0),
                                   pv, plo, phi);
+                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
+                           ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
+                           ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
+                        when 16#1C# | 16#10# | 16#11# | 16#14# | 16#15# =>
+                           -- PMULTH, PMADDH, PHMADH, PMSUBH, PHMSBH.  The
+                           -- accumulating pair read HI and LO, so they take the
+                           -- *forwarded* copies: a PMADDH straight after a
+                           -- PMULTH is how the group is actually used, and
+                           -- reading the register file there would accumulate
+                           -- onto a value one instruction out of date.
+                           hmac(sa, hm_p, lo1_f & lo_f, hi1_f & hi_f,
+                                pv, plo, phi);
                            ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
                            ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
                            ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
@@ -2092,6 +2194,7 @@ begin
                pdiv   := is_pdiv(d_ir);
                pdivbw := is_pdivbw(d_ir);
                pmul   := is_pmultw(d_ir);
+               hmul   := is_hmac(d_ir);
                psgn   := fn = 16#09#;        -- MMI2 is PDIVW, MMI3 is PDIVUW
                if ex_cnt = 0 then
                   -- kick off
@@ -2124,6 +2227,15 @@ begin
                                  a128(95 downto 64), b128(95 downto 64));
                         ex_cnt <= 33;
                      end if;
+                  elsif hmul then
+                     -- Eight halfword pairs, straight in.  All five
+                     -- instructions in the group load identically; what they
+                     -- differ about happens three cycles later.
+                     for i in 0 to 7 loop
+                        hm_a(i) <= signed(a128(16*i+15 downto 16*i));
+                        hm_b(i) <= signed(b128(16*i+15 downto 16*i));
+                     end loop;
+                     ex_cnt <= 3;
                   elsif fn = 24 or fn = 25 or pmul then
                      -- MULT, MULTU, PMULTW and PMULTUW all load the same way.
                      -- The signed and unsigned forms differ only in how the
@@ -2166,7 +2278,17 @@ begin
                      ex_cnt <= 33;
                   end if;
                elsif ex_cnt > 1 then
-                  if fn = 24 or fn = 25 or pmul then
+                  if hmul then
+                     if ex_cnt = 3 then
+                        for i in 0 to 7 loop
+                           hm_p1(i) <= hm_a(i) * hm_b(i);
+                        end loop;
+                     else
+                        for i in 0 to 7 loop
+                           hm_p(i) <= hm_p1(i);
+                        end loop;
+                     end if;
+                  elsif fn = 24 or fn = 25 or pmul then
                      if ex_cnt = 3 then
                         mul_p1  <= mul_a * mul_b;
                         mul2_p1 <= mul2_a * mul2_b;

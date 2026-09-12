@@ -59,6 +59,13 @@ def s64(x):
     return x - (1 << 64) if x >> 63 else x
 
 
+def sext16(x):
+    """A halfword read as signed, which is how every operand of the halfword
+    multiply group is taken."""
+    x &= 0xFFFF
+    return x - (1 << 16) if x >> 15 else x
+
+
 def s32(x):
     x &= M32
     return x - (1 << 32) if x >> 31 else x
@@ -330,6 +337,55 @@ def pdivw(signed_form, a128, b128):
         lo |= (l & M64) << (64 * n)
         hi |= (h & M64) << (64 * n)
     return lo, hi
+
+
+def hmac(form, a128, b128, curlo, curhi):
+    """MMI2's halfword multiply-accumulate group.
+
+    PMULTH, PMADDH, PHMADH, PMSUBH and PHMSBH all form the same eight products
+    of rs and rt read as signed halfwords, and differ only in what they do with
+    them. The products are dealt out to HI and LO in *pairs*, alternating
+    between the two and working up the register:
+
+        p0 p1 -> LO words 0,1      p2 p3 -> HI words 0,1
+        p4 p5 -> LO words 2,3      p6 p7 -> HI words 2,3
+
+    and rd gets the first word of each pair: LO0, HI0, LO2, HI2.
+
+    Every result is a 32-bit word that wraps rather than saturating, which is
+    the opposite of MMI0's arithmetic and is what makes the accumulating forms
+    usable as a dot product: an intermediate sum is allowed to overflow and come
+    back.
+
+    PHMSBH's second word is the **complement** of the product. That is
+    undocumented -- see the note in rtl/ee/ee_core.vhd and the probe entry --
+    and is implemented here because it is the only known account of it.
+
+    Returns (rd, lo, hi) as 128-bit values.
+    """
+    p = [s32(sext16((a128 >> (16 * i)) & 0xFFFF)
+             * sext16((b128 >> (16 * i)) & 0xFFFF)) for i in range(8)]
+    rd = lo = hi = 0
+    nlo, nhi = curlo, curhi
+    for g in range(4):
+        w = 64 * (g // 2)
+        cur = curlo if g % 2 == 0 else curhi
+        c0 = s32((cur >> w) & M32)
+        c1 = s32((cur >> (w + 32)) & M32)
+        if form == 0x1C:   v0, v1 = p[2*g],            p[2*g+1]
+        elif form == 0x10: v0, v1 = c0 + p[2*g],       c1 + p[2*g+1]
+        elif form == 0x14: v0, v1 = c0 - p[2*g],       c1 - p[2*g+1]
+        elif form == 0x11: v0, v1 = p[2*g+1] + p[2*g], p[2*g+1]
+        else:              v0, v1 = p[2*g+1] - p[2*g], ~p[2*g+1]
+        v0 &= M32
+        v1 &= M32
+        mask = ~((M32 << w) | (M32 << (w + 32))) & M128
+        if g % 2 == 0:
+            nlo = (nlo & mask) | (v0 << w) | (v1 << (w + 32))
+        else:
+            nhi = (nhi & mask) | (v0 << w) | (v1 << (w + 32))
+        rd |= v0 << (32 * g)
+    return rd, nlo, nhi
 
 
 def pdivbw(a128, b128):
@@ -673,6 +729,12 @@ class R5900:
                     self.hi, self.hi1 = h & M64, h >> 64
                 elif sa == 0x0D:                                        # PDIVW
                     l, h = pdivw(True, a128, b128)
+                    self.lo, self.lo1 = l & M64, l >> 64
+                    self.hi, self.hi1 = h & M64, h >> 64
+                elif sa in (0x1C, 0x10, 0x11, 0x14, 0x15):
+                    # PMULTH, PMADDH, PHMADH, PMSUBH, PHMSBH
+                    v, l, h = hmac(sa, a128, b128, lolo, hilo)
+                    self.w128(rd, v)
                     self.lo, self.lo1 = l & M64, l >> 64
                     self.hi, self.hi1 = h & M64, h >> 64
                 elif sa == 0x1D:                                        # PDIVBW

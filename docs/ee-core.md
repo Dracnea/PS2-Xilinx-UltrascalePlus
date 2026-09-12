@@ -1405,6 +1405,87 @@ still sign-extends its 32-bit results into their 64-bit halves, because the
 result is a word and a word landing in a doubleword is always sign-extended on
 this machine, however its operands were read.
 
+## The halfword multiply-accumulate group — 2026-09-12
+
+`PMULTH`, `PMADDH`, `PHMADH`, `PMSUBH` and `PHMSBH`. Five instructions that
+form the same eight products — rs and rt read as signed halfwords, eight
+16 × 16 multipliers — and differ only in what they do with them afterwards.
+
+### Splitting a deferral that had been treated as one thing
+
+This page has said since MMI2 and MMI3 went in that the multiply-accumulate
+half was deferred because *"the accumulating forms carry hardware quirks nobody
+has explained"*, citing PCSX2's `PMADDW` adding `0x70000000` under a condition
+its own comment calls "PlayStation 2 division voodoo".
+
+That was true of the **word** forms and was quietly assumed of the halfword
+ones. Checking rather than assuming: the halfword group is plain arithmetic
+with no such quirk anywhere in it. So it is done, and `PMADDW`, `PMSUBW` and
+`PMADDUW` remain deferred for the reason that actually applies to them.
+
+The lesson is small and worth having: a deferral inherits its justification
+from whatever was in view when it was written, and the scope drifts outward if
+nobody re-reads it.
+
+### The lane map is the instruction
+
+Nothing here is interesting arithmetic. What makes these five instructions
+rather than eight multiplies is where the products go, and it is not obvious:
+they are dealt to HI and LO in *pairs*, alternating, working up the register.
+
+    p0 p1 -> LO words 0,1      p2 p3 -> HI words 0,1
+    p4 p5 -> LO words 2,3      p6 p7 -> HI words 2,3
+
+and rd takes the first word of each pair — LO0, HI0, LO2, HI2. Written that
+way it is one loop over four groups, and the five instructions differ in two
+lines: the pair of values each group produces. The horizontal forms
+(`PHMADH`, `PHMSBH`) combine the two products of a group instead of keeping
+them apart, which is the only structural difference among the five.
+
+The directed program's operands are therefore all-distinct halfwords rather
+than corner values: a product taken from the wrong lane, or landing in HI where
+it belonged in LO, has to produce a number that appears nowhere else in the
+answer. Corners are in there too — `0x8000 × 0x8000` in every lane, accumulated
+four deep, which takes the sums well past 32 bits, because **these wrap and do
+not saturate**. That is the opposite of MMI0's arithmetic and it is what makes
+the accumulating forms usable as a dot product.
+
+### PHMSBH writes the complement of a product, and nobody knows why
+
+`PHMSBH`'s second word of each pair is `NOT p`, not `p`. No manual this project
+has says so. It is PCSX2's behaviour, marked in its own source as undocumented,
+and it is the only account of it anywhere.
+
+It is implemented, because a guess that matches the only known description is
+better than a different guess, and it is **tagged in both implementations and
+given a probe entry**, because testing a guess against a copy of itself proves
+only that the two agree. This is the same treatment the depth clamp got.
+
+### Twelve mutations, ten caught, and the two that were not
+
+Ten of twelve fail: HI and LO swapped, rd taking the wrong word of the pair,
+the complement dropped, halfwords read unsigned, `PMSUBH` adding, `PHMADH`
+doubling the wrong product, the pair's words swapped, the group base computed
+from the wrong half of the index, an accumulate that stops accumulating, and
+the interlock removed.
+
+Two survive, and both are **equivalent mutants** — which is a conclusion, not a
+gap, and it was checked against the whole regression rather than asserted:
+
+**Reading HI and LO unforwarded is indistinguishable here.** These are
+multi-cycle instructions: one sits in A1 for four cycles and reads its
+accumulator on the last of them, by which time any producer — even one
+immediately before it — has been through A2 and WB with a cycle to spare. The
+forwarding distance is shorter than the interlock. The forwarded read stays
+anyway, because it costs nothing and it is what keeps this correct if the
+interlock is ever shortened.
+
+**The second multiplier pipeline stage is invisible.** Reading the product from
+the first stage gives the same answer, because nothing overwrites it before the
+retire. That is expected: the second stage exists so the tool has a register to
+push into the DSP's own output pipeline, exactly as the scalar `MULT`'s does.
+It is a timing structure, and a functional test cannot see a timing structure.
+
 ## PMULTW was costing sixty megahertz, unmeasured — 2026-09-12
 
 A fit of `ee_top` after the parallel divides came back at **140.1 MHz**, against
@@ -1444,12 +1525,14 @@ first guess was the divides that had just gone in.
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
 and the VUs. The integer subset is not complete: no TLB. **MMI0 and MMI1 are
-complete, and MMI2 and MMI3 are complete apart from their multiply-accumulate
-half** — `PMADDW`, `PMSUBW`, `PMADDH`, `PHMADH`, `PMSUBH`, `PHMSBH`, `PMULTH`
-and `PMADDUW`; `PMULTW`, `PMULTUW`, `PDIVW`, `PDIVUW` and `PDIVBW` are done.
+complete, and MMI2 and MMI3 are complete apart from three instructions** —
+`PMADDW`, `PMSUBW` and `PMADDUW`. Everything else in both tables is done,
+including the whole halfword multiply-accumulate group and all five multiplies
+and divides.
 
-The reason the rest is a separate piece of work is that the **accumulating forms
-carry hardware quirks nobody has explained**: PCSX2's
+What is left of MMI is three instructions, and the reason they are a separate
+piece of work is that the **word-wide accumulating forms carry hardware quirks
+nobody has explained**: PCSX2's
 `PMADDW` adds `0x70000000` under a condition its own comment calls "PlayStation
 2 division voodoo, for some reason only the lower half is affected", and divides
 by `0xFFFFFFFF` rather than shifting by 32 because "multiplication error on the

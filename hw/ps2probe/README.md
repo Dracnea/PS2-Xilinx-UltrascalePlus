@@ -119,6 +119,30 @@ texture coordinate is truncated and may carry a block width of its own**, but no
 capture has swept it. The same width curve that established eight pixels for
 colour would settle it, and there is no texture unit to drive it with.
 
+## PHMSBH's complement — the first EE probe on this page
+
+Every other entry here is about the Graphics Synthesizer. This one is about the
+Emotion Engine, and it is the same shape of question.
+
+`PHMSBH` computes, for each pair of halfword products, `p(n+1) - p(n)` into one
+word and — according to the only account of it that exists — the **bitwise
+complement** of `p(n+1)` into the next. Not the product: its complement. PCSX2
+implements that and marks it `// undocumented behaviour` in its own source; no
+manual this project has describes it at all.
+
+`rtl/ee/ee_core.vhd` and `sim/ee/r5900_ref.py` both implement it, and they agree
+with each other, which proves nothing — they are the same guess written twice.
+
+The probe is an EE program rather than a GIF stream, so it needs a different
+harness from `gsprobe.c`: load a register pair with halfwords whose products are
+distinct and non-symmetric, execute `PHMSBH`, and read HI and LO back with
+`PMFHI`/`PMFLO`. Words 1 and 3 of each are the answer. If they come back as the
+plain product, both implementations lose one `NOT` each and this note goes away;
+if they come back complemented, an undocumented quirk becomes a measured one.
+
+Worth doing in the same session as the others, because it needs nothing the
+`ps2link` setup above does not already provide.
+
 ## Two more that a console has to answer, added with PCRTC
 
 Writing the video block's read circuit left two things that cannot be settled
