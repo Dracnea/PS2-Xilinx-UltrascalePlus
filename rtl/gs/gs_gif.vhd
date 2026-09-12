@@ -32,6 +32,8 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
+use work.gs_addr_pkg.all;
+
 entity gs_gif is
    port
    (
@@ -79,7 +81,8 @@ architecture arch of gs_gif is
    type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
                     S_SPR_CLAMP, S_SPR_TEST,
                     S_DRAW, S_DRAWRD,
-                    S_TRI_SET, S_TRI_WAIT, S_TRI_SCAN, S_TRI_STEP,
+                    S_TRI_SET, S_TRI_WAIT, S_TRI_SCAN, S_TRI_CLAMP,
+                    S_TRI_TEST, S_TRI_STEP,
                     S_TRI_SEED, S_ZRD);
    signal state : state_t := S_TAG;
 
@@ -162,6 +165,13 @@ architecture arch of gs_gif is
    -- the right ones to cut and the pixel loop is not.
    signal k_ax, k_ay, k_bx, k_by     : integer range -131072 to 131071 := 0;
    signal k_sx0, k_sx1, k_sy0, k_sy1 : integer range 0 to 2047 := 0;
+
+   -- The scanline's span, and the scissor it is clamped against, carried
+   -- between S_TRI_SCAN, S_TRI_CLAMP and S_TRI_TEST.  The low end of the range
+   -- is -4097 and not -4096 because a scanline that no edge spans leaves the
+   -- maximum at its initial -4096 and then subtracts one from it.
+   signal q_lft, q_rgt : integer range -4097 to 4095 := 0;
+   signal q_sx0, q_sx1 : integer range 0 to 2047 := 0;
    signal k_ok  : std_logic := '0';
    signal dr_x1      : unsigned(10 downto 0) := (others => '0');
    signal dr_y1      : unsigned(10 downto 0) := (others => '0');
@@ -341,86 +351,42 @@ architecture arch of gs_gif is
       end if;
    end function;
 
-   -- The five bits after the page are the block index within it, and the six
-   -- after that the word within the block.  The depth formats use the same
-   -- tables with the block index exclusive-ored by 24 -- bits 3 and 4, which
-   -- are y(4) and x(5) here.  The GS User's Manual gives the PSMZ32 and PSMZ16
-   -- block figures as their colour figures with every entry xor 24, and PCSX2
-   -- says the same thing as `swizzle32Z {swizzleTables32, 0x18}`.
+   -- The swizzle, fb16_half and the two 16-bit conversions live in
+   -- gs_addr_pkg: PCRTC reads the frame buffer back through exactly the same
+   -- addressing this writes it with, and two copies that drifted would scramble
+   -- the picture in a way no differential test of either block alone could find
+   -- -- each would still agree with its own model.
+
+   -- ---- placing a pixel in a 256-bit word ---------------------------------
+   -- The write port is 256 bits and a pixel is 32 or 16, so the pixel has to
+   -- land in the lane its address names.  The obvious way is to shift it there,
+   -- and that builds a 256-bit barrel shifter on the *end* of the
+   -- read-modify-write path -- after the memory read, the expand, the blender
+   -- and the format pack, which is already the longest path in the design.
    --
-   -- Getting this wrong is invisible in a differential test, because the
-   -- reference and the RTL are wrong together: it shows up only against silicon
-   -- or wherever a Z buffer shares memory with something addressed as colour --
-   -- which is exactly what reading the Z buffer back through Local->Host does.
-   function pix_addr_page(pg : unsigned(8 downto 0); bw : unsigned(5 downto 0);
-                          x, y : unsigned(10 downto 0);
-                          zblk : std_logic := '0') return unsigned is
-      variable page : unsigned(8 downto 0);
-   begin
-      page := resize(pg + resize(y(10 downto 5) * bw, 9)
-                     + resize(x(10 downto 6), 9), 9);
-      return page & (x(5) xor zblk) & (y(4) xor zblk) & x(4) & y(3) & x(3)
-                  & y(2) & y(1) & x(2) & x(1) & y(0) & x(0);
-   end function;
-
-   function pix_addr(bp : unsigned(13 downto 0); bw : unsigned(5 downto 0);
-                     x, y : unsigned(10 downto 0)) return unsigned is
-   begin
-      return pix_addr_page(bp(13 downto 5), bw, x, y);
-   end function;
-
-   -- The 16-bit formats.  A page is 64x64 pixels, a block 16x8, a column 16x2,
-   -- and two pixels share a word.  The six bits naming the word within a block
-   -- are the *same* interleave as at 32 bits -- a column holds sixteen words
-   -- either way, and the extra eight pixels of width go into the upper half of
-   -- those same words -- so only the block index changes, and which half, which
-   -- is x(3) and is returned by fb16_half rather than folded in here.
-   --
-   -- PSMCT16 and PSMCT16S differ only in the order of blocks within a page.
-   -- Both orders are wire permutations here, as the 32-bit one is.
-   function pix_addr16_page(pg : unsigned(8 downto 0); bw : unsigned(5 downto 0);
-                            x, y : unsigned(10 downto 0);
-                            sform : std_logic;
-                            zblk  : std_logic := '0') return unsigned is
-      variable page : unsigned(8 downto 0);
-      variable blk  : unsigned(4 downto 0);
-   begin
-      page := resize(pg + resize(y(10 downto 6) * bw, 9)
-                     + resize(x(10 downto 6), 9), 9);
-      if sform = '0' then
-         blk := y(5) & x(5) & y(4) & x(4) & y(3);
-      else
-         blk := x(5) & y(4) & y(5) & x(4) & y(3);
-      end if;
-      blk := blk xor ("11" & "000" and (4 downto 0 => zblk));
-      return page & blk & y(2) & y(1) & x(2) & x(1) & y(0) & x(0);
-   end function;
-
-   function fb16_half(x : unsigned(10 downto 0)) return integer is
-   begin
-      return to_integer(unsigned'("" & x(3)));
-   end function;
-
-   -- RGBA16 is A1 B5 G5 R5.  The two conversions are not inverses: writing
-   -- truncates the low three bits of each channel, and reading shifts back up
-   -- with *zeros* rather than replicating the top bits, so white comes back as
-   -- 0xF8F8F8 and not 0xFFFFFF.  Alpha read from a 16-bit buffer is 0x80 or
-   -- 0x00, never 0xFF.  All three are drawn explicitly in the GS User's Manual
-   -- (3.9.5 and "Color Processing in PSMCT16(S) Mode") and all three are the
-   -- opposite of the obvious guess.
-   function pack16(rgba : std_logic_vector(31 downto 0))
+   -- It is not needed.  The byte enables already say which lane is being
+   -- written, so the data can simply be repeated into every lane and the
+   -- enables pick one.  Replication is wires; the shifter was about 0.8 ns of a
+   -- 7.6 ns path, and this costs nothing in throughput because it changes no
+   -- cycle counts at all.
+   function spread32(v : std_logic_vector(31 downto 0))
       return std_logic_vector is
+      variable r : std_logic_vector(255 downto 0);
    begin
-      return rgba(31) & rgba(23 downto 19) & rgba(15 downto 11) & rgba(7 downto 3);
+      for i in 0 to 7 loop
+         r(32*i+31 downto 32*i) := v;
+      end loop;
+      return r;
    end function;
 
-   function expand16(px : std_logic_vector(15 downto 0))
+   function spread16(v : std_logic_vector(15 downto 0))
       return std_logic_vector is
+      variable r : std_logic_vector(255 downto 0);
    begin
-      return (px(15) & "0000000")          -- alpha: 0x80 or 0x00
-           & (px(14 downto 10) & "000")
-           & (px(9 downto 5) & "000")
-           & (px(4 downto 0) & "000");
+      for i in 0 to 15 loop
+         r(16*i+15 downto 16*i) := v;
+      end loop;
+      return r;
    end function;
 
    -- The four frame-buffer formats this rasteriser can draw to.
@@ -539,7 +505,8 @@ begin
                 '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
                          or state = S_SPR_CLAMP or state = S_SPR_TEST
                          or state = S_TRI_SET or state = S_TRI_WAIT
-                         or state = S_TRI_SCAN or state = S_TRI_STEP
+                         or state = S_TRI_SCAN or state = S_TRI_CLAMP
+                         or state = S_TRI_TEST or state = S_TRI_STEP
                          or state = S_TRI_SEED or state = S_ZRD
                 else '1';
 
@@ -1142,6 +1109,16 @@ begin
                      state <= S_DRAW;
                   end if;
 
+               -- Finding the span, clamping it to the scissor and deciding
+               -- whether anything of it survived used to be one state.  That
+               -- put the three edge DDAs' outputs through a three-way minimum,
+               -- a three-way maximum, two clamps and three comparisons in one
+               -- clock: twenty-nine logic levels, and the longest path in the
+               -- part once the pixel path and the plane numerators had been
+               -- split off.  It is three states now.  The cost is two extra
+               -- clocks per scanline against a scanline hundreds of pixels
+               -- long, which is the same trade the sprite setup took and the
+               -- same reason: this is per primitive, not per pixel.
                when S_TRI_SCAN =>
                   -- Exactly two edges span any scanline, and the span runs
                   -- between their two ceil(x) values, half-open.
@@ -1154,12 +1131,19 @@ begin
                         if to_integer(e_x(k)) > rgt then rgt := to_integer(e_x(k)); end if;
                      end if;
                   end loop;
-                  sx0 := to_integer(unsigned(reg(16#40# + ctxi)(10 downto 0)));
-                  sx1 := to_integer(unsigned(reg(16#40# + ctxi)(26 downto 16)));
-                  rgt := rgt - 1;
-                  if lft < sx0 then lft := sx0; end if;
-                  if rgt > sx1 then rgt := sx1; end if;
-                  if lft > rgt or lft < 0 or rgt < 0 then
+                  q_lft <= lft;
+                  q_rgt <= rgt - 1;
+                  q_sx0 <= to_integer(unsigned(reg(16#40# + ctxi)(10 downto 0)));
+                  q_sx1 <= to_integer(unsigned(reg(16#40# + ctxi)(26 downto 16)));
+                  state <= S_TRI_CLAMP;
+
+               when S_TRI_CLAMP =>
+                  if q_lft < q_sx0 then q_lft <= q_sx0; end if;
+                  if q_rgt > q_sx1 then q_rgt <= q_sx1; end if;
+                  state <= S_TRI_TEST;
+
+               when S_TRI_TEST =>
+                  if q_lft > q_rgt or q_lft < 0 or q_rgt < 0 then
                      e_step <= '1';
                      if dr_y >= dr_y1 then
                         tri_mode <= '0';
@@ -1169,15 +1153,15 @@ begin
                         state <= S_TRI_STEP;
                      end if;
                   else
-                     dr_x  <= to_unsigned(lft, 11);
-                     dr_x0 <= to_unsigned(lft, 11);
-                     dr_x1 <= to_unsigned(rgt, 11);
+                     dr_x  <= to_unsigned(q_lft, 11);
+                     dr_x0 <= to_unsigned(q_lft, 11);
+                     dr_x1 <= to_unsigned(q_rgt, 11);
                      if dr_iip = '1' or dr_zon = '1' then
                         -- Every span is seeded at its own first pixel, which is
                         -- also where the blocking starts: lane 0 of block 0 is
                         -- the leftmost pixel of this scanline, not of the
                         -- triangle and not of an aligned x.
-                        c_sx <= to_signed(lft, 13);
+                        c_sx <= to_signed(q_lft, 13);
                         c_sy <= signed(resize(dr_y, 13));
                         if dr_iip = '1' then c_sstart <= '1'; end if;
                         if dr_zon = '1' then z_sstart <= '1'; end if;
@@ -1242,15 +1226,12 @@ begin
                            wr_en   <= '1';
                            wr_addr <= std_logic_vector(za(19 downto 3));
                            if dr_z16 = '1' then
-                              wr_data <= std_logic_vector(shift_left(
-                                            resize(unsigned(src_zc(15 downto 0)), 256),
-                                            32 * lane + 16 * half));
+                              wr_data <= spread16(src_zc(15 downto 0));
                               wr_be   <= std_logic_vector(shift_left(
                                             resize(unsigned'("11"), 32),
                                             4 * lane + 2 * half));
                            else
-                              wr_data <= std_logic_vector(shift_left(
-                                            resize(unsigned(src_zc), 256), 32 * lane));
+                              wr_data <= spread32(src_zc);
                               wr_be   <= std_logic_vector(shift_left(
                                             resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
                            end if;
@@ -1279,15 +1260,12 @@ begin
                         wr_en   <= '1';
                         wr_addr <= std_logic_vector(wa(19 downto 3));
                         if dr_fb16 = '1' then
-                           wr_data <= std_logic_vector(shift_left(
-                                         resize(unsigned(pack16(src_rgba)), 256),
-                                         32 * lane + 16 * half));
+                           wr_data <= spread16(pack16(src_rgba));
                            wr_be   <= std_logic_vector(shift_left(
                                          resize(unsigned'("11"), 32),
                                          4 * lane + 2 * half));
                         else
-                           wr_data <= std_logic_vector(shift_left(
-                                         resize(unsigned(src_rgba), 256), 32 * lane));
+                           wr_data <= spread32(src_rgba);
                            wr_be   <= std_logic_vector(shift_left(
                                          resize(unsigned'(x"F"), 32), 4 * lane));
                         end if;
@@ -1311,15 +1289,12 @@ begin
                            wr_en   <= '1';
                            wr_addr <= std_logic_vector(dr_zaddr(19 downto 3));
                            if dr_z16 = '1' then
-                              wr_data <= std_logic_vector(shift_left(
-                                            resize(unsigned(dr_srcz(15 downto 0)), 256),
-                                            32 * lane + 16 * dr_zhalf));
+                              wr_data <= spread16(dr_srcz(15 downto 0));
                               wr_be   <= std_logic_vector(shift_left(
                                             resize(unsigned'("11"), 32),
                                             4 * lane + 2 * dr_zhalf));
                            else
-                              wr_data <= std_logic_vector(shift_left(
-                                            resize(unsigned(dr_srcz), 256), 32 * lane));
+                              wr_data <= spread32(dr_srcz);
                               wr_be   <= std_logic_vector(shift_left(
                                             resize(unsigned(zbe(dr_zmask)), 32), 4 * lane));
                            end if;
@@ -1362,16 +1337,13 @@ begin
                         -- does rather than needing one of its own.
                         msk16 := pack16(dr_fbmsk);
                         new16 := (old16 and msk16) or (pack16(blended) and not msk16);
-                        wr_data <= std_logic_vector(shift_left(
-                                      resize(unsigned(new16), 256),
-                                      32 * lane + 16 * dr_half));
+                        wr_data <= spread16(new16);
                         wr_be   <= std_logic_vector(shift_left(
                                       resize(unsigned'("11"), 32),
                                       4 * lane + 2 * dr_half));
                      else
                         newpx := (oldpx and dr_fbmsk) or (blended and not dr_fbmsk);
-                        wr_data <= std_logic_vector(shift_left(
-                                      resize(unsigned(newpx), 256), 32 * lane));
+                        wr_data <= spread32(newpx);
                         wr_be   <= std_logic_vector(shift_left(
                                       resize(unsigned'(x"F"), 32), 4 * lane));
                      end if;
@@ -1389,9 +1361,7 @@ begin
                         lane := to_integer(wa(2 downto 0));
                         wr_en   <= '1';
                         wr_addr <= std_logic_vector(wa(19 downto 3));
-                        wr_data <= std_logic_vector(shift_left(
-                                      resize(unsigned(px_data(31 downto 0)), 256),
-                                      32 * lane));
+                        wr_data <= spread32(px_data(31 downto 0));
                         wr_be   <= std_logic_vector(shift_left(
                                       resize(unsigned'(x"F"), 32), 4 * lane));
                         if x_cx + 1 = x_x0 + x_w then

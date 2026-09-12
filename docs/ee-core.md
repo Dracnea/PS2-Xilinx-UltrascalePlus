@@ -1322,18 +1322,134 @@ The directed program caught it on the run it was added to, which is the useful
 part: `gen_mmi.py` already had the machinery to check that HI and LO move
 together and that a wide write does not disturb the second pair.
 
+## The parallel divides — 2026-09-11
+
+`PDIVW`, `PDIVUW` and `PDIVBW` are done. These were the half of MMI2 and MMI3
+that had been deferred four times, and the reason to do them now rather than
+later is that they are *machinery*: unlike the accumulating forms below, nothing
+about what they compute is in question.
+
+### Two dividers, because the results have to arrive together
+
+`PDIVW` divides word 0 by word 0 and word 2 by word 2, and both quotients land
+in the 128-bit LO at once. With one divider that is sixty-six cycles; with two
+it is thirty-three, which is what the scalar `DIV` already takes. The second
+divider is thirty-two bits of subtractor next to a datapath that is already a
+hundred and twenty-eight wide, so the trade is not close.
+
+It steps unconditionally, beside the first, rather than under an enable. A
+scalar `DIV` therefore leaves it churning on operands nothing will read, which
+costs a little toggling and saves an enable term on a path that is already
+tight.
+
+### Divide by zero needed no code at all
+
+None of these instructions has a special case for a zero divisor, and none needs
+one. A restoring divider with a zero divisor finds that zero "fits" at every
+step: it sets every quotient bit and shifts the dividend intact into the
+remainder. That is `LO = 0xFFFFFFFF`, `HI = dividend` — which for `PDIVUW` is
+the architectural answer directly, and which the existing sign fixups turn into
+`LO = -1` for a non-negative dividend and `LO = 1` for a negative one, the
+architectural answer for `PDIVW`. The signed case with no representable
+quotient, `0x80000000 / -1`, falls out the same way: the magnitude divider
+returns `0x80000000` and the sign fixup leaves it alone.
+
+This is worth stating because the tempting alternative — a guard that tests for
+zero and writes constants — would be more code, would need its own test, and
+would be a *second* description of behaviour the divider already has. The
+directed program tests it in every lane and in both instructions anyway, because
+"it falls out" is a claim and not a measurement.
+
+The scalar `DIV` in `sim/ee/r5900_ref.py` now goes through the same `divw`
+helper the parallel forms use. Two copies of these rules that could drift is the
+failure this is meant to make impossible.
+
+### PDIVBW is the same two dividers, twice
+
+`PDIVBW` divides all four words by one halfword of `rt`, read as **signed** — so
+a divisor field of `0xFFFF` is minus one and not 65535, which is the only place
+the halfword-ness matters and the first thing the directed test checks. Four
+divides through two units is two passes: words 0 and 1, one cycle to copy the
+results out and reload, then words 2 and 3. Sixty-six cycles, and a counter that
+now runs to 66 rather than 33.
+
+A third and fourth divider would spend four times the area to save thirty-three
+cycles on an instruction that is rare in real code. The one cycle between the
+passes is why the count is 66 and not 65, and a mutation that takes it back —
+stealing an iteration from the second pass — is one of the eight the directed
+program catches.
+
+Both loads of the divider pair go through one `load_div` procedure. A second
+pass that disagreed with the first about how magnitudes are taken would be wrong
+on exactly the two words that nothing else in the file tests.
+
+### What found what
+
+`sim/ee/gen_pdiv.py` is the directed program: every sign combination, zero
+divisors one lane at a time and then both, `0x80000000 / -1`, divisors larger
+than dividends, one and minus one, operands with the high bit set so that the
+signed and unsigned forms diverge, and decoys in words 1 and 3 — which these
+instructions never read — chosen so that a divider fed from the wrong half of
+the register produces them. Then `PDIVBW` against seven divisors including zero,
+one, minus one, `0x7FFF` and `0x8000`, with decoys in `rt`'s other three
+halfwords.
+
+It passed first try, so it was mutated: sixteen changes to the RTL — lanes
+crossed, `PDIVUW` reading its operands as signed, a sign fixup dropped, a
+divider fed from word 1 instead of word 2, one iteration short, `PDIVUW`
+zero-extending instead of sign-extending, the interlock removed, the divisor
+read unsigned or from the wrong halfword, the first pass's results not held, the
+words of LO swapped. **All sixteen fail.** The one that would otherwise have
+been easiest to miss is the sign-extension: `PDIVUW` does unsigned division and
+still sign-extends its 32-bit results into their 64-bit halves, because the
+result is a word and a word landing in a doubleword is always sign-extended on
+this machine, however its operands were read.
+
+## PMULTW was costing sixty megahertz, unmeasured — 2026-09-12
+
+A fit of `ee_top` after the parallel divides came back at **140.1 MHz**, against
+201.3 recorded on this page. The divides were not the cause — the critical path
+named no divider signal at all. It ran from a forwarding select through a
+cascade of DSP stages into `m_val`, which is a 32-bit multiply sitting
+combinationally in the single cycle a result is written.
+
+That is `PMULTW`. It was added in the same session as the GS board target, and
+**no fit was run after it**: the 201.3 MHz on this page predates it, so the cost
+had been sitting there unrecorded ever since.
+
+The fix was already written, elsewhere in the same file. The scalar `MULT` had
+solved this on the first day by capturing its operands and walking the product
+through the DSP's own pipeline registers over three cycles, under the interlock
+`is_muldiv` provides. `PMULTW` and `PMULTUW` simply had never been given the
+same treatment; they now load the same two multipliers the parallel divides'
+second unit taught the file to have, and read their products out three cycles
+later.
+
+**140.1 → 203.9 MHz** (200.8 / 205.5 / 205.3 over three placement directives),
+and the critical path is back where it has always been: `d_ir` to `m_val`, the
+forwarding-and-result-mux region.
+
+The lesson is not about multipliers. **A feature added without a fit is a clock
+regression that nobody will attribute later** — by the time it was noticed, two
+sessions of other work stood between the cause and the measurement, and the
+first guess was the divides that had just gone in.
+
+| | Fmax | LUTs |
+|---|---|---|
+| `ee_top` before MMI2/MMI3 multiplies | 201.3 | 16769 |
+| with PMULTW combinational (never measured until now) | 140.1 | 19707 |
+| **PMULTW multi-cycle, and the parallel divides** | **203.9** | 20290 |
+
 ## What is not started
 
 Hazards and pipelining — the core is still one instruction at a time. The FPU
 and the VUs. The integer subset is not complete: no TLB. **MMI0 and MMI1 are
-complete, and MMI2 and MMI3 are complete apart from most of their
-multiply-accumulate half** — `PMADDW`, `PMSUBW`, `PDIVW`, `PMADDH`, `PHMADH`, `PMSUBH`, `PHMSBH`,
-`PMULTH`, `PDIVBW`, `PMADDUW` and `PDIVUW`; `PMULTW` and `PMULTUW` are done.
+complete, and MMI2 and MMI3 are complete apart from their multiply-accumulate
+half** — `PMADDW`, `PMSUBW`, `PMADDH`, `PHMADH`, `PMSUBH`, `PHMSBH`, `PMULTH`
+and `PMADDUW`; `PMULTW`, `PMULTUW`, `PDIVW`, `PDIVUW` and `PDIVBW` are done.
 
-Two reasons the rest is a separate piece of work, and the second is the
-interesting one. The **divides** need two 32-bit dividers sequenced the way the
-scalar `DIV` already is, which is machinery rather than semantics. The
-**accumulating forms carry hardware quirks nobody has explained**: PCSX2's
+The reason the rest is a separate piece of work is that the **accumulating forms
+carry hardware quirks nobody has explained**: PCSX2's
 `PMADDW` adds `0x70000000` under a condition its own comment calls "PlayStation
 2 division voodoo, for some reason only the lower half is affected", and divides
 by `0xFFFFFFFF` rather than shifting by 32 because "multiplication error on the

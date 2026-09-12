@@ -19,7 +19,7 @@ else python3 "$HERE/gen_gif.py" --seed "$SEED" --tags "$TAGS" > packets.hex; fi
 
 python3 "$HERE/gs_ref.py" packets.hex --raw --dump-mem "$BASE" "$LEN" > ref.txt 2> ref.err
 
-xvhdl -2008 "$ROOT/rtl/gs/gs_edge_dda.vhd" "$ROOT/rtl/gs/gs_chan_dda.vhd" "$ROOT/rtl/gs/gs_gif.vhd" > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }
+xvhdl -2008 "$ROOT/rtl/gs/gs_addr_pkg.vhd" "$ROOT/rtl/gs/gs_edge_dda.vhd" "$ROOT/rtl/gs/gs_chan_dda.vhd" "$ROOT/rtl/gs/gs_gif.vhd" > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }
 xvlog -sv   "$HERE/tb_gs.sv"          > xvlog.log 2>&1 || { tail -20 xvlog.log; exit 1; }
 xelab -debug off tb_gs -s tb          > xelab.log 2>&1 || { tail -30 xelab.log; exit 1; }
 xsim tb -R -testplusarg "packets=packets.hex" \

@@ -312,7 +312,9 @@ architecture arch of ee_core is
    -- 0 for a single-cycle instruction and for the first cycle of a multi-cycle
    -- one; 1 means "the result is on the wires now", which is the only value at
    -- which A1 is allowed to advance.
-   signal ex_cnt   : integer range 0 to 33 := 0;
+   -- Long enough for PDIVBW, which is two passes of the pair of dividers with
+   -- one cycle between them to swap the operands over.
+   signal ex_cnt   : integer range 0 to 66 := 0;
 
    signal div_rem  : unsigned(32 downto 0) := (others => '0');
    signal div_quot : unsigned(31 downto 0) := (others => '0');
@@ -320,8 +322,39 @@ architecture arch of ee_core is
    signal div_negq : std_logic := '0';
    signal div_negr : std_logic := '0';
 
+   -- A second, identical iterative divider.  PDIVW and PDIVUW divide two word
+   -- pairs at once and both results have to be ready together, so the choice is
+   -- a second unit or twice the latency; the R5900 does it in one pass and so
+   -- does this.  It is only 32 bits of adder, which is cheap next to the
+   -- 128-bit datapath it sits beside.
+   signal div2_rem  : unsigned(32 downto 0) := (others => '0');
+   signal div2_quot : unsigned(31 downto 0) := (others => '0');
+   signal div2_dvsr : unsigned(31 downto 0) := (others => '0');
+   signal div2_negq : std_logic := '0';
+   signal div2_negr : std_logic := '0';
+
+   -- PDIVBW divides four words by one halfword, which is two passes of the two
+   -- dividers.  The first pass's results wait here while the second runs.  A
+   -- third and fourth divider would spend four times the area to save
+   -- thirty-three cycles on an instruction that is rare in real code, which is
+   -- not a trade worth making in a part where the divider is already the
+   -- widest thing in the execute stage.
+   signal div_p1lo0, div_p1hi0 : std_logic_vector(31 downto 0) := (others => '0');
+   signal div_p1lo1, div_p1hi1 : std_logic_vector(31 downto 0) := (others => '0');
+
    signal mul_a, mul_b  : signed(32 downto 0) := (others => '0');
    signal mul_p1, mul_p : signed(65 downto 0) := (others => '0');
+
+   -- A second multiplier, for PMULTW's and PMULTUW's upper word.  It exists for
+   -- the same reason the second divider does -- both products have to arrive
+   -- together -- but it was added for a different one, which is worth keeping:
+   -- PMULTW originally computed both products *combinationally* in the single
+   -- cycle its result was written, and a 32x32 multiply in that path cost the
+   -- core about sixty megahertz.  The scalar MULT had solved this on the first
+   -- day by walking its product through the DSP's own pipeline registers over
+   -- three cycles; PMULTW simply had not been given the same treatment.
+   signal mul2_a, mul2_b  : signed(32 downto 0) := (others => '0');
+   signal mul2_p1, mul2_p : signed(65 downto 0) := (others => '0');
 
    function sext32(v : std_logic_vector(31 downto 0)) return std_logic_vector is
    begin
@@ -661,23 +694,21 @@ architecture arch of ee_core is
    -- sign-extended from 32 bits, while rd gets the products whole.  Three
    -- 128-bit destinations from one instruction, which is what the wide HI/LO
    -- write exists for.
-   procedure pmultw(signed_form : boolean;
-                    a, b : in  std_logic_vector(127 downto 0);
+   -- Where PMULTW's and PMULTUW's two products go.  The products themselves are
+   -- formed by the two multipliers over three cycles and arrive here already
+   -- made; the signed and unsigned forms differ only in how the operands were
+   -- widened on the way in, which is why there is one procedure and not two.
+   --
+   -- Each product is sixty-four bits and goes three places at once: whole into
+   -- rd, its low word sign-extended into LO, its high word sign-extended into
+   -- HI.  A word landing in a doubleword is always sign-extended on this
+   -- machine, unsigned operands or not.
+   procedure pmultw(p0, p1 : in signed(63 downto 0);
                     rdv, lov, hiv : out std_logic_vector(127 downto 0)) is
       variable p : signed(63 downto 0);
    begin
       for n in 0 to 1 loop
-         if signed_form then
-            p := signed(a(64*n+31 downto 64*n)) * signed(b(64*n+31 downto 64*n));
-         else
-            -- 32 x 32 already gives 64 bits.  Resizing the operands to 64
-            -- first makes a 128-bit product, and assigning that to a 64-bit
-            -- signal is a length mismatch that xvhdl does not flag and xsim
-            -- answers with zeros -- which looked exactly like an instruction
-            -- that had not been decoded.
-            p := signed(unsigned(a(64*n+31 downto 64*n))
-                        * unsigned(b(64*n+31 downto 64*n)));
-         end if;
+         if n = 0 then p := p0; else p := p1; end if;
          rdv(64*n+63 downto 64*n) := std_logic_vector(p);
          lov(64*n+63 downto 64*n) := sext32(std_logic_vector(p(31 downto 0)));
          hiv(64*n+63 downto 64*n) := sext32(std_logic_vector(p(63 downto 32)));
@@ -761,12 +792,92 @@ architecture arch of ee_core is
       end case;
    end function;
 
+   -- PDIVW (MMI2) and PDIVUW (MMI3) share a sub-opcode and differ only in
+   -- whether the words are read as signed.
+   function is_pdiv(ir : std_logic_vector(31 downto 0)) return boolean is
+      variable op : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
+      variable sa : integer := to_integer(unsigned(ir(10 downto 6)));
+   begin
+      return op = 28 and (fn = 16#09# or fn = 16#29#) and sa = 16#0D#;
+   end function;
+
+   -- PMULTW (MMI2) and PMULTUW (MMI3): two 32x32 products, multi-cycle.
+   function is_pmultw(ir : std_logic_vector(31 downto 0)) return boolean is
+      variable op : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
+      variable sa : integer := to_integer(unsigned(ir(10 downto 6)));
+   begin
+      return op = 28 and (fn = 16#09# or fn = 16#29#) and sa = 16#0C#;
+   end function;
+
+   -- PDIVBW is MMI2's other divide: four words by one halfword.
+   function is_pdivbw(ir : std_logic_vector(31 downto 0)) return boolean is
+      variable op : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
+      variable sa : integer := to_integer(unsigned(ir(10 downto 6)));
+   begin
+      return op = 28 and fn = 16#09# and sa = 16#1D#;
+   end function;
+
+   -- Load one of the two dividers with a dividend and a divisor.  Written once
+   -- because PDIVBW loads them a second time half way through, and a second
+   -- pass that disagreed with the first about how magnitudes are taken would be
+   -- wrong on exactly the two words nothing else tests.
+   procedure load_div(signal rem_r  : out unsigned(32 downto 0);
+                      signal quot_r : out unsigned(31 downto 0);
+                      signal dvsr_r : out unsigned(31 downto 0);
+                      signal negq_r : out std_logic;
+                      signal negr_r : out std_logic;
+                      sgn : boolean;
+                      d   : std_logic_vector(31 downto 0);
+                      v   : std_logic_vector(31 downto 0)) is
+   begin
+      rem_r <= (others => '0');
+      if sgn and d(31) = '1' then
+         quot_r <= 0 - unsigned(d);
+      else
+         quot_r <= unsigned(d);
+      end if;
+      if sgn and v(31) = '1' then
+         dvsr_r <= 0 - unsigned(v);
+      else
+         dvsr_r <= unsigned(v);
+      end if;
+      if sgn then
+         negq_r <= d(31) xor v(31);
+         negr_r <= d(31);
+      else
+         negq_r <= '0';
+         negr_r <= '0';
+      end if;
+   end procedure;
+
    function is_muldiv(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
       variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
    begin
       if op /= 0 and op /= 28 then return false; end if;
-      return fn >= 24 and fn <= 27;
+      if fn >= 24 and fn <= 27 then return true; end if;
+      return is_pdiv(ir) or is_pdivbw(ir) or is_pmultw(ir);
+   end function;
+
+   -- The dividers work in magnitudes; this puts the sign back on and widens
+   -- the 32-bit result to the 64-bit half of HI or LO it occupies.
+   function dfix32(neg : std_logic; v : unsigned(31 downto 0))
+      return std_logic_vector is
+   begin
+      if neg = '1' then
+         return std_logic_vector(0 - v);
+      else
+         return std_logic_vector(v);
+      end if;
+   end function;
+
+   function dfix(neg : std_logic; v : unsigned(31 downto 0))
+      return std_logic_vector is
+   begin
+      return sext32(dfix32(neg, v));
    end function;
 begin
 
@@ -836,7 +947,11 @@ begin
       variable ex_trap                : boolean;
       variable ex_busy                : boolean;
       variable dvd_mag, dvsr_mag      : unsigned(31 downto 0);
-      variable div_shift              : unsigned(32 downto 0);
+      variable dvd2_mag, dvsr2_mag    : unsigned(31 downto 0);
+      variable div_shift, div2_shift  : unsigned(32 downto 0);
+      variable pdiv, psgn, pdivbw, pmul : boolean;
+      variable bw_dvsr                : std_logic_vector(31 downto 0);
+      variable bw_lo, bw_hi           : integer;
 
       -- stage handshakes
       variable a2_adv, a1_adv, id_adv  : boolean;
@@ -1386,11 +1501,32 @@ begin
                            ex_val   := b128(63 downto 0);
                            ex_valhi := a128(63 downto 0);
                         when 16#0C# =>                       -- PMULTW
-                           pmultw(true, a128, b128, pv, plo, phi);
+                           pmultw(mul_p(63 downto 0), mul2_p(63 downto 0),
+                                  pv, plo, phi);
                            ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
                            ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
                            ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
                            ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
+                        when 16#0D# =>                       -- PDIVW
+                           ex_we := '0'; ex_w128 := '0';
+                           ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
+                           ex_lo  := dfix(div_negq,  div_quot);
+                           ex_hi  := dfix(div_negr,  div_rem(31 downto 0));
+                           ex_lou := dfix(div2_negq, div2_quot);
+                           ex_hiu := dfix(div2_negr, div2_rem(31 downto 0));
+                        when 16#1D# =>                       -- PDIVBW
+                           -- Four words, so four quotients into the four lanes
+                           -- of LO and four remainders into HI.  Nothing is
+                           -- widened to sixty-four bits here, unlike PDIVW:
+                           -- these results are words and the lanes are full.
+                           ex_we := '0'; ex_w128 := '0';
+                           ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
+                           ex_lo  := div_p1lo1 & div_p1lo0;
+                           ex_hi  := div_p1hi1 & div_p1hi0;
+                           ex_lou := dfix32(div2_negq, div2_quot)
+                                     & dfix32(div_negq, div_quot);
+                           ex_hiu := dfix32(div2_negr, div2_rem(31 downto 0))
+                                     & dfix32(div_negr, div_rem(31 downto 0));
                         when 16#02# =>                       -- PSLLVW
                            pv := pshiftv('l', a128, b128);
                            ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
@@ -1431,11 +1567,23 @@ begin
                            ex_val   := a128(127 downto 64);
                            ex_valhi := b128(127 downto 64);
                         when 16#0C# =>                       -- PMULTUW
-                           pmultw(false, a128, b128, pv, plo, phi);
+                           pmultw(mul_p(63 downto 0), mul2_p(63 downto 0),
+                                  pv, plo, phi);
                            ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
                            ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
                            ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
                            ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
+                        when 16#0D# =>                       -- PDIVUW
+                           -- Unsigned division, but the 32-bit results are
+                           -- still sign-extended into their 64-bit halves:
+                           -- the result is a word, and every word this core
+                           -- writes to a doubleword is sign-extended.
+                           ex_we := '0'; ex_w128 := '0';
+                           ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
+                           ex_lo  := dfix('0', div_quot);
+                           ex_hi  := dfix('0', div_rem(31 downto 0));
+                           ex_lou := dfix('0', div2_quot);
+                           ex_hiu := dfix('0', div2_rem(31 downto 0));
                         when 16#03# =>                       -- PSRAVW
                            pv := pshiftv('a', a128, b128);
                            ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
@@ -1941,15 +2089,57 @@ begin
             -- the multi-cycle units, stepped only when A1 may make progress
             -- ============================================================
             if a2_adv and d_valid = '1' and is_muldiv(d_ir) then
+               pdiv   := is_pdiv(d_ir);
+               pdivbw := is_pdivbw(d_ir);
+               pmul   := is_pmultw(d_ir);
+               psgn   := fn = 16#09#;        -- MMI2 is PDIVW, MMI3 is PDIVUW
                if ex_cnt = 0 then
                   -- kick off
-                  if fn = 24 or fn = 25 then
-                     if fn = 24 then
-                        mul_a <= resize(signed(a(31 downto 0)), 33);
-                        mul_b <= resize(signed(b(31 downto 0)), 33);
+                  if pdiv or pdivbw then
+                     -- Two words in, two quotients and two remainders out, in
+                     -- the same 33 cycles a scalar DIV takes.  Both units are
+                     -- the plain restoring divider, so the awkward cases -- a
+                     -- zero divisor, and 0x80000000 / -1 -- come out with the
+                     -- architectural results without a case of their own, in
+                     -- each lane independently.
+                     --
+                     -- PDIVBW takes its single divisor from rt's low halfword
+                     -- read as signed, and starts on words 0 and 1; words 2
+                     -- and 3 go through the same two units on a second pass.
+                     bw_dvsr := (31 downto 16 => b128(15)) & b128(15 downto 0);
+                     if pdivbw then
+                        load_div(div_rem,  div_quot,  div_dvsr,
+                                 div_negq,  div_negr,  true,
+                                 a128(31 downto 0),  bw_dvsr);
+                        load_div(div2_rem, div2_quot, div2_dvsr,
+                                 div2_negq, div2_negr, true,
+                                 a128(63 downto 32), bw_dvsr);
+                        ex_cnt <= 66;
                      else
-                        mul_a <= signed(std_logic_vector'('0' & a(31 downto 0)));
-                        mul_b <= signed(std_logic_vector'('0' & b(31 downto 0)));
+                        load_div(div_rem,  div_quot,  div_dvsr,
+                                 div_negq,  div_negr,  psgn,
+                                 a128(31 downto 0),  b128(31 downto 0));
+                        load_div(div2_rem, div2_quot, div2_dvsr,
+                                 div2_negq, div2_negr, psgn,
+                                 a128(95 downto 64), b128(95 downto 64));
+                        ex_cnt <= 33;
+                     end if;
+                  elsif fn = 24 or fn = 25 or pmul then
+                     -- MULT, MULTU, PMULTW and PMULTUW all load the same way.
+                     -- The signed and unsigned forms differ only in how the
+                     -- 32-bit operands are widened to the multiplier's 33 bits,
+                     -- and the parallel forms differ only in also loading the
+                     -- second multiplier from word 2.
+                     if fn = 24 or (pmul and fn = 16#09#) then
+                        mul_a  <= resize(signed(a128(31 downto 0)), 33);
+                        mul_b  <= resize(signed(b128(31 downto 0)), 33);
+                        mul2_a <= resize(signed(a128(95 downto 64)), 33);
+                        mul2_b <= resize(signed(b128(95 downto 64)), 33);
+                     else
+                        mul_a  <= signed(std_logic_vector'('0' & a128(31 downto 0)));
+                        mul_b  <= signed(std_logic_vector'('0' & b128(31 downto 0)));
+                        mul2_a <= signed(std_logic_vector'('0' & a128(95 downto 64)));
+                        mul2_b <= signed(std_logic_vector'('0' & b128(95 downto 64)));
                      end if;
                      ex_cnt <= 3;
                   else
@@ -1976,19 +2166,39 @@ begin
                      ex_cnt <= 33;
                   end if;
                elsif ex_cnt > 1 then
-                  if fn = 24 or fn = 25 then
+                  if fn = 24 or fn = 25 or pmul then
                      if ex_cnt = 3 then
-                        mul_p1 <= mul_a * mul_b;
+                        mul_p1  <= mul_a * mul_b;
+                        mul2_p1 <= mul2_a * mul2_b;
                      else
                         -- a second register stage, so the tool has one to push
                         -- into the DSP's own output pipeline rather than
                         -- leaving the cascade adder in fabric
-                        mul_p <= mul_p1;
+                        mul_p  <= mul_p1;
+                        mul2_p <= mul2_p1;
                      end if;
                   else
                      -- one quotient bit per clock: shift the next dividend bit
                      -- into the running remainder, subtract the divisor if it
                      -- fits, and record whether it did.
+                     if pdivbw and ex_cnt = 34 then
+                        -- Between the passes.  What the first pass found has to
+                        -- survive the second, so it is copied out before the
+                        -- units are reloaded with the other two words.  This
+                        -- cycle runs no iteration, which is why the count is
+                        -- 66 and not 65.
+                        div_p1lo0 <= dfix32(div_negq,  div_quot);
+                        div_p1hi0 <= dfix32(div_negr,  div_rem(31 downto 0));
+                        div_p1lo1 <= dfix32(div2_negq, div2_quot);
+                        div_p1hi1 <= dfix32(div2_negr, div2_rem(31 downto 0));
+                        bw_dvsr := (31 downto 16 => b128(15)) & b128(15 downto 0);
+                        load_div(div_rem,  div_quot,  div_dvsr,
+                                 div_negq,  div_negr,  true,
+                                 a128(95 downto 64),  bw_dvsr);
+                        load_div(div2_rem, div2_quot, div2_dvsr,
+                                 div2_negq, div2_negr, true,
+                                 a128(127 downto 96), bw_dvsr);
+                     else
                      div_shift := div_rem(31 downto 0) & div_quot(31);
                      if div_shift >= ('0' & div_dvsr) then
                         div_rem  <= div_shift - ('0' & div_dvsr);
@@ -1996,6 +2206,19 @@ begin
                      else
                         div_rem  <= div_shift;
                         div_quot <= div_quot(30 downto 0) & '0';
+                     end if;
+                     -- The second unit steps beside it unconditionally.  A
+                     -- scalar DIV leaves it churning on stale operands whose
+                     -- result nothing reads, which costs a little toggling and
+                     -- saves an enable term on a path that is already tight.
+                     div2_shift := div2_rem(31 downto 0) & div2_quot(31);
+                     if div2_shift >= ('0' & div2_dvsr) then
+                        div2_rem  <= div2_shift - ('0' & div2_dvsr);
+                        div2_quot <= div2_quot(30 downto 0) & '1';
+                     else
+                        div2_rem  <= div2_shift;
+                        div2_quot <= div2_quot(30 downto 0) & '0';
+                     end if;
                      end if;
                   end if;
                   ex_cnt <= ex_cnt - 1;

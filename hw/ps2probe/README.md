@@ -119,6 +119,34 @@ texture coordinate is truncated and may carry a block width of its own**, but no
 capture has swept it. The same width curve that established eight pixels for
 colour would settle it, and there is no texture unit to drive it with.
 
+## Two more that a console has to answer, added with PCRTC
+
+Writing the video block's read circuit left two things that cannot be settled
+from this side of the PCIe bus, and they are recorded here rather than guessed
+into the RTL.
+
+**The sync registers' field layouts.** SMODE1, SMODE2, SYNCH1, SYNCH2 and SYNCV
+hold a PLL setting and a set of counter reloads, and this project has no
+verified source for where the fields sit in them. `rtl/gs/gs_pcrtc.vhd`
+therefore takes its raster totals as ports and implements no sync generator at
+all. The probe is not a picture but a **dump**: a console that has booted has
+already had these registers written by the BIOS for its video mode, so reading
+them back in NTSC, in PAL and in 480p and printing the three 64-bit values gives
+three known-good points to fit the layout against. That is a different shape of
+probe from the others here — it reads the machine's own state rather than
+drawing something — and it is the only way to get the answer without a manual.
+
+**The merge circuit's arithmetic.** PMODE combines the two read circuits, and
+`sim/gs/pcrtc_ref.py` implements the blend as `under + (over - under) * a / 128`
+with a clamp, because that is the fixed point the drawing side's ALPHA register
+uses. It is an argument, not a measurement. The probe is one frame with both
+read circuits enabled over the same area, circuit 1 a flat mid-grey and circuit
+2 a flat white, swept across every ALP from 0x00 to 0xFF with MMOD = 1 — 256
+numbers, which is enough to distinguish a divide by 128 from a divide by 255,
+and a clamp from a wrap, from the shape of the curve alone. Until it runs, a
+picture that uses one read circuit is verified and a picture that uses two is
+not; every scene this project has drawn uses one.
+
 ## Status
 
 **Builds, and the host half is tested; the console half is still untested.**

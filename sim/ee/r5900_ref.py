@@ -283,6 +283,78 @@ def permute(tbl, w, a128, b128):
     return _join([(la if src == "S" else lb)[i] for src, i in tbl], w)
 
 
+def divw(signed_form, x, y):
+    """One 32-bit divide, with the R5900's results for the awkward cases.
+
+    Division by zero does not trap here and does not leave HI and LO
+    undefined.  The hardware's iterative divider finds that a zero divisor
+    "fits" at every step, so it sets every quotient bit and shifts the dividend
+    intact into the remainder; that makes the results architectural -- LO = -1
+    (or 1 for a negative signed dividend) and HI = the dividend -- and worth
+    writing down rather than guarding against.
+
+    The signed form dividing 0x80000000 by -1 is the other case with no
+    representable quotient.  The magnitude divider returns 0x80000000 and the
+    sign fixup leaves it alone, which is what the hardware gives.
+
+    Returns (lo, hi), each already sign-extended to sixty-four bits.
+    """
+    if signed_form:
+        x, y = s32(x), s32(y)
+        if y == 0:
+            return sext32(-1 if x >= 0 else 1), sext32(x)
+        q = abs(x) // abs(y) * (1 if (x < 0) == (y < 0) else -1)
+        return sext32(q), sext32(x - q * y)
+    x, y = x & M32, y & M32
+    if y == 0:
+        return sext32(M32), sext32(x)
+    return sext32(x // y), sext32(x % y)
+
+
+def pdivw(signed_form, a128, b128):
+    """PDIVW and PDIVUW: words 0 and 2 divide into the 128-bit LO and HI.
+
+    Each pair produces a quotient into a doubleword of LO and a remainder into
+    the same doubleword of HI, sign-extended from 32 bits -- so these write
+    both halves of both accumulators and nothing else, not even rd.  Note that
+    PDIVUW sign-extends too: the results are words, and a word landing in a
+    doubleword is always sign-extended on this machine regardless of how the
+    operands were read.
+
+    Returns (lo, hi) as 128-bit values.
+    """
+    lo = hi = 0
+    for n in range(2):
+        l, h = divw(signed_form,
+                    (a128 >> (64 * n)) & M32, (b128 >> (64 * n)) & M32)
+        lo |= (l & M64) << (64 * n)
+        hi |= (h & M64) << (64 * n)
+    return lo, hi
+
+
+def pdivbw(a128, b128):
+    """PDIVBW: all four words of rs divided by one halfword of rt.
+
+    The divisor is rt's low halfword read as signed and widened to a word, so
+    a divisor of 0xFFFF is minus one and not 65535 -- which is the whole
+    difference between this and PDIVW, and the only place the halfword matters.
+
+    Unlike PDIVW the results are *words*, one per lane of the 128-bit LO and
+    HI, so nothing is sign-extended to sixty-four bits here: there is no room.
+
+    Returns (lo, hi) as 128-bit values.
+    """
+    y = b128 & 0xFFFF
+    if y >> 15:
+        y |= 0xFFFF0000
+    lo = hi = 0
+    for n in range(4):
+        l, h = divw(True, (a128 >> (32 * n)) & M32, y)
+        lo |= (l & M32) << (32 * n)
+        hi |= (h & M32) << (32 * n)
+    return lo, hi
+
+
 def pmultw(signed_form, a128, b128):
     """PMULTW and PMULTUW: two 32x32 products into the 128-bit HI, LO and rd.
 
@@ -599,6 +671,14 @@ class R5900:
                     self.w128(rd, v)
                     self.lo, self.lo1 = l & M64, l >> 64
                     self.hi, self.hi1 = h & M64, h >> 64
+                elif sa == 0x0D:                                        # PDIVW
+                    l, h = pdivw(True, a128, b128)
+                    self.lo, self.lo1 = l & M64, l >> 64
+                    self.hi, self.hi1 = h & M64, h >> 64
+                elif sa == 0x1D:                                        # PDIVBW
+                    l, h = pdivbw(a128, b128)
+                    self.lo, self.lo1 = l & M64, l >> 64
+                    self.hi, self.hi1 = h & M64, h >> 64
                 elif sa == 0x02: self.w128(rd, pshiftv("sll", a128, b128))
                 elif sa == 0x03: self.w128(rd, pshiftv("srl", a128, b128))
                 # HI and LO are 128 bits on the R5900, which is what the second
@@ -621,6 +701,10 @@ class R5900:
                 elif sa == 0x0C:                                        # PMULTUW
                     v, l, h = pmultw(False, a128, b128)
                     self.w128(rd, v)
+                    self.lo, self.lo1 = l & M64, l >> 64
+                    self.hi, self.hi1 = h & M64, h >> 64
+                elif sa == 0x0D:                                        # PDIVUW
+                    l, h = pdivw(False, a128, b128)
                     self.lo, self.lo1 = l & M64, l >> 64
                     self.hi, self.hi1 = h & M64, h >> 64
                 elif sa == 0x03: self.w128(rd, pshiftv("sra", a128, b128))
@@ -721,17 +805,7 @@ class R5900:
             # encoding and writes nothing, which is why this is easy to miss.
             self.w(rd, lo)
         else:                                                         # DIV/DIVU
-            if fn == 26:
-                x, y = s32(a), s32(b)
-                if y == 0:
-                    lo, hi = sext32(-1 if x >= 0 else 1), sext32(x)
-                else:
-                    q = abs(x) // abs(y) * (1 if (x < 0) == (y < 0) else -1)
-                    lo, hi = sext32(q), sext32(x - q * y)
-            else:
-                x, y = a & M32, b & M32
-                if y == 0: lo, hi = sext32(M32), sext32(x)
-                else: lo, hi = sext32(x // y), sext32(x % y)
+            lo, hi = divw(fn == 26, a, b)
 
         if pipe1:
             self.hi1, self.lo1 = hi, lo

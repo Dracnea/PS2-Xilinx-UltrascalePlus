@@ -90,7 +90,7 @@ entity gs_chan_dda is
 end entity;
 
 architecture arch of gs_chan_dda is
-   type state_t is (S_IDLE, S_GLOAD, S_GDIV, S_GFIX, S_LANE,
+   type state_t is (S_IDLE, S_NMUL, S_NSUM, S_GLOAD, S_GDIV, S_GFIX, S_LANE,
                     S_READY, S_SMUL, S_SLOAD, S_SDIV, S_SFIX);
    signal state : state_t := S_IDLE;
 
@@ -139,6 +139,23 @@ architecture arch of gs_chan_dda is
    -- chain, because nothing downstream of them is available to cascade into.
    signal p_c, p_nx, p_ny : signed(W - 1 downto 0) := (others => '0');
 
+   -- The plane numerators' four products, held for a cycle, for exactly the
+   -- reason above and found the same way.  Once the seed numerator had been
+   -- split, the longest path in the Graphics Synthesizer became the *other*
+   -- end of this arithmetic: a vertex's depth, through the (c1 - c0)
+   -- subtraction, through a multiplier, and through the carry chain of the
+   -- subtraction that combines the two products -- nine CARRY8s and four DSP
+   -- stages in one clock.
+   --
+   -- So it is now three cycles instead of one: the differences, the products,
+   -- the sums.  That is two extra cycles per primitive per channel, against a
+   -- setup that already spends sixty-four on a division, and no extra cycles
+   -- per pixel at all -- which is the distinction that matters, because fill
+   -- rate is what a frame is made of and setup is not.
+   signal d10, d20 : signed(CWIDTH downto 0) := (others => '0');
+   signal q_nx1, q_nx2, q_ny1, q_ny2 : signed(W - 1 downto 0)
+      := (others => '0');
+
    -- the restoring divider, shared between the gradient and every seed
    signal dv_n, dv_d, dv_q, dv_r : unsigned(W - 1 downto 0) := (others => '0');
    signal dv_cnt : integer range 0 to W + 1 := 0;
@@ -172,25 +189,16 @@ begin
       -- entry from being forgotten -- which in the edge DDA it was, and every
       -- edge after the first quietly reused the previous triangle's quotient.
       procedure setup is
-         variable vnx, vny : signed(W - 1 downto 0);
       begin
          busy <= '1';
-         -- Both numerators, at their natural widths.  A VHDL product is as
-         -- wide as its operands together, so these are formed first and
-         -- resized once; resizing the operands instead is how the edge DDA
-         -- failed to elaborate.
-         vnx := resize((signed('0' & c1) - signed('0' & c0)) * dy20, W)
-              - resize((signed('0' & c2) - signed('0' & c0)) * dy10, W);
-         vny := resize((signed('0' & c2) - signed('0' & c0)) * dx10, W)
-              - resize((signed('0' & c1) - signed('0' & c0)) * dx20, W);
-         if sgn = '1' then
-            vnx := -vnx;
-            vny := -vny;
-         end if;
-         nx    <= vnx;
-         ny    <= vny;
+         -- The two differences every product below takes as an operand.  They
+         -- are registered here rather than folded into the multiplies because a
+         -- subtraction in front of a multiplier and the product's own carry
+         -- chain behind it is one path, and it was the longest one in the part.
+         d10   <= signed('0' & c1) - signed('0' & c0);
+         d20   <= signed('0' & c2) - signed('0' & c0);
          detp  <= resize(det, W);
-         state <= S_GLOAD;
+         state <= S_NMUL;
       end procedure;
    begin
       if rising_edge(clk) then
@@ -205,6 +213,31 @@ begin
                   if start = '1' then
                      setup;
                   end if;
+
+               when S_NMUL =>
+                  -- The four products, side by side.  A VHDL product is as wide
+                  -- as its operands together, so each is formed at its natural
+                  -- width and resized once; resizing the operands instead is
+                  -- how the edge DDA failed to elaborate.
+                  q_nx1 <= resize(d10 * dy20, W);
+                  q_nx2 <= resize(d20 * dy10, W);
+                  q_ny1 <= resize(d20 * dx10, W);
+                  q_ny2 <= resize(d10 * dx20, W);
+                  state <= S_NSUM;
+
+               when S_NSUM =>
+                  -- The sign of the determinant flips both numerators.  It is
+                  -- applied by swapping the operands of each subtraction rather
+                  -- than by negating the result, which would put a second carry
+                  -- chain in series with the first for nothing.
+                  if sgn = '0' then
+                     nx <= q_nx1 - q_nx2;
+                     ny <= q_ny1 - q_ny2;
+                  else
+                     nx <= q_nx2 - q_nx1;
+                     ny <= q_ny2 - q_ny1;
+                  end if;
+                  state <= S_GLOAD;
 
                when S_GLOAD =>
                   -- gradient = floor(16 * 1024 * nx / det), always on the

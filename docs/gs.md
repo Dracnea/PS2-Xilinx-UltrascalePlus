@@ -1088,6 +1088,87 @@ carries the measured status of all three blocks against their native rates, and
 the separate problem that the C1100's 100 MHz reference cannot produce the
 PS2's 18.432 MHz clock family exactly.
 
+### The pixel path is no longer the limit, and neither is the shift — 2026-09-11
+
+The write port is 256 bits and a pixel is 32 or 16, so the pixel has to land in
+the lane its address names. The obvious way is to shift it there, and that
+builds a 256-bit barrel shifter on the **end** of the read-modify-write path —
+after the memory read, the expand, the blender and the format pack.
+
+It is not needed. The byte enables already say which lane is being written, so
+the pixel can simply be repeated into every lane and the enables pick one.
+Replication is wires; the byte-enable shift that remains is 32 bits wide.
+
+**It measured 127.6 against 129.1, which is to say nothing at all** — well
+inside the spread between placements. The gain is real but it was not in the
+clock: the critical path *moved*, off the pixel path and onto the plane
+numerators, and until it moved the next cut could not be found. That is the
+honest way to report a cut that does not show up in the headline number, and it
+is why the next two entries exist.
+
+### The plane numerators, and the same lesson twice — 2026-09-11
+
+The path the shift removal exposed ran from a vertex's depth, through the
+`(c1 - c0)` subtraction, through a multiplier, and through the carry chain of
+the subtraction that combines the two products: nine carry chains and four DSP
+stages in one clock. That is `gs_chan_dda`'s `setup`, which formed both plane
+numerators in a single cycle.
+
+    nx = (c1-c0)*dy20 - (c2-c0)*dy10
+    ny = (c2-c0)*dx10 - (c1-c0)*dx20
+
+Three cycles now: the two differences, the four products, the two sums. The sign
+of the determinant is applied by **swapping the operands of each subtraction**
+rather than by negating the result, which would put a second carry chain in
+series with the first for nothing.
+
+Two extra cycles per primitive per channel, against a setup that already spends
+sixty-four on a division and no extra cycles per pixel at all.
+
+**129.1 → 134.5 MHz** (132.9 / 132.9 / 137.6 over three placement directives).
+
+### The scanline setup, and 147.456 MHz met — 2026-09-12
+
+The path moved again, this time to `S_TRI_SCAN`: finding which two of the three
+edges span this scanline, taking the minimum and maximum of their x values,
+clamping both against the scissor and deciding whether anything survived — a
+three-way minimum, a three-way maximum, two clamps and three comparisons, all on
+one edge. Twenty-nine logic levels.
+
+It is three states now, exactly as the sprite setup was split: find the span,
+clamp it, test it. Two extra clocks per scanline against a scanline hundreds of
+pixels long.
+
+**134.5 → 152.5 MHz** (152.6 / 153.8 / 151.1 over three placement directives),
+and that is **over the console's 147.456 MHz** — by 3.4 % on the mean, and the
+*worst* of the three placements is still 2.5 % over, which is what makes this a
+result and not one lucky fit.
+
+| | Fmax |
+|---|---|
+| as first fitted | 110.8 |
+| pixel path cut | 117.3 |
+| seed numerator split | 121.5 |
+| sprite setup split | 129.1 |
+| lane shift removed | 127.6 (no change; the path moved) |
+| plane numerators split | 134.5 |
+| **scanline setup split** | **152.5** |
+
+The pattern across all six is the same and it is worth stating once rather than
+six times: **every gain came from splitting a setup path and none from touching
+the pixel loop.** Setup runs once per primitive or once per scanline, so a cycle
+there is free; the pixel loop runs once per pixel, so a cycle there is the fill
+rate. Each cut exposed the next longest path, and the next longest path was
+always in setup again — right up until the last one, which left the part with
+its critical path at a colour DDA's seed multiply and the clock above spec.
+
+**What this does not close.** The GS now *meets* 147.456 MHz in a fit; it has not
+been run at it. The board target still builds at 125 MHz in the `sys` domain,
+and moving it onto the two-stage MMCM from `boards/ps2_clocks.py` — which
+synthesises 147.455867 MHz, 0.90 ppm off — is the next step and a separate one.
+Nor does it close the fill rate: one pixel per clock against the console's
+sixteen is a different question from the clock, and a bigger one.
+
 ## On a card — 2026-09-11
 
 `boards/c1100_gs.py` is the first board target for either of the two large
@@ -1208,8 +1289,90 @@ faults that are perfectly self-consistent and would pass any amount of
 differential testing. `--model-only` renders the same stream through
 `gs_ref.py`, so the two can be put side by side.
 
+## PCRTC, the read circuit — 2026-09-11
+
+`rtl/gs/gs_pcrtc.vhd` is the video block's read circuit: two read circuits, each
+with its own `DISPFB` and `DISPLAY`, and the merge that combines them. Source
+formats `PSMCT32`, `PSMCT24`, `PSMCT16` and `PSMCT16S`, which is every format a
+frame buffer can be in. It agrees with `sim/gs/pcrtc_ref.py` across eighteen
+generated cases.
+
+### The swizzle now has one definition
+
+The rasteriser writes through the swizzle and PCRTC reads back through it, and
+if the two ever disagreed the picture would be scrambled in a way that no
+differential test of *either block on its own* could find: each would still
+agree with its own model. So it moved into `rtl/gs/gs_addr_pkg.vhd` and both
+take it from there. This is the first thing in the GS that two blocks share.
+
+### Magnification without a divider
+
+`MAGH` and `MAGV` stretch each source pixel over several video clocks. Written
+as arithmetic that is a division of the offset into the display area — and a
+divider per circuit per axis would be absurd for a value that only counts up. So
+it counts: a source position and a small repeat counter, both starting at zero
+at the top-left of the raster and advancing only while the raster is *inside*
+the display area, so that at the area's first pixel they are still zero, which
+is the answer the division gives. Four counters.
+
+Two of the twelve mutations this test catches are exactly here: the horizontal
+counters not reset at the end of a line, and the vertical ones advanced on lines
+outside the area.
+
+### What is deliberately absent, and why that is not the same as unfinished
+
+**The sync generator.** `SMODE1`, `SMODE2`, `SYNCH1`, `SYNCH2` and `SYNCV` hold
+a PLL setting and a set of counter reloads whose field positions this project
+has no verified source for. Writing them from memory would produce a block that
+*looked* finished and could not be shown wrong until a console was attached. So
+the raster totals arrive as ports, no sync generator exists, and reading the
+real registers off a booted console is now a probe entry — a dump rather than a
+picture, because a machine that has booted has already had them written by the
+BIOS for its video mode.
+
+What that costs is real: a PCRTC that cannot yet be told "NTSC" and work out its
+own timings. What it buys is that every line that *is* written can be checked
+today.
+
+**The merge arithmetic is written but flagged.** `out = under + (over - under) *
+a / 128`, clamped, with `a` from circuit 1's alpha or from `ALP`. The shape is
+the drawing side's `ALPHA` fixed point, which is the argument for it; it is not
+a measurement. A sweep of all 256 `ALP` values on a console would separate a
+divide by 128 from a divide by 255, and a clamp from a wrap, from the shape of
+the curve alone. Until it runs, a picture that uses one read circuit is verified
+and a picture that uses two is not — and every scene this project has drawn uses
+one.
+
+### The pattern in the test memory is not random
+
+Each pixel in the generated frame buffers carries its own coordinates: red is
+x, green is y, blue is a checker, alpha ramps with x so the `MMOD = 0` merge has
+something varying to blend by. Random words would make a buffer read one pixel
+off, mirrored, magnified wrongly or taken from the wrong page all look the same
+— wrong — and none of them diagnosable. The rasters are small on purpose: every
+fault this can find shows up within a few source pixels of the display area's
+corner, and a 640 × 480 frame is three hundred thousand lines of simulation
+output to say what two thousand already said.
+
+### One thing left open rather than decided
+
+A privileged-register write lands immediately here: the next pixel uses the new
+`DISPFB` or `PMODE`. Real hardware may instead hold them until the next vertical
+blank, which is what a double-buffered game flipping buffers mid-frame would
+depend on, and this project has no source that settles it either way. Nothing is
+asserted in the RTL beyond "immediately", and the question belongs with the sync
+generator — both need the same console session to answer.
+
+### Fill rate, again
+
+A pixel needs one memory read per enabled circuit and the raster waits for them,
+so this is slower than one pixel per clock when both circuits are on. The real
+PCRTC reads whole columns into a line buffer. That is the same fill-rate gap the
+rasteriser has and it is recorded here rather than hidden.
+
 ## What is not started
 
-The rest of step 4 — lines and points, and texture — and step 5, PCRTC.
+The rest of step 4 — lines and points, and texture. PCRTC's sync generator, and
+PCRTC wired into `gs_top` and out to the host.
 Local-to-host and local-to-local transfers; host-to-local is still PSMCT32 only.
 Dither, which needs a 16-bit format to act on and now has one.

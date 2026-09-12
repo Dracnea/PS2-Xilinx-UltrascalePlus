@@ -220,12 +220,20 @@ depends on.
 
 | block | native | measured | short by |
 |---|---|---|---|
-| EE core | 294.912 MHz | 192.7 (mean, three directives) | **35 %** |
-| GS | 147.456 MHz | 129.1 | **12 %** |
+| EE (`ee_top`, core + cache) | 294.912 MHz | 203.9 (mean, three directives) | **31 %** |
+| GS (`gs_top`) | 147.456 MHz | **152.5** (mean, three directives; worst 151.1) | **met** |
 | IOP | 36.864 MHz | runs on the card | met |
 
-The GS number is the one to fix first and the study above already said it was
-reachable. The EE is the known blocker and nothing here has changed that.
+**The GS meets its native clock as of 2026-09-12.** Six cuts took it from 110.8
+to 152.5 MHz, every one of them a *setup* path split into more cycles and
+none of them touching the pixel loop — see [gs.md](gs.md). What that does not
+mean is that it has been *run* at 147.456: the board target still builds at 125
+MHz and moving it onto the two-stage MMCM below is a separate step.
+
+The EE is the remaining blocker, exactly as this section has said since it was
+written. It is closer than the table used to show, but only because a
+sixty-megahertz regression that had gone unmeasured — a combinational `PMULTW` —
+was found and fixed; the structural problem is unchanged.
 
 ### The other half of the problem: the C1100 cannot make these clocks exactly
 
@@ -305,8 +313,8 @@ timing at the console's own rate":
 
 | block | needs | has | gap |
 |---|---|---|---|
-| GS | 147.456 | 129.1 | 12 % |
-| EE | 294.912 | 192.7 | 35 % |
+| GS | 147.456 | 152.5 | **met** |
+| EE | 294.912 | 203.9 | 31 % |
 
 
 So a **cycle-accurate EE at native rate is the blocker**, exactly as the
