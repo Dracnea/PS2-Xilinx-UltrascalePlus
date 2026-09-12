@@ -40,7 +40,7 @@ import argparse, fcntl, os, struct, sys, time
 
 LITEPCIE_IOCTL_REG = (3 << 30) | (12 << 16) | (ord("S") << 8) | 0
 
-NATIVE = 147.455867e6          # what the two MMCMs should produce
+NATIVE = 147.456e6             # what the two MMCMs produce -- exactly
 CONSOLE = 147.456e6            # what a PlayStation 2 runs at
 
 
@@ -93,7 +93,11 @@ def main():
     locked = rd("gs_clk_locked") & 1
     print(f"PS2 clock tree locked: {locked}")
     if not locked:
-        print("FAIL  the MMCMs did not lock -- nothing else here is meaningful")
+        print("FAIL  the MMCMs did not lock.")
+        print("      The link is alive and this bit is readable, which is the")
+        print("      whole point of keeping sys off the clock being measured:")
+        print("      the answer is 'the PS2 clock tree does not lock', not a")
+        print("      driver that hangs with nothing to say.")
         return 1
 
     # Bracket each read with the clock so the timing error is bounded by one
@@ -113,7 +117,9 @@ def main():
     f = ticks / dt
     err = (f - CONSOLE) / CONSOLE * 1e6
 
-    print(f"counted {ticks} ticks in {dt:.4f} s")
+    # The counter is in cd_gs and crossed into sys as gray code, so what is
+    # being measured is the GS clock, not the clock this CSR bank runs on.
+    print(f"counted {ticks} GS-domain ticks in {dt:.4f} s")
     print(f"measured {f/1e6:.4f} MHz")
     print(f"  synthesised target {NATIVE/1e6:.6f} MHz")
     print(f"  a PlayStation 2's  {CONSOLE/1e6:.6f} MHz")

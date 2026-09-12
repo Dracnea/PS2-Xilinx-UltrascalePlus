@@ -7,37 +7,46 @@
 # so those are a specification -- a block running at the wrong rate is wrong,
 # not slow, and the *ratios* between them are what the software depends on.
 #
-# 18.432 MHz is not reachable exactly from 100 MHz.  The ratio is
+# 18.432 MHz *is* reachable exactly from 100 MHz, and the whole clock tree with
+# it.  An earlier version of this file argued at length that it was not, and
+# settled for 0.90 ppm; the argument was wrong in one number.
 #
 #     18.432 / 100 = 576 / 3125 = (2^6 * 3^2) / 5^5
 #
-# and no MMCM can put 5^5 in its divider: a single MMCM would need DIVCLK x
-# CLKOUT = 3125 (say 25 x 125, both in range) and then CLKFBOUT_MULT = 576,
-# against a hard limit of 64.  A search of the whole legal parameter space finds
-# no exact solution for 18.432, 36.864, 147.456 or 294.912.
+# The 5^5 has to come out of the dividers, and the claim was that it cannot
+# because CLKFBOUT_MULT would have to exceed "a hard limit of 64".  **64 is the
+# 7-series limit.**  An UltraScale+ MMCME4 multiplies by up to 128, and inside
+# that larger space there is exactly one exact solution:
 #
-# The best a *single* MMCM can do while keeping the ratios exact is 295.000 /
-# 147.500 / 36.875 -- 298 ppm fast, which is what boards/c1100_ps2_iop.py's
-# _IOPClocks settled for.
+#     DIVCLK 5, MULT 72, CLKOUT0_DIVIDE_F 78.125
+#     VCO = 100 / 5 x 72 = 1440 MHz,  1440 / 78.125 = 18.432000 MHz
 #
-# Two do far better, and this is the whole idea here:
+# One solution, found by searching the whole legal space rather than reasoning
+# about it -- which is what should have happened the first time.
 #
-#   * one MMCM makes the 18.432 MHz base, using the *fractional* output divider
-#     that only CLKOUT0 has: DIVCLK 3, MULT 44.375, CLKOUT0 80.25, from a VCO of
-#     1479.1667 MHz.  That lands on 18.431983 MHz -- **0.90 ppm** fast;
-#   * a second multiplies that base by 64 to a VCO of 1179.647 MHz and divides
-#     by 4, 8 and 32.  Those are integers, so the EE : GS : IOP ratios are
-#     16 : 8 : 2 *exactly*, by construction, not approximately.
+# Two MMCMs are still needed, and that part of the old argument holds.  A single
+# one would have to produce 294.912, 147.456 and 36.864 from one VCO, so the VCO
+# must be a common multiple of all three: 1474.56 MHz works arithmetically
+# (x5, x10, x40) but needs MULT_F / DIVCLK = 14.7456, and 625 does not divide
+# any DIVCLK in range.  So:
 #
-# The result is every PS2 clock 0.90 ppm fast with mathematically exact ratios.
-# A real console's crystal is typically 30 to 100 ppm, so this is a more
-# accurate clock than the hardware being copied -- and it needs no oscillator
-# added to the card.
+#   * one MMCM makes the 18.432 MHz base exactly, as above;
+#   * a second multiplies it by 64 to a VCO of 1179.648 MHz and divides by 4, 8
+#     and 32.  Those are integers, so the EE : GS : IOP ratios are 16 : 8 : 2
+#     exactly, by construction.
 #
-# The error being *shared* is the part that matters.  A uniform 0.9 ppm is a
-# console running 0.9 ppm fast, which nothing can observe.  Two blocks with
-# different offsets would break the integer relationships, and that would be
-# observable immediately.
+# Every PS2 clock therefore comes out **exact**: 294.912, 147.456 and 36.864
+# MHz, 0 ppm, from a 100 MHz board reference and no added oscillator.  That is
+# better than the console being copied, whose crystal is 30 to 100 ppm.
+#
+# Both feedback multipliers are now **integers**, which matters for a second
+# reason.  The fractional feedback multiplier the old STAGE1 used is the one
+# feature of this block that nothing in this project had ever seen work on
+# hardware -- boards/c1100_ps2_iop.py flags its own as unverified for exactly
+# this reason -- and the first two attempts to run the card on this clock tree
+# produced a design whose sys domain never clocked.  Only the *output* divider
+# is fractional now, which is the ordinary case that LiteX's own MMCM wrapper
+# emits.
 #
 # SPDX-License-Identifier: BSD-2-Clause
 
@@ -47,8 +56,8 @@ from litex.gen.fhdl.module import LiteXModule
 
 # The measured constants, kept here so they are checkable rather than folded
 # into the instance below.
-STAGE1 = dict(divclk=3, mult=44.375, clkout0=80.25)   # 100 MHz -> 18.431983
-STAGE2 = dict(divclk=1, mult=64.0,                     # 18.431983 -> VCO 1179.647
+STAGE1 = dict(divclk=5, mult=72, clkout0=78.125)       # 100 MHz -> 18.432 exactly
+STAGE2 = dict(divclk=1, mult=64,                       # 18.432 -> VCO 1179.648
               ee=4, gs=8, iop=32)                      # integer, so ratios are exact
 
 
@@ -114,7 +123,7 @@ class PS2Clocks(LiteXModule):
         # ---- stage 1: the 18.432 MHz base -------------------------------
         self.specials += Instance("MMCME4_ADV", name=f"{name}_mmcm1",
             p_BANDWIDTH        = "OPTIMIZED",
-            p_COMPENSATION     = "AUTO",
+            p_REF_JITTER1      = 0.01,
             p_CLKIN1_PERIOD    = 10.0,
             p_DIVCLK_DIVIDE    = STAGE1["divclk"],
             p_CLKFBOUT_MULT_F  = STAGE1["mult"],
@@ -133,8 +142,8 @@ class PS2Clocks(LiteXModule):
         # ---- stage 2: the three console clocks, integer dividers ---------
         self.specials += Instance("MMCME4_ADV", name=f"{name}_mmcm2",
             p_BANDWIDTH       = "OPTIMIZED",
-            p_COMPENSATION    = "AUTO",
-            p_CLKIN1_PERIOD   = 1e3 / 18.431983,
+            p_REF_JITTER1     = 0.01,
+            p_CLKIN1_PERIOD   = 1e3 / 18.432,
             p_DIVCLK_DIVIDE   = STAGE2["divclk"],
             p_CLKFBOUT_MULT_F = STAGE2["mult"],
             # CLKOUT0 is the one output with a fractional divider, so its

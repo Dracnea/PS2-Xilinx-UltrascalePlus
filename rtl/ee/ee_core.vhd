@@ -56,8 +56,20 @@
 --     except a load whose value is still in flight, which is what the load-use
 --     interlock stalls for.
 --
--- Traps are counted, not taken: there is no exception path yet, and a silent
--- difference would be worse than a loud unimplemented one.
+-- Two different things are called traps here and the distinction matters.
+--
+--   * **Architectural exceptions are taken.**  SYSCALL, BREAK and integer
+--     overflow raise in A1, travel down the pipeline and commit in WB like any
+--     other result, writing EPC and Cause -- including Cause.BD, which needs the
+--     branch-delay-slot question answered a stage earlier than it is asked.
+--     ERET returns.  Nothing about them is counted rather than performed.
+--
+--   * **`dbg_traps` counts instructions this core does not implement**, which
+--     is a debugging aid and not an architectural feature.  An undecoded
+--     instruction increments it and writes nothing, so a differential test that
+--     agrees on every register while this counter climbs is a test that proved
+--     less than it looks: a silent difference would be worse than a loud
+--     unimplemented one, which is the reason the counter exists at all.
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
