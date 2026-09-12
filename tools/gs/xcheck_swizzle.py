@@ -31,7 +31,14 @@ def read_table(src, name, rows, cols):
                   % (re.escape(name), rows, cols), src, re.S)
     if not m:
         return None
-    nums = [int(t) for t in re.findall(r"\b\d+\b", m.group(1))]
+    # Strip line comments before counting numbers.  PCSX2 labels the halves of
+    # its column tables with `// column 0`, and the 0 in that comment is
+    # indistinguishable from data to a bare number scan -- which made this
+    # function return None for every commented table and the check above report
+    # "PCSX2 layout changed?" for tables that had not changed at all.  A
+    # cross-check that quietly declines to check is worse than no cross-check.
+    body = re.sub(r"//[^\n]*", "", m.group(1))
+    nums = [int(t) for t in re.findall(r"\b\d+\b", body)]
     if len(nums) != rows * cols:
         return None
     return [nums[r * cols:(r + 1) * cols] for r in range(rows)]
@@ -88,6 +95,31 @@ def main():
                     print("FAIL column32(%d,%d) = %d, PCSX2 says %d" % (cy, cx, mine, theirs))
                     bad += 1
         print("column32: 64 entries checked")
+
+    # ---- the indexed texture formats ------------------------------------
+    #
+    # gs_ref derives these as bit-linear closed forms rather than storing the
+    # tables, which is the claim this check exists to break.
+    for name, rows, cols, fn, label in (
+            ("_blockTable8",  4,  8, gs_ref.block8,  "block8"),
+            ("columnTable8", 16, 16, gs_ref.column8, "column8"),
+            ("_blockTable4",  8,  4, gs_ref.block4,  "block4"),
+            ("columnTable4", 16, 32, gs_ref.column4, "column4")):
+        t = read_table(src, name, rows, cols)
+        if t is None:
+            print("FAIL could not read %s -- PCSX2 layout changed?" % name)
+            bad += 1
+            continue
+        n = 0
+        for r in range(rows):
+            for c in range(cols):
+                mine, theirs = fn(r, c), t[r][c]
+                if mine != theirs:
+                    print("FAIL %s(%d,%d) = %d, PCSX2 says %d"
+                          % (label, r, c, mine, theirs))
+                    bad += 1
+                n += 1
+        print("%-9s %d entries checked" % (label + ":", n))
 
     # Both tables agreeing entry by entry is necessary but not sufficient: the
     # addresses they are combined into are what the rasteriser will use, so

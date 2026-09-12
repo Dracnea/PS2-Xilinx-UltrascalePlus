@@ -240,6 +240,65 @@ def addr16p(pagebase, bw, x, y, sform=False, blkxor=0):
             (x >> 3) & 1)
 
 
+# ---- the indexed formats, PSMT8 and PSMT4 -----------------------------------
+#
+# These are the texture formats that store a palette index rather than a colour,
+# and their layout looks at first like the one part of the GS that really is a
+# table: PCSX2 stores columnTable8 as a literal 16 x 16 array of bytes and
+# columnTable4 as 16 x 32, with no evident pattern.
+#
+# They are not tables.  Both are **linear over GF(2)** -- every output bit is a
+# fixed exclusive-or of input bits -- which was established by testing it rather
+# than by looking at them: for all 256 and 512 entries,
+#
+#     v(y, x) == v(y, 0) ^ v(0, x) ^ v(0, 0)
+#
+# holds, which is exactly the condition for a bit-linear map.  Solving for the
+# basis gives the closed forms below.  So, as with the colour formats, this is a
+# wire permutation and one exclusive-or gate, not a lookup.
+#
+# The *block* index is not new at all: PCSX2's _blockTable8 is byte-identical to
+# _blockTable32, so an 8-bit page arranges its blocks exactly as a 32-bit page
+# does -- only the block is 16 x 16 pixels instead of 8 x 8.  _blockTable4 is
+# the same permutation with the roles of x and y exchanged, its blocks being
+# 32 x 16.
+#
+# tools/gs/xcheck_swizzle.py checks all of this against PCSX2's tables
+# exhaustively, which is what makes the derivation above a claim that can fail.
+
+def column8(y, x):
+    """Byte offset of pixel (x, y) within a PSMT8 column, x < 16, y < 16."""
+    y0, y1, y2, y3 = (y >> 0) & 1, (y >> 1) & 1, (y >> 2) & 1, (y >> 3) & 1
+    x0, x1, x2, x3 = (x >> 0) & 1, (x >> 1) & 1, (x >> 2) & 1, (x >> 3) & 1
+    return (y1 << 0 | x3 << 1 | x0 << 2 | y0 << 3 | x1 << 4
+            | (y1 ^ y2 ^ x2) << 5 | y2 << 6 | y3 << 7)
+
+
+def column4(y, x):
+    """Nibble offset of pixel (x, y) within a PSMT4 column, x < 32, y < 16.
+
+    Nine bits, not eight: a 4-bit column is 32 x 16 pixels and so holds 512
+    nibbles.  The first version of this stopped at bit 7 because the basis was
+    extracted over a byte, and it was right for the top half of every column and
+    wrong by exactly 256 for the bottom -- which the cross-check caught on its
+    first run.
+    """
+    y0, y1, y2, y3 = ((y >> b) & 1 for b in range(4))
+    x0, x1, x2, x3, x4 = ((x >> b) & 1 for b in range(5))
+    return (y1 << 0 | x3 << 1 | x4 << 2 | x0 << 3 | y0 << 4 | x1 << 5
+            | (y1 ^ y2 ^ x2) << 6 | y2 << 7 | y3 << 8)
+
+
+def block8(by, bx):
+    """PSMT8 blocks are laid out in a page exactly as PSMCT32's are."""
+    return block32(by, bx)
+
+
+def block4(by, bx):
+    """PSMT4's block order is PSMCT32's with x and y exchanged."""
+    return block32(bx, by)
+
+
 # ---- RGBA16 -----------------------------------------------------------------
 #
 # The 16-bit pixel is A1 B5 G5 R5, alpha in bit 15 and red in bits 4:0, and the
