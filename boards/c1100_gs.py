@@ -430,9 +430,32 @@ class GSSoC(SoCMini):
 def build(nlanes=4, speed="gen3", do_build=False, build_dir="build/c1100_gs"):
     platform = xilinx_c1100.Platform(toolchain="vivado")
     soc      = GSSoC(platform, speed=speed, nlanes=nlanes)
+
+    # The Graphics Synthesizer closes at about 152 MHz out of context and is
+    # marginal at 147.456 in it -- not because the part is full (this design
+    # uses three per cent of it) but because the GS ends up placed around the
+    # PCIe and HBM hard blocks, and the routes stretch.  Two builds have now
+    # come back on opposite sides of zero from changes that touched no datapath.
+    #
+    # So the implementation is told to try harder rather than left on defaults.
+    # Explore placement and physical optimisation together cost perhaps twenty
+    # minutes of build time, which is cheap against a bitstream that cannot be
+    # trusted to behave.
+    #
+    # These are arguments to the toolchain's build(), not attributes of it --
+    # setting them on the toolchain object looks like it works, produces no
+    # error, and is silently overwritten by the defaults when build() runs.
+    # The first attempt did exactly that and came back with a WNS identical to
+    # the digit, which is what gave it away.
+    effort = dict(
+        vivado_place_directive               = "Explore",
+        vivado_post_place_phys_opt_directive = "Explore",
+        vivado_route_directive               = "Explore",
+        vivado_post_route_phys_opt_directive = "Explore",
+    )
     builder  = Builder(soc, output_dir=build_dir, compile_software=False,
                        csr_csv=join(build_dir, "csr.csv"))
-    builder.build(run=do_build)
+    builder.build(run=do_build, **effort)
     try:
         generate_litepcie_software(soc, join(build_dir, "software"))
     except Exception as e:

@@ -81,6 +81,7 @@ architecture arch of gs_gif is
    type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
                     S_SPR_CLAMP, S_SPR_TEST,
                     S_DRAW, S_DRAWRD,
+                    S_DRAWWR,
                     S_TRI_SET, S_TRI_CEIL, S_TRI_GO, S_TRI_WAIT,
                     S_TRI_SCAN, S_TRI_CLAMP,
                     S_TRI_TEST, S_TRI_STEP,
@@ -191,6 +192,18 @@ architecture arch of gs_gif is
    -- same numbers are computed into.
    signal dr_run  : integer range 1 to 4 := 1;
    signal dr_wide : std_logic := '0';
+
+   -- The wide read-modify-write's result, held for a cycle before it is
+   -- written.
+   --
+   -- Four blenders, a mask and a lane-place in the same clock as the memory's
+   -- answer did not fit: in context at 147.456 MHz it missed by 0.36 ns, and
+   -- Explore placement with physical optimisation only brought that to 0.14.
+   -- Splitting the blend from the write costs one cycle per *group* rather than
+   -- per pixel, so the blended fill rate goes to five clocks per four pixels
+   -- instead of four -- against the sixteen it started at.
+   signal dr_nw   : std_logic_vector(255 downto 0) := (others => '0');
+   signal dr_nbe  : std_logic_vector(31 downto 0) := (others => '0');
    signal k_ok  : std_logic := '0';
    signal dr_x1      : unsigned(10 downto 0) := (others => '0');
    signal dr_y1      : unsigned(10 downto 0) := (others => '0');
@@ -497,7 +510,8 @@ begin
                        and ((dr_zon = '1' and dr_zdone = '0' and dr_ztst = "00")
                             or ((dr_zon = '0' or dr_zdone = '1')
                                 and dr_fbmsk = x"00000000" and dr_abe = '0'))
-              else '1' when state = S_DRAWRD and rd_valid = '1'
+              else '1' when state = S_DRAWWR
+              else '1' when state = S_DRAWRD and rd_valid = '1' and dr_wide = '0'
               else '1' when state = S_ZRD and rd_valid = '1' and z_pass = '0'
               else '0';
 
@@ -522,6 +536,7 @@ begin
    -- stops to do some work, which is the one case that matters.
    gif_ready <= '0' when reset = '1' else
                 '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
+                         or state = S_DRAWWR
                          or state = S_SPR_CLAMP or state = S_SPR_TEST
                          or state = S_TRI_SET or state = S_TRI_CEIL
                          or state = S_TRI_GO or state = S_TRI_WAIT
@@ -1381,6 +1396,17 @@ begin
                      end if;
                   end if;
 
+               -- The wide read-modify-write's write, a cycle after its blend.
+               when S_DRAWWR =>
+                  wr_en   <= '1';
+                  wr_addr <= std_logic_vector(dr_addr(19 downto 3));
+                  wr_data <= dr_nw;
+                  wr_be   <= dr_nbe;
+                  pixels  <= pixels + dr_run;
+                  px_run  := dr_run;
+                  -- next_px sets the state, as it does for every other way a
+                  -- pixel can end
+
                when S_ZRD =>
                   if rd_valid = '1' then
                      if z_pass = '1' then
@@ -1446,14 +1472,9 @@ begin
                                                     4 * li);
                         end if;
                      end loop;
-                     wr_en   <= '1';
-                     wr_addr <= std_logic_vector(dr_addr(19 downto 3));
-                     wr_data <= nw;
-                     wr_be   <= std_logic_vector(wbe);
-                     pixels  <= pixels + dr_run;
-                     px_run  := dr_run;
-                     -- next_px sets the state, as it does for every other way a
-                     -- pixel can end
+                     dr_nw  <= nw;
+                     dr_nbe <= std_logic_vector(wbe);
+                     state  <= S_DRAWWR;
                   elsif rd_valid = '1' then
                      lane := to_integer(dr_addr(2 downto 0));
                      oldpx := std_logic_vector(
