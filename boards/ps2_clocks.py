@@ -59,6 +59,27 @@ class PS2Clocks(LiteXModule):
     `locked` is high when *both* have locked, because a design that starts on
     one of two clocks is worse than one that does not start at all.
 
+    Two details of the instances below are not optional and were both missing
+    from the first version, which did not lock on the card at all:
+
+      * **CLKINSEL must be tied high.**  It selects between CLKIN1 and CLKIN2,
+        and it is not optional just because CLKIN2 is unused: left unconnected
+        it reads as 0, the MMCM selects the unconnected CLKIN2, and it never
+        locks.  boards/c1100_ps2_iop.py's hand-written MMCM sets it and this one
+        did not, which is the whole difference between a design that runs and
+        one whose sys domain has no clock.
+      * **The second MMCM is held in reset until the first has locked.**  A
+        cascade whose downstream stage is released while its input is still
+        absent may fail to lock or lock to the wrong frequency; UG572 says to
+        gate it, and it costs one term.
+
+    Neither is visible in simulation, neither is a parameter a DRC checks, and
+    the failure they produce is silent in a specific and nasty way: the PCIe
+    hard block has its own clock, so the card still enumerates, trains its link
+    and answers config-space reads.  Only the CSR space behind the bridge is
+    dead, and a read of it does not error -- it never completes, so the driver
+    hangs.
+
     `domains` maps "ee", "gs" and "iop" to the ClockDomain each should drive,
     and selects which of the three to build.  The second MMCM always drives all
     three outputs -- they cost nothing, and keeping them makes the *ratios* a
@@ -98,8 +119,10 @@ class PS2Clocks(LiteXModule):
             p_DIVCLK_DIVIDE    = STAGE1["divclk"],
             p_CLKFBOUT_MULT_F  = STAGE1["mult"],
             p_CLKOUT0_DIVIDE_F = STAGE1["clkout0"],
-            i_CLKIN1   = ref,
-            i_RST      = rst,
+            i_CLKIN1   = ref, i_CLKIN2 = 0, i_CLKINSEL = 1,
+            i_RST      = rst, i_PWRDWN = 0,
+            i_DADDR = 0, i_DCLK = 0, i_DEN = 0, i_DI = 0, i_DWE = 0,
+            i_PSCLK = 0, i_PSEN = 0, i_PSINCDEC = 0, i_CDDCREQ = 0,
             i_CLKFBIN  = fb1,
             o_CLKFBOUT = fb1,
             o_CLKOUT0  = base,
@@ -125,8 +148,12 @@ class PS2Clocks(LiteXModule):
             p_CLKOUT0_DIVIDE_F = float(STAGE2["ee"]),
             p_CLKOUT1_DIVIDE   = STAGE2["gs"],
             p_CLKOUT2_DIVIDE   = STAGE2["iop"],
-            i_CLKIN1   = base_b,
-            i_RST      = rst,
+            i_CLKIN1   = base_b, i_CLKIN2 = 0, i_CLKINSEL = 1,
+            # Held until the first stage is locked, so this one is never asked
+            # to acquire against an input that is not there yet.
+            i_RST      = rst | ~lock1, i_PWRDWN = 0,
+            i_DADDR = 0, i_DCLK = 0, i_DEN = 0, i_DI = 0, i_DWE = 0,
+            i_PSCLK = 0, i_PSEN = 0, i_PSINCDEC = 0, i_CDDCREQ = 0,
             i_CLKFBIN  = fb2,
             o_CLKFBOUT = fb2,
             o_CLKOUT0  = c2[0],
