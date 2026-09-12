@@ -1415,6 +1415,60 @@ so this is slower than one pixel per clock when both circuits are on. The real
 PCRTC reads whole columns into a line buffer. That is the same fill-rate gap the
 rasteriser has and it is recorded here rather than hidden.
 
+## The console's clock, on the card — 2026-09-12
+
+    PS2 clock tree locked: 1
+    counted 737297895 GS-domain ticks in 5.0001 s
+    measured 147.4563 MHz     (+2 ppm, which is the host's clock, not the card's)
+
+Getting there took three builds and the first two taught nothing, which is the
+part worth writing down.
+
+### Two builds that looked like a working card and were not
+
+The first two put the *whole SoC* on the PS2 clock tree. Both came back with a
+PCIe link trained at Gen3 x4, a BAR enumerated and config space reading
+perfectly — and every CSR read hanging. The PCIe hard block has its own clock,
+so nothing about the card's outward behaviour changes when the fabric's clock
+fails. And a CSR read of a domain that is not clocking does not *error*: it
+never completes, so the host driver blocks. From the outside it looks like a
+tool that is stuck.
+
+### Why they taught nothing
+
+`locked` was in a CSR bank clocked by the domain whose clock had failed. The one
+bit that would have explained the failure could not be read *because of* the
+failure it described.
+
+That was a design decision, and it was argued for in this file: keeping the GS
+in `sys` meant nothing crossed a clock boundary, and "a design that does not
+cross a clock boundary cannot fail at one". The simplicity was real. The cost
+was that the failure had no voice, and it cost two builds.
+
+**A control plane must not depend on the clock it is used to diagnose.** `sys`
+now stays on the LiteX MMCM, which has worked on this card since the first
+bring-up, and the console's clock is measured from beside it.
+
+### And the clock itself was one number wrong
+
+Comparing the failing MMCM against the one in the same design that works
+narrowed it to a single difference: a **fractional feedback multiplier**, which
+is the one feature of this block that nothing in this project had ever seen work
+on silicon — `boards/c1100_ps2_iop.py` flags its own as unverified for exactly
+that reason.
+
+Searching the legal parameter space for an integer-multiplier solution found one,
+and it is better than what it replaced:
+
+    DIVCLK 5, MULT 72, CLKOUT0_DIVIDE_F 78.125
+    VCO 1440 MHz,  1440 / 78.125 = 18.432000 MHz
+
+Exact. The earlier analysis had argued at length that no exact solution existed,
+and that argument used **64** as the multiplier limit — which is the 7-series
+number. An UltraScale+ MMCME4 multiplies by up to 128, and the answer was inside
+the difference. The tree is now 294.912 / 147.456 / 36.864 at 0 ppm with integer
+feedback multipliers in both stages.
+
 ## What is not started
 
 The rest of step 4 — lines and points, and texture. PCRTC's sync generator, and

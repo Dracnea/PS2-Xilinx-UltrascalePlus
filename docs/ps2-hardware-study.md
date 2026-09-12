@@ -235,11 +235,24 @@ written. It is closer than the table used to show, but only because a
 sixty-megahertz regression that had gone unmeasured — a combinational `PMULTW` —
 was found and fixed; the structural problem is unchanged.
 
-### The other half of the problem: the C1100 cannot make these clocks exactly
+### The other half of the problem: solved, and measured — 2026-09-12
+
+**The card produces the PlayStation 2's clocks exactly, and it has been measured
+doing it.** `tools/gs/gsclock.py` against a C1100 running `boards/ps2_clocks.py`:
+
+    PS2 clock tree locked: 1
+    counted 737297895 GS-domain ticks in 5.0001 s
+    measured 147.4563 MHz
+
++2 ppm against 147.456, which is the *host's* clock error over five seconds, not
+the card's. The synthesised value is exact.
+
+What follows is the analysis that got there, including the two things it got
+wrong on the way.
 
 Every PS2 clock is an integer multiple of **18.432 MHz** — the EE is 16x, the GS
-8x, the IOP 2x — and 18.432 MHz is not reachable from this card's 100 MHz
-reference. The ratio is 576/3125, and the 5^5 in the denominator is not
+8x, the IOP 2x — and the question was whether 18.432 MHz is reachable from this
+card's 100 MHz reference. The ratio is 576/3125, and the 5^5 in the denominator is not
 something an MMCM's multiplier grid can produce.
 
 `_IOPClocks` already lives with this: it runs the IOP at **36.875 MHz against a
@@ -315,6 +328,9 @@ timing at the console's own rate":
 |---|---|---|---|
 | GS | 147.456 | 152.5 | **met** |
 | EE | 294.912 | 203.9 | 31 % |
+
+And the clock itself is no longer a gap at all: **0 ppm by construction,
++2 ppm by measurement on the card.**
 
 
 So a **cycle-accurate EE at native rate is the blocker**, exactly as the

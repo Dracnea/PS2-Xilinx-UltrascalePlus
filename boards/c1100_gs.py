@@ -49,9 +49,11 @@
 # and tools/gs/gsclock.py can say whether the PS2 clock tree locks and what
 # frequency it is actually producing.
 #
-# Moving the GS onto `cd_gs` is the next step and needs a clock-domain crossing
-# on the CSR interface.  It is deliberately not in this build: a failure then
-# will point at the crossing, because the clock will already have been measured.
+# **The tree was then measured on the card: locked, 147.4563 MHz, +2 ppm --
+# which is the host clock's own error, not the card's.**  So the GS now runs in
+# `cd_gs` at the console's rate, and the CSR interface crosses the boundary
+# explicitly; `sys` stays on the LiteX MMCM so that the control plane never
+# again depends on the clock it is being used to diagnose.
 #
 # SPDX-License-Identifier: BSD-2-Clause
 
@@ -92,8 +94,8 @@ class _GSCRG(LiteXModule):
     Two MMCMs, for two different jobs.  The LiteX one makes `sys` and the three
     clocks the HBM IP wants, all on integer ratios from 100 MHz, and this is the
     configuration that has worked on this card since the first bring-up.
-    PS2Clocks makes the console's own clock family; here it drives only `cd_gs`,
-    and the only thing in `cd_gs` is a counter.
+    PS2Clocks makes the console's own clock family; here it drives `cd_gs`, which
+    is the Graphics Synthesizer's domain and is measured by a counter beside it.
 
     That separation is the point.  Two earlier builds put `sys` itself on the
     PS2 clock tree, and when the tree did not lock there was no way to find out:
@@ -122,8 +124,7 @@ class _GSCRG(LiteXModule):
         mmcm.create_clkout(self.cd_apb,     100e6, margin=0)
         mmcm.create_clkout(self.cd_axi,     250e6, margin=0)
 
-        # The console's clock tree, built but not yet load-bearing.  Only the GS
-        # domain is asked for: the EE's 294.912 and the IOP's 36.864 come off
+        # The console's clock tree.  Only the GS domain is asked for: the EE's 294.912 and the IOP's 36.864 come off
         # the same second MMCM and will be wanted when those blocks join this
         # image, but a clock domain that drives nothing is a period constraint
         # on nothing.
@@ -226,63 +227,141 @@ class GSBringup(LiteXModule, AutoCSR):
         if clk_locked is not None:
             self.specials += MultiReg(clk_locked, self.clk_locked.status, "sys")
 
-        # ---- the GS itself ------------------------------------------------
-        gif_valid = Signal()
-        gif_ready = Signal()
-        gif_data  = Signal(128)
-        h_rd_en   = Signal()
-        h_rd_data = Signal(256)
+        # ---- the GS itself, in its own clock domain ------------------------
+        #
+        # Everything above this line is in `sys`; gs_top is in `gs`, at the
+        # console's 147.456 MHz.  Every signal between them crosses a boundary
+        # between two unrelated clocks, and none of it may be sampled naively.
+        #
+        # Three patterns cover all of it, and the choice of which to use is
+        # decided by what the signal *is*, not by how wide it happens to be:
+        #
+        #   * **A request that must happen exactly once** -- a GIF push, a
+        #     memory read -- crosses as a *toggle*.  A level would be sampled
+        #     for as many cycles as the two clocks' ratio allows and the request
+        #     would happen two or three times; a pulse could be missed entirely
+        #     between sampling edges.  A toggle is edge-free: the far side
+        #     compares it against what it last acted on, so one toggle is one
+        #     request however the clocks line up.
+        #
+        #   * **Data that accompanies a request** -- the quadword, the address --
+        #     is not synchronised at all.  It sits in a CSR register that the
+        #     host wrote before the request and does not touch until the
+        #     acknowledgement comes back, so it is stable for the whole crossing.
+        #     Synchronising it would cost 400 flip-flops to solve a problem the
+        #     handshake has already solved.
+        #
+        #   * **Free-running status** -- the pixel count, the register window --
+        #     is snapshotted in `gs` every 64 cycles and announced with a toggle.
+        #     A multi-bit counter sampled directly is the classic mistake: at a
+        #     carry, several bits change at once and the sampler can catch some
+        #     old and some new, so 0x0FF -> 0x100 reads as anything in between.
+        gif_valid  = Signal()
+        gif_ready  = Signal()
+        gif_data   = Signal(128)
+        h_rd_en    = Signal()
+        h_rd_addr  = Signal(17)
+        h_rd_data  = Signal(256)
         h_rd_valid = Signal()
-        dbg_reg   = Signal(64)
-        dbg_unk   = Signal(16)
-        dbg_pix   = Signal(32)
+        dbg_reg    = Signal(64)
+        dbg_unk    = Signal(16)
+        dbg_pix    = Signal(32)
+        gs_rst     = Signal()
 
         self.comb += gif_data.eq(Cat(self.gif_w0.storage, self.gif_w1.storage,
                                      self.gif_w2.storage, self.gif_w3.storage))
 
-        # A push is held until the GIF takes it.  gif_ready falls for as long as
-        # a primitive takes to draw, which for a large sprite is thousands of
-        # cycles, so the host has to be told rather than left to guess.
+        # ---- reset: a level, so two flops are all it needs -----------------
+        rst_gs = Signal()
+        self.specials += MultiReg(self.reset.storage[0], rst_gs, "gs")
+        self.comb += gs_rst.eq(rst_gs | ResetSignal("gs"))
+
+        # ---- the push handshake --------------------------------------------
+        push_req  = Signal()          # toggles in sys, one toggle per push
+        push_ack  = Signal()          # follows it in gs, once the GIF has taken it
+        push_ack_s = Signal()
+        push_busy = Signal()
+        self.specials += MultiReg(push_ack, push_ack_s, "sys")
+        self.comb += push_busy.eq(push_req != push_ack_s)
+        self.sync += If(self.gif_push.re & ~push_busy, push_req.eq(~push_req))
+
+        push_req_s = Signal()
+        self.specials += MultiReg(push_req, push_req_s, "gs")
+        self.comb += gif_valid.eq(push_req_s != push_ack)
+        self.sync.gs += If(gif_valid & gif_ready, push_ack.eq(push_req_s))
+
+        # ---- the read handshake --------------------------------------------
+        rd_req   = Signal()
+        rd_ack   = Signal()
+        rd_ack_s = Signal()
+        rd_done  = Signal()
+        self.specials += MultiReg(rd_ack, rd_ack_s, "sys")
         self.sync += [
-            If(self.gif_push.re,
-               gif_valid.eq(1),
-            ).Elif(gif_valid & gif_ready,
-               gif_valid.eq(0),
+            If(self.rd_addr.re,
+               rd_req.eq(~rd_req),
+               rd_done.eq(0),
+            ).Elif(rd_req == rd_ack_s,
+               rd_done.eq(1),
             ),
-        ]
-        self.comb += [
-            self.status.fields.busy.eq(gif_valid),
-            self.status.fields.ready.eq(gif_ready),
-            self.pixels.status.eq(dbg_pix),
-            self.unknown.status.eq(dbg_unk),
-            self.dbg_lo.status.eq(dbg_reg[:32]),
-            self.dbg_hi.status.eq(dbg_reg[32:]),
         ]
 
-        # A read is one pulse, answered two cycles later.
-        rd_done = Signal()
-        self.sync += [
+        rd_req_s = Signal()
+        rd_pend  = Signal()
+        rd_hold  = Signal(256)
+        self.specials += MultiReg(rd_req, rd_req_s, "gs")
+        self.comb += h_rd_addr.eq(self.rd_addr.storage)   # stable across the crossing
+        self.sync.gs += [
             h_rd_en.eq(0),
-            If(self.rd_addr.re,
+            If((rd_req_s != rd_ack) & ~rd_pend,
                h_rd_en.eq(1),
-               rd_done.eq(0),
+               rd_pend.eq(1),
             ),
-            If(h_rd_valid,
-               rd_done.eq(1),
-               *[self.rd_data[i].status.eq(h_rd_data[32*i:32*(i+1)]) for i in range(8)]
+            If(rd_pend & h_rd_valid,
+               rd_hold.eq(h_rd_data),
+               rd_pend.eq(0),
+               rd_ack.eq(rd_req_s),
             ),
         ]
-        self.comb += self.status.fields.rd_done.eq(rd_done)
+        self.comb += [self.rd_data[i].status.eq(rd_hold[32*i:32*(i+1)])
+                      for i in range(8)]
+
+        # ---- free-running status, snapshotted -------------------------------
+        snap_cnt = Signal(6)
+        snap     = Signal(112)
+        snap_tog = Signal()
+        self.sync.gs += [
+            snap_cnt.eq(snap_cnt + 1),
+            If(snap_cnt == 0, snap.eq(Cat(dbg_pix, dbg_unk, dbg_reg))),
+            If(snap_cnt == 1, snap_tog.eq(~snap_tog)),
+        ]
+        tog_s, tog_d = Signal(), Signal()
+        hold = Signal(112)
+        self.specials += MultiReg(snap_tog, tog_s, "sys")
+        self.sync += [
+            tog_d.eq(tog_s),
+            If(tog_s != tog_d, hold.eq(snap)),
+        ]
+        ready_s = Signal()
+        self.specials += MultiReg(gif_ready, ready_s, "sys")
+        self.comb += [
+            self.status.fields.busy.eq(push_busy),
+            self.status.fields.ready.eq(ready_s),
+            self.status.fields.rd_done.eq(rd_done),
+            self.pixels.status.eq(hold[0:32]),
+            self.unknown.status.eq(hold[32:48]),
+            self.dbg_lo.status.eq(hold[48:80]),
+            self.dbg_hi.status.eq(hold[80:112]),
+        ]
 
         self.specials += Instance("gs_top",
             p_ADDR_BITS = 17,
-            i_clk       = ClockSignal("sys"),
-            i_reset     = self.reset.storage[0] | ResetSignal("sys"),
+            i_clk       = ClockSignal("gs"),
+            i_reset     = gs_rst,
             i_gif_valid = gif_valid,
             i_gif_data  = gif_data,
             o_gif_ready = gif_ready,
             i_h_rd_en   = h_rd_en,
-            i_h_rd_addr = self.rd_addr.storage,
+            i_h_rd_addr = h_rd_addr,
             o_h_rd_data = h_rd_data,
             o_h_rd_valid= h_rd_valid,
             i_dbg_sel   = self.dbg_sel.storage,
@@ -337,8 +416,11 @@ class GSSoC(SoCMini):
 
         self.gs = GSBringup(platform, clk_locked=self.crg.ps2.locked)
 
-        # The gray counter is the only thing crossing sys <-> gs, and gray code
-        # is exactly the construct that makes an unconstrained crossing safe.
+        # Everything crossing sys <-> gs is either two-flop synchronised, gray
+        # coded, or data held stable by a handshake for the whole crossing, so
+        # the two clocks are declared asynchronous and no path between them is
+        # timed.  That is a claim about the logic, not a way of silencing the
+        # tool: see the crossing patterns documented in GSBringup.
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_gs.clk)
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_axi.clk)
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_apb.clk)
