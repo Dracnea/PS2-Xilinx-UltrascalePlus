@@ -143,6 +143,52 @@ if they come back complemented, an undocumented quirk becomes a measured one.
 Worth doing in the same session as the others, because it needs nothing the
 `ps2link` setup above does not already provide.
 
+## The Emotion Engine's timing, which nothing public records
+
+The R5900's *shape* is published and consistent across sources: six-stage
+integer pipeline, in-order, two-way superscalar, two 64-bit integer ALUs, a
+128-bit load-store unit and a branch unit, 294.912 MHz on 250 nm. What is not
+published anywhere is the part a cycle-accurate core actually needs:
+
+* **Per-instruction latency and repeat rate.** How many cycles before a
+  multiply's result can be used; whether a divide blocks issue or only its own
+  unit; what MMI's parallel forms cost against the scalar ones.
+* **The dual-issue pairing rules.** Which two instructions may go together.
+  Every real two-way in-order machine has restrictions -- one memory operation
+  per cycle, one branch, one multiplier -- and the R5900's are not written down.
+* **Hazard and interlock behaviour.** Where the forwarding paths actually are,
+  and which dependencies cost a stall rather than being bypassed.
+* **Branch cost.** The R5900 has a branch target address cache; what a taken
+  branch costs with and without a hit is not recorded.
+
+None of this makes an FPGA faster -- the clock gap is an implementation problem
+and no measurement changes it. What it decides is **what the pipeline has to
+look like to be cycle-accurate**, which is exactly the question the deeper
+pipeline work has to answer before it starts. Building a six-stage dual-issue
+machine and then discovering its stall behaviour is wrong is a much worse order
+than measuring first.
+
+**The probe is a timing harness rather than a picture.** The EE has cycle
+counters in COP0 (the Count register) and performance counters of its own, so
+the shape is: set up a register state, execute a short instruction sequence a
+few thousand times in a loop, read the cycle count, and subtract the loop
+overhead. Repeat per instruction, per operand dependency distance, and per pair.
+
+Three groups are worth capturing in one session, because they need the same
+harness and the console is not always attached:
+
+1. **Latency and repeat rate** for every instruction group this core
+   implements: the scalar ALU, the shifts, MULT and DIV, every MMI table,
+   the unaligned loads, LQ and SQ.
+2. **Pairing**, by timing each instruction against itself and against one of
+   each other class, and looking for pairs that take one cycle rather than two.
+3. **Dependency distance**, by timing a producer and a consumer separated by
+   zero, one, two and three independent instructions -- which maps the
+   forwarding network directly.
+
+Worth doing in the same session as the `PHMSBH` probe below, since both are EE
+programs rather than GIF streams and share whatever harness gets written.
+
 ## The FPU's last bit, which is the whole of its arithmetic
 
 Not yet buildable -- there is no FPU -- but recorded now because it decides how

@@ -72,7 +72,6 @@ from litepcie.phy.usppciephy import USPHBMPCIEPHY
 from litepcie.software import generate_litepcie_software
 
 import xilinx_c1100
-from hbm_common import HBM
 from litex.soc.cores.clock import USPMMCM
 from migen.genlib.cdc import MultiReg, GrayCounter, GrayDecoder
 from ps2_clocks import PS2Clocks
@@ -444,11 +443,33 @@ class GSSoC(SoCMini):
 
         self.crg = _GSCRG(platform, sys_clk_freq)
 
-        # The GS keeps its 4 MB in UltraRAM and wants nothing from HBM, but
-        # hbm_cattrip still has to be driven or the satellite controller powers
-        # the card off.  Instantiating HBM is how this repository does that, and
-        # it costs nothing that matters here.
-        self.hbm = HBM(platform, platform.request("hbm_cattrip"))
+        # ---- hbm_cattrip, driven low, and why HBM is not instantiated ------
+        #
+        # BE45 must be driven or the satellite controller powers the card off.
+        # This target used to satisfy that by instantiating the whole HBM
+        # controller, on the grounds that it carries the *real* over-temperature
+        # output and tying the pin low would make an overheating card look
+        # healthy.  That reasoning is sound for a design that uses HBM.  This
+        # one does not: the Graphics Synthesizer keeps its 4 MB in UltraRAM and
+        # never touches the stacks.
+        #
+        # And the power report says what it was costing.  Of 22.058 W on chip,
+        # **HBM was 17.627 W** -- eighty per cent of the design's power, for one
+        # pin.  Everything that is actually the GS -- clocks, signals, block RAM,
+        # UltraRAM, DSPs, the MMCMs -- comes to about 0.6 W.
+        #
+        # That matters because of what this project is for.  A PlayStation 2
+        # draws somewhere between 35 and 79 W depending on the model, and a
+        # replication that needs more power than the machine it replicates is
+        # not a replication anybody would use.  Seventeen watts spent keeping
+        # idle memory refreshed so that it can report its own temperature is the
+        # opposite of that trade.
+        #
+        # The over-temperature argument also inverts once HBM is not running:
+        # the heat CATTRIP exists to warn about is the heat of the stacks being
+        # driven, and they are not being driven.  When the Emotion Engine's main
+        # memory arrives HBM comes back, and so does the real output.
+        self.comb += platform.request("hbm_cattrip").eq(0)
 
         pcie_pads = platform.request(f"pcie_x{nlanes}")
         self.pcie_phy = USPHBMPCIEPHY(platform, pcie_pads,
