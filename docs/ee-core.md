@@ -1570,6 +1570,38 @@ quirks derivable from nothing and checkable against nothing but the emulator
 they came from, so they wait for a console. Everything else in MMI0, MMI1, MMI2
 and MMI3 is done, along with the unaligned group, `LQ` and `SQ`.
 
+### Every figure below was measured across two SLRs — 2026-09-13
+
+This part has **two super-logic regions**, and an out-of-context fit is free to
+spread a design across both. A crossing costs a Laguna register and a long
+line, and the EE's critical path was last measured at 77 per cent routing, so
+the question is whether these numbers have been measuring the device's geometry
+as much as the core's logic.
+
+Partly, yes. The same core, confined to one SLR by a pblock and fitted the same
+way:
+
+| | Default | Explore | ExtraNetDelay | mean | spread |
+|---|---|---|---|---|---|
+| free to spread (as published) | 193.3 | 192.3 | 186.8 | **190.8** | 6.5 |
+| confined to one SLR | 203.7 | 199.7 | 204.0 | **202.5** | 4.3 |
+
+**+11.7 MHz, and a tighter spread.** So the honest figure for `ee_core` is
+202.5 MHz, and the gap to 294.912 is 31 per cent rather than 35.
+
+The table below is left as measured rather than rewritten, because every row in
+it was measured the same way and the *differences* between rows are what it
+exists to show — those are unaffected. What is affected is the absolute
+distance to the target, which was overstated, and the spread, which was partly
+the placer choosing differently about the SLR boundary from one variant to the
+next rather than the logic changing.
+
+The same lesson had just been learned on the other side of the project: the GS
+is placed around the PCIe and HBM hard blocks, which all live in SLR0, and
+giving it SLR1 to itself is what stopped its builds landing within a few hundred
+picoseconds of the boundary at random. A fit that does not say where a design
+sits is not measuring the design.
+
 Timing, three placement directives per variant, against a 294.912 MHz target:
 
 | core | Fmax mean | LUTs |

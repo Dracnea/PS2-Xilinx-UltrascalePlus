@@ -133,6 +133,36 @@ class _GSCRG(LiteXModule):
 
         platform.add_period_constraint(pads.p, 1e9 / 100e6)
 
+        # ---- the Graphics Synthesizer gets an SLR to itself ----------------
+        #
+        # This part has two super-logic regions, and everything that is not the
+        # GS lives in one of them: SLR0 holds all four PCIe sites and the HBM
+        # reference clocks.  SLR1 holds no hard block this design uses, and has
+        # 320 UltraRAMs and 3072 DSPs against the GS's 128 and 96.
+        #
+        # Left to itself the placer spreads gs_top across both, and the result
+        # is a design that lands within a few hundred picoseconds of the
+        # boundary at 147.456 MHz every time -- four builds running -0.36,
+        # -0.14, +0.02 and 0.000 ns, on changes that mostly did not touch the
+        # datapath.  The part is three per cent full, so that is not capacity,
+        # it is the GS being placed around the hard blocks and its own internal
+        # paths stretching between the two regions.
+        #
+        # Confining it to SLR1 is the right shape rather than a trick, because
+        # of what crosses: the GS talks to the rest of this design *only*
+        # through the CSR interface, and that interface is already a
+        # toggle-and-handshake crossing built for two unrelated clocks.  It
+        # tolerates the extra latency of an inter-SLR hop for exactly the same
+        # reason it tolerates the clock domain change -- nothing in it is timed
+        # edge to edge.  Everything that *is* timed edge to edge, which is the
+        # whole rasteriser and its 4 MB of memory, ends up on one side.
+        platform.toolchain.pre_placement_commands.append(
+            "create_pblock pblock_gs")
+        platform.toolchain.pre_placement_commands.append(
+            "resize_pblock [get_pblocks pblock_gs] -add SLR1")
+        platform.toolchain.pre_placement_commands.append(
+            "add_cells_to_pblock [get_pblocks pblock_gs] [get_cells gs_top]")
+
         # Named by MMCM pin, not by net: a net name that no longer exists makes
         # Vivado print "No clocks matched" and apply nothing, which is the trap
         # c1100_ps2_iop.py's comment records hitting three times.  After a
