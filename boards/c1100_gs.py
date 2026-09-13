@@ -133,35 +133,57 @@ class _GSCRG(LiteXModule):
 
         platform.add_period_constraint(pads.p, 1e9 / 100e6)
 
-        # ---- the Graphics Synthesizer gets an SLR to itself ----------------
+        # ---- margin at 147.456, without changing 147.456 -------------------
         #
-        # This part has two super-logic regions, and everything that is not the
-        # GS lives in one of them: SLR0 holds all four PCIe sites and the HBM
-        # reference clocks.  SLR1 holds no hard block this design uses, and has
-        # 320 UltraRAMs and 3072 DSPs against the GS's 128 and 96.
+        # Four consecutive builds landed at -0.36, -0.14, +0.02 and 0.000 ns on
+        # changes that mostly did not touch the datapath.  The part is three per
+        # cent full, so that is not capacity; the GS is simply placed around the
+        # PCIe and HBM hard blocks, which all live in SLR0, and the tool stops
+        # optimising the moment it reaches zero.
         #
-        # Left to itself the placer spreads gs_top across both, and the result
-        # is a design that lands within a few hundred picoseconds of the
-        # boundary at 147.456 MHz every time -- four builds running -0.36,
-        # -0.14, +0.02 and 0.000 ns, on changes that mostly did not touch the
-        # datapath.  The part is three per cent full, so that is not capacity,
-        # it is the GS being placed around the hard blocks and its own internal
-        # paths stretching between the two regions.
+        # Confining gs_top to SLR1 was tried first and did not help.  The reason
+        # is worth keeping: synthesis promotes the rasteriser's generate-loop
+        # instances out of the gs_top hierarchy, so `get_cells gs_top` captures
+        # some of a carry chain and not the rest, and the placer is then asked
+        # to split chains across a region boundary.  Vivado says so in the log
+        # -- "The cells involved are ... in Carry-chain.  The area groups
+        # involved are pblock_gs" -- and the result was 0.000 ns again.  A
+        # floorplan that names a hierarchy the netlist no longer has is worse
+        # than none.
         #
-        # Confining it to SLR1 is the right shape rather than a trick, because
-        # of what crosses: the GS talks to the rest of this design *only*
-        # through the CSR interface, and that interface is already a
-        # toggle-and-handshake crossing built for two unrelated clocks.  It
-        # tolerates the extra latency of an inter-SLR hop for exactly the same
-        # reason it tolerates the clock domain change -- nothing in it is timed
-        # edge to edge.  Everything that *is* timed edge to edge, which is the
-        # whole rasteriser and its 4 MB of memory, ends up on one side.
+        # So the target is raised instead of the design being moved.  Clock
+        # uncertainty tells the timing engine to assume it has less of the
+        # period than it really does; the MMCM still produces 147.456 MHz and
+        # the hardware still runs at exactly that.  This is a synthesis effort
+        # knob, not a specification change -- the card is not overclocked and
+        # nothing about the console being replicated moves.
+        # The uncertainty is applied for *placement* and removed again before
+        # routing, so the two things it has to do do not fight each other.
+        #
+        # Placement needs a hard goal.  Left at the real period the tool stops
+        # the moment it reaches zero slack, and four builds in a row proved
+        # that: -0.36, -0.14, +0.02 and 0.000 ns on changes that mostly did not
+        # touch the datapath.  With 0.400 ns of extra uncertainty it kept
+        # working and found 0.173 ns of genuine margin.
+        #
+        # Sign-off needs the truth.  Slack reported against an inflated target
+        # reads as VIOLATED on a design that is fine, which is a trap for
+        # whoever reads the log next.  Worse, a smaller inflation is not a
+        # compromise but a lottery: at 0.150 the same design came back at
+        # -0.204, which is -0.054 against the real clock -- *worse* than the
+        # build with no uncertainty at all, because the placer lands somewhere
+        # in a +-0.2 ns band each time and an easier goal does not make it land
+        # higher.
+        #
+        # So: 0.400 through placement and post-place optimisation, then zero for
+        # routing and the reports.  The clock itself never changes; 147.456 MHz
+        # is what the MMCM produces throughout.
         platform.toolchain.pre_placement_commands.append(
-            "create_pblock pblock_gs")
-        platform.toolchain.pre_placement_commands.append(
-            "resize_pblock [get_pblocks pblock_gs] -add SLR1")
-        platform.toolchain.pre_placement_commands.append(
-            "add_cells_to_pblock [get_pblocks pblock_gs] [get_cells gs_top]")
+            "set_clock_uncertainty -setup 0.400 "
+            "[get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT1]]")
+        platform.toolchain.pre_routing_commands.append(
+            "set_clock_uncertainty -setup 0.000 "
+            "[get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT1]]")
 
         # Named by MMCM pin, not by net: a net name that no longer exists makes
         # Vivado print "No clocks matched" and apply nothing, which is the trap
