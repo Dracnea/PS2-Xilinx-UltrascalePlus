@@ -1583,11 +1583,24 @@ way:
 
 | | Default | Explore | ExtraNetDelay | mean | spread |
 |---|---|---|---|---|---|
-| free to spread (as published) | 193.3 | 192.3 | 186.8 | **190.8** | 6.5 |
+| free to spread, no physical optimisation (as published) | 193.3 | 192.3 | 186.8 | **190.8** | 6.5 |
 | confined to one SLR | 203.7 | 199.7 | 204.0 | **202.5** | 4.3 |
+| + physical optimisation | 208.2 | 206.6 | 205.3 | **206.7** | 2.9 |
 
-**+11.7 MHz, and a tighter spread.** So the honest figure for `ee_core` is
-202.5 MHz, and the gap to 294.912 is 31 per cent rather than 35.
+**+15.9 MHz in total, and the spread more than halved.** The second row is the
+SLR boundary; the third is that these fits had been running *no physical
+optimisation at all*, which the GS's in-context builds had just shown to be
+worth having — it replicates high-fan-out drivers, which is precisely the
+remedy for the problem the EE's critical path had been diagnosed with.
+
+**None of this made the core faster.** It is the same netlist throughout. What
+changed is that the measurement stopped charging the core for the device's
+geometry and for effort the tool was never asked to spend. The honest figure
+for `ee_core` is **206.7 MHz** and the gap to 294.912 is **30 per cent**, not
+35; and the earlier conclusion that the EE is limited by routing rather than
+logic depth survives the correction — the new critical path is `d_ir` to
+`m_val` at 62 per cent routing, and the tool has already replicated the control
+bit at its head, which is the automatic version of the fix.
 
 The table below is left as measured rather than rewritten, because every row in
 it was measured the same way and the *differences* between rows are what it
