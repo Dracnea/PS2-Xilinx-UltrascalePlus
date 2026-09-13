@@ -1593,6 +1593,9 @@ optimisation at all*, which the GS's in-context builds had just shown to be
 worth having — it replicates high-fan-out drivers, which is precisely the
 remedy for the problem the EE's critical path had been diagnosed with.
 
+A wider sweep of six placement directives puts the control at **208.8 MHz
+mean** (205.3 to 214.3), which is the figure to carry.
+
 **None of this made the core faster.** It is the same netlist throughout. What
 changed is that the measurement stopped charging the core for the device's
 geometry and for effort the tool was never asked to spend. The honest figure
@@ -1637,6 +1640,37 @@ that path, which is also why `PMULTW` was worth sixty megahertz the moment it
 stopped being an exception to that rule.
 
 The memory port costs about 6 MHz by comparison.
+
+### Decoding the parallel ALU a stage early — measured, 2026-09-13
+
+The critical path, read cell by cell rather than guessed at, begins at **bit 10
+of the instruction word** — part of the MMI sub-opcode — goes through three
+levels of logic to a net with a fan-out of 138, then to `neg` with a fan-out of
+78, which is the add-or-subtract line of a sixty-four-bit carry chain, and only
+then enters the chain. A quarter of a 4.8 ns path spent deciding *what the
+operation is*.
+
+So it was decided in ID instead and carried in the ID/A1 latch beside the
+instruction word: no extra stage, no extra cycle, no change to any result, 19
+of 19 still passing. Six placement directives each:
+
+| | mean | range | best |
+|---|---|---|---|
+| control | **208.8** | 205.3 – 214.3 | 214.3 |
+| decoded in ID | 196.9 | 176.4 – 222.6 | **222.6** |
+
+**Reverted**, and the shape of the result is the interesting part. The mean is
+12 MHz worse and the spread is five times wider — but the *best* placement is
+the fastest this core has ever measured. Registering an enum that `par_alu`
+immediately decodes again does not shorten the path; it adds an encode and a
+decode round trip, and it stops the tool flattening the sub-opcode straight into
+the adder's control line. What it does do is give the placer a different
+structure that occasionally suits it very well.
+
+A design whose clock depends on which of six directives was chosen is not
+faster, it is a lottery. But 222.6 MHz is a real number produced by a real
+netlist, and it says the ceiling is above where the core sits — which is worth
+knowing before the deeper-pipeline work decides what to build.
 
 ### The parallel ALU is not where the clock went — measured, 2026-09-12
 
