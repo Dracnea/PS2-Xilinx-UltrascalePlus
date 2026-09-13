@@ -220,7 +220,7 @@ depends on.
 
 | block | native | measured | short by |
 |---|---|---|---|
-| EE (`ee_core`) | 294.912 MHz | 208.8 (mean of six directives, one SLR, phys-opt) | **29 %** |
+| EE (`ee_core`) | 294.912 MHz | 210.7 at the 0.72 V model, 265.4 at 0.85 V; card is at 0.800 V | **~19 %** |
 | GS (`gs_top`) | 147.456 MHz | **runs on the card at 147.456** | **met** |
 | IOP | 36.864 MHz | runs on the card | met |
 

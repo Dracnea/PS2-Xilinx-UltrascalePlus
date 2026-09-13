@@ -1641,6 +1641,45 @@ stopped being an exception to that rule.
 
 The memory port costs about 6 MHz by comparison.
 
+### The gap was being measured at the wrong voltage — 2026-09-13
+
+Every number on this page was fitted against `xcu55n-fsvh2892-**2LV**-e`, which
+is the part as marked. Vivado has a second model for the same silicon,
+`-2L-e`, and the difference between them is not a different chip: it is the
+**core voltage they assume**. AMD's datasheet is explicit — a `-2L` device run
+at 0.85 V has the same speed specification as a `-2I`; the LV file is the
+0.72 V operating point, taken to save static power.
+
+The same core, same method, three directives each:
+
+| model | Default | ExtraNetDelay_low | AltSpreadLogic_high | mean |
+|---|---|---|---|---|
+| `-2LV` (0.72 V) | 208.2 | 214.3 | 209.5 | **210.7** |
+| `-2L` (0.85 V) | 265.7 | 270.7 | 259.9 | **265.4** |
+
+**55 MHz, or 26 per cent, between the two models of the same netlist on the
+same die.**
+
+And the card is at neither. Read from the device's own system monitor:
+
+    VCCINT = 0.800 V,  temperature 31.9 °C
+
+So `-2LV` understates this card by 80 mV of margin and `-2L` overstates it by
+50 mV. Interpolating puts the real figure near **240 MHz** — an estimate, not a
+measurement, and flagged as such until one of the two models is made true by
+setting the rail to match it.
+
+That reframes the remaining work. The EE is not 29 per cent short of 294.912
+MHz; at the voltage the card is actually running it is roughly **19 per cent**
+short, and at 0.85 V it would be **10 per cent** short. Raising VCCINT is an
+operator decision and a real one -- it is global, it persists across
+reconfiguration, and this is a passively cooled 75 W card -- so it is recorded
+here rather than done.
+
+Nothing about this touches the PlayStation 2 being replicated. VCCINT is the
+FPGA's own supply; choosing it is choosing how fast the host part runs, in the
+same sense as choosing a faster speed grade would be.
+
 ### Decoding the parallel ALU a stage early — measured, 2026-09-13
 
 The critical path, read cell by cell rather than guessed at, begins at **bit 10
