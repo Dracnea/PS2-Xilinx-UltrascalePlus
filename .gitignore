@@ -61,3 +61,9 @@ bios/
 
 # Vivado-generated HBM IP (18 MB); regenerate with ip/hbm/gen_hbm.tcl
 /ip/hbm/hbm_0/
+
+# xsim / xvhdl simulation output
+xsim.dir/
+*.pb
+xelab.*
+xsim.*

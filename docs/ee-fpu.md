@@ -99,3 +99,55 @@ of every arithmetic instruction at once. It is recorded in
 
 **Do not start with `ADD.S`.** Start with the conditioner and the flags, because
 that is the part that can be finished and known to be right.
+
+## The half that could be finished, finished — 2026-09-14
+
+`rtl/ee/ee_fpu_pkg.vhd`, in the order this page asked for: **not `ADD.S`**.
+
+The conditioner is the whole of the special-case handling, and once it is right
+no other part of the unit ever has to consider a special value again:
+
+| operand | reads as |
+|---|---|
+| exponent 0 — a denormal, or zero | a **signed** zero, mantissa discarded |
+| exponent 255 — what IEEE calls infinity or NaN | the **largest finite value of the same sign** |
+| anything else | itself |
+
+The sign surviving a flush is not a nicety. `MAX` and `MIN` compare as integers,
+and they would order +0 and −0 differently if it were dropped — which is the
+kind of fault that appears in one game, in one place, years later.
+
+The compares are done on conditioned values as integers, which works here for a
+reason that does not hold on an IEEE machine: with no NaN there is nothing
+unordered, and the format is monotonic in its bit pattern within each sign. The
+only special case is that +0 and −0 have different patterns and must compare
+equal.
+
+`ABS` and `NEG` deliberately do **not** condition their operand: a denormal
+negated is still that denormal with the other sign, and only an arithmetic
+instruction flushes it.
+
+### How it is checked
+
+`sim/ee/run_fpu_diff.sh` drives the package from a vector file and diffs the
+result against `ps2_float.py`, which does its arithmetic in exact rationals.
+**924 vectors, identical.**
+
+Random 32-bit patterns would be nearly useless: almost all of them are ordinary
+normals with a middling exponent, and the conditioner's entire job is at the two
+ends. So `gen_fpu_vectors.py` enumerates the corners — both zeros, the smallest
+and largest denormal, the smallest normal, the largest finite value, the
+exponent-255 patterns, every bit set — and pairs **every corner with every
+corner**, because the comparisons care about the pairing and not just the
+operands. Random pairs with exponents biased toward the ends are added on top
+rather than relied upon.
+
+Eight mutations, all caught: the denormal not flushed, exponent 255 not
+saturated, the sign dropped on a flush, +0 ≠ −0, the both-negative comparison
+inverted, a negative not less than a positive, `ABS` negating instead of
+clearing, and `MIN`/`MAX` exchanged.
+
+**What is still open** is exactly what this page said would be: the last bit of
+`MUL`, `DIV` and `SQRT`. Those are implemented to the specification — round
+toward zero, in one place so a measurement can change it — and remain unverified
+until the console sweep in `hw/ps2probe/README.md` runs.

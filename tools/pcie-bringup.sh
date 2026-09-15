@@ -40,10 +40,25 @@ else
 fi
 SW=${LITEPCIE_SW:-$PWD/build/$IMAGE/software}
 
+# Build the module if it is missing, the way litepcie_util is built below.
+#
+# generate_litepcie_software() writes the *sources* and nothing compiles them,
+# so every newly created target hits this on its first bring-up. The script
+# already builds litepcie_util automatically when it is absent; refusing to do
+# the same for the module was an asymmetry with no reason behind it, and it cost
+# a round trip on the first EE bring-up.
+#
+# Built as the invoking user so the objects are not left root-owned.
 if [[ ! -f $SW/kernel/litepcie.ko ]]; then
-    echo "no driver at $SW/kernel/litepcie.ko" >&2
-    echo "build it:  make -C $SW/kernel" >&2
-    echo "or name the image on the card, e.g.  sudo $0 c1100_ps2_diag" >&2
+    echo "no driver at $SW/kernel/litepcie.ko; building it"
+    if ! runuser -u "$USER_NAME" -- make -C "$SW/kernel" >/dev/null 2>&1; then
+        echo "  build failed; run: make -C $SW/kernel" >&2
+        echo "  (a kernel module needs the headers for $(uname -r))" >&2
+        exit 1
+    fi
+fi
+if [[ ! -f $SW/kernel/litepcie.ko ]]; then
+    echo "no driver at $SW/kernel/litepcie.ko and the build produced none" >&2
     exit 1
 fi
 echo "driver: $SW/kernel/litepcie.ko"
@@ -99,8 +114,19 @@ echo "== identifier / CSR =="
 # on the card, so quietly skipping it is the wrong default -- and it is a
 # thirty-second native build with no cross toolchain involved.  Built as the
 # invoking user so the objects are not left root-owned.
-if [[ ! -x $SW/user/litepcie_util ]]; then
-    echo "litepcie_util not built; building it"
+# Rebuild when it is MISSING *or* STALE.  litepcie_util compiles the CSR map in
+# from csr.h, so a binary left over from an earlier build of the same image
+# reads the identifier at last week's address and gets nothing back.  That comes
+# out as the mismatch message below, which blames the bitstream -- and the
+# bitstream is fine.  Seen 2026-09-14: a Sep 11 binary against a Sep 13 csr.h
+# reported an empty identifier while the gateware was answering every other CSR
+# correctly, clocked at 147.4564 MHz, and passed the whole differential suite.
+if [[ ! -x $SW/user/litepcie_util || $SW/kernel/csr.h -nt $SW/user/litepcie_util ]]; then
+    if [[ -x $SW/user/litepcie_util ]]; then
+        echo "litepcie_util is older than csr.h; rebuilding it"
+    else
+        echo "litepcie_util not built; building it"
+    fi
     if ! runuser -u "$USER_NAME" -- make -C "$SW/user" >/dev/null 2>&1; then
         echo "  build failed; run: make -C $SW/user"
     fi

@@ -48,7 +48,7 @@ PRID = 0x00002E20
 C0_STATUS, C0_CAUSE, C0_EPC, C0_ERROREPC = 12, 13, 14, 30
 
 # Exception codes, as Cause.ExcCode
-EXC_INT, EXC_SYSCALL, EXC_BREAK, EXC_RI, EXC_OV = 0, 8, 9, 10, 12
+EXC_INT, EXC_SYSCALL, EXC_BREAK, EXC_RI, EXC_OV, EXC_TR = 0, 8, 9, 10, 12, 13
 
 # The instruction address space is aliased to the size of the test image, so the
 # exception vector at 0x80000180 lands inside a program that can be loaded.  The
@@ -638,6 +638,23 @@ class R5900:
             if s64(self.r(rs)) <= 0: self.branch(nxt + (simm << 2))
         elif op == 7:                                   # BGTZ
             if s64(self.r(rs)) > 0: self.branch(nxt + (simm << 2))
+        # BEQL / BNEL / BLEZL / BGTZL.  MIPS III added these so a compiler could
+        # fill a delay slot with an instruction that is only correct on the
+        # taken path; annulling on the not-taken path is the whole point, and a
+        # core that treats them as ordinary branches silently executes an
+        # instruction the compiler guaranteed would not run.
+        elif op == 20:                                  # BEQL
+            if self.r(rs) == self.r(rt): self.branch(nxt + (simm << 2))
+            else:                        self.pc = (nxt + 4) & M64
+        elif op == 21:                                  # BNEL
+            if self.r(rs) != self.r(rt): self.branch(nxt + (simm << 2))
+            else:                        self.pc = (nxt + 4) & M64
+        elif op == 22:                                  # BLEZL
+            if s64(self.r(rs)) <= 0: self.branch(nxt + (simm << 2))
+            else:                    self.pc = (nxt + 4) & M64
+        elif op == 23:                                  # BGTZL
+            if s64(self.r(rs)) > 0: self.branch(nxt + (simm << 2))
+            else:                   self.pc = (nxt + 4) & M64
         elif op == 8:                                   # ADDI
             v = s32(self.r(rs)) + simm
             if not (-(1 << 31) <= v < (1 << 31)):
@@ -654,8 +671,21 @@ class R5900:
         elif op == 13: self.w(rt, self.r(rs) | imm)     # ORI
         elif op == 14: self.w(rt, self.r(rs) ^ imm)     # XORI
         elif op == 15: self.w(rt, sext32(imm << 16))    # LUI
-        elif op == 24:                                  # DADDI (traps)
-            self.w(rt, (s64(self.r(rs)) + simm) & M64)
+        # CACHE and PREF.  Neither writes a register, and this model has no
+        # cache to operate on, so both are no-ops here -- but they must DECODE.
+        # The PlayStation 2's BIOS invalidates and writes back cache lines
+        # constantly during boot, and a core that takes a reserved-instruction
+        # trap on `cache` does not get through the first few hundred
+        # instructions of the real machine.  Treating them as no-ops is a
+        # deliberate simplification of the memory hierarchy, not of the
+        # instruction set: when a cache is modelled, these become real.
+        elif op in (47, 51): pass                       # CACHE, PREF
+        elif op == 24:                                  # DADDI
+            v = s64(self.r(rs)) + simm
+            if not (-(1 << 63) <= v < (1 << 63)):
+                self.exception(EXC_OV)     # and rt is left alone
+            else:
+                self.w(rt, v & M64)
         elif op == 25:                                  # DADDIU
             self.w(rt, (s64(self.r(rs)) + simm) & M64)
         elif op in (32, 33, 35, 36, 37, 39, 55):        # loads
@@ -1004,6 +1034,36 @@ class R5900:
         # the shift-amount register.  The exclusive-or is what the manual
         # specifies and is not a typo -- it lets a byte offset be flipped
         # without a read-modify-write.
+        # The four likely forms.  "Likely" is not a hint: when the branch is
+        # NOT taken the delay slot is annulled -- it does not execute at all.
+        # Skipping it is exactly pc = slot + 4, because exec has already left
+        # pc pointing at the slot.
+        elif rt == 2:                                                 # BLTZL
+            if v < 0: self.branch(nxt + (simm << 2))
+            else:     self.pc = (nxt + 4) & M64
+        elif rt == 3:                                                 # BGEZL
+            if v >= 0: self.branch(nxt + (simm << 2))
+            else:      self.pc = (nxt + 4) & M64
+        elif rt == 18:                                                # BLTZALL
+            self.w(31, (nxt + 4) & M64)
+            if v < 0: self.branch(nxt + (simm << 2))
+            else:     self.pc = (nxt + 4) & M64
+        elif rt == 19:                                                # BGEZALL
+            self.w(31, (nxt + 4) & M64)
+            if v >= 0: self.branch(nxt + (simm << 2))
+            else:      self.pc = (nxt + 4) & M64
+        elif rt == 8:                                                 # TGEI
+            if v >= simm: self.exception(EXC_TR)
+        elif rt == 9:                                                 # TGEIU
+            if self.r(rs) >= (simm & M64): self.exception(EXC_TR)
+        elif rt == 10:                                                # TLTI
+            if v < simm: self.exception(EXC_TR)
+        elif rt == 11:                                                # TLTIU
+            if self.r(rs) < (simm & M64): self.exception(EXC_TR)
+        elif rt == 12:                                                # TEQI
+            if v == simm: self.exception(EXC_TR)
+        elif rt == 14:                                                # TNEI
+            if v != simm: self.exception(EXC_TR)
         elif rt == 24:                                                # MTSAB
             self.sa = (self.r(rs) & 0xF) ^ (simm & 0xF)
         elif rt == 25:                                                # MTSAH
@@ -1033,8 +1093,26 @@ class R5900:
             else:
                 self.w(rd, sext32(v))
         elif fn == 33: self.w(rd, sext32(s32(a) + s32(b)))            # ADDU
-        elif fn == 34: self.w(rd, sext32(s32(a) - s32(b)))            # SUB
+        elif fn == 34:                                                # SUB
+            v = s32(a) - s32(b)
+            if not (-(1 << 31) <= v < (1 << 31)):
+                self.exception(EXC_OV)     # and rd is left alone
+            else:
+                self.w(rd, sext32(v))
         elif fn == 35: self.w(rd, sext32(s32(a) - s32(b)))            # SUBU
+        # MOVZ / MOVN: the branchless conditional move.  The write is
+        # suppressed entirely when the condition fails -- rd keeps its old
+        # value, which is the whole point and is not the same as writing it
+        # back, because rd may be the destination of an in-flight instruction.
+        elif fn == 10:
+            if b == 0: self.w(rd, a)                                  # MOVZ
+        elif fn == 11:
+            if b != 0: self.w(rd, a)                                  # MOVN
+        # SYNC is a memory barrier.  This model is a single in-order core with
+        # no store buffer, so it has nothing to order and is correctly a no-op
+        # -- but it has to *decode*, or a program that uses one takes a
+        # reserved-instruction trap instead of continuing.
+        elif fn == 15: pass                                           # SYNC
         elif fn == 36: self.w(rd, a & b)                              # AND
         elif fn == 37: self.w(rd, a | b)                              # OR
         elif fn == 38: self.w(rd, a ^ b)                              # XOR
@@ -1043,8 +1121,35 @@ class R5900:
         elif fn == 43: self.w(rd, 1 if a < b else 0)                  # SLTU
         elif fn == 40: self.w(rd, self.sa)                            # MFSA
         elif fn == 41: self.sa = a & 0xF                              # MTSA
+        elif fn == 44:                                                # DADD
+            v = s64(a) + s64(b)
+            if not (-(1 << 63) <= v < (1 << 63)):
+                self.exception(EXC_OV)     # and rd is left alone
+            else:
+                self.w(rd, v & M64)
         elif fn == 45: self.w(rd, (s64(a) + s64(b)) & M64)            # DADDU
+        elif fn == 46:                                                # DSUB
+            v = s64(a) - s64(b)
+            if not (-(1 << 63) <= v < (1 << 63)):
+                self.exception(EXC_OV)     # and rd is left alone
+            else:
+                self.w(rd, v & M64)
         elif fn == 47: self.w(rd, (s64(a) - s64(b)) & M64)            # DSUBU
+        # The six conditional traps.  They write nothing and their only effect
+        # is the exception, which is why a core can appear to run correctly with
+        # them missing right up to the moment something relies on one.
+        elif fn == 48:                                                # TGE
+            if s64(a) >= s64(b): self.exception(EXC_TR)
+        elif fn == 49:                                                # TGEU
+            if a >= b: self.exception(EXC_TR)
+        elif fn == 50:                                                # TLT
+            if s64(a) < s64(b): self.exception(EXC_TR)
+        elif fn == 51:                                                # TLTU
+            if a < b: self.exception(EXC_TR)
+        elif fn == 52:                                                # TEQ
+            if a == b: self.exception(EXC_TR)
+        elif fn == 54:                                                # TNE
+            if a != b: self.exception(EXC_TR)
         elif fn == 56: self.w(rd, (b << sa) & M64)                    # DSLL
         elif fn == 58: self.w(rd, b >> sa)                            # DSRL
         elif fn == 59: self.w(rd, s64(b) >> sa & M64)                 # DSRA

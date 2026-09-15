@@ -1750,3 +1750,1113 @@ IPC is better but not closed: CPI 1.78 on ordinary code, 2.15 on branch-heavy.
 What is left is multiply/divide latency (inherent), one stall per memory access,
 and the absence of a branch predictor — the R5900 has a BTAC and this core does
 not, so every taken branch pays a full fetch refill.
+
+## The four traps that agreed with each other and were both wrong — 2026-09-14
+
+`SUB`, `DADD`, `DSUB` and `DADDI` raise Integer Overflow. Their unsigned
+partners `SUBU`, `DADDU`, `DSUBU` and `DADDIU` never do. That is the entire
+reason both forms exist, and it is why a compiler emits `ADDU` for pointer
+arithmetic and `ADD` for signed C arithmetic.
+
+None of the four trapped here. The RTL wrote:
+
+```vhdl
+when 34 | 35 => ex_we := '1'; ex_rd := rd;                 -- SUB/SUBU
+   ex_val := sext32(std_logic_vector(signed(a(31 downto 0)) - signed(b(31 downto 0))));
+```
+
+— one expression for both opcodes — and the reference model wrote the matching
+pair of identical Python lines. `DADD` and `DSUB` were worse: the reference had
+only the `U` forms, so the trapping halves fell through to "reserved
+instruction" entirely. `DADDI` carried the comment `# DADDI (traps)` directly
+above code that did not trap.
+
+**This is the failure mode differential testing cannot see.** Every test here
+compares the RTL against the reference, and the two agreed perfectly — because
+they were wrong in the same way. Thirty-two regression cases, twelve random
+seeds, and a mutation suite all passed over this for weeks. The bug was not
+hiding in a corner the tests failed to reach; it was in plain sight in an
+instruction the tests executed constantly, and the oracle was simply wrong.
+
+The lesson is narrow and worth stating plainly: **a differential test measures
+agreement, not correctness.** It finds the faults where one implementation
+slipped. It is structurally blind to the faults where the same misunderstanding
+went into both, and the only remedy for those is to check against the
+instruction set rather than against the other implementation.
+
+`sim/ee/gen_ovf.py` is that check. Each case is a pair — the trapping form with
+operands that overflow, and the unsigned form with the *same* operands, which
+must wrap instead — plus a non-overflowing case of each so the trap cannot be
+unconditional. Every trapping case preloads its destination with a marker,
+because "the exception was taken" and "the destination was left alone" are two
+separate claims, and only the second rules out a core that counts the trap and
+writes the result anyway.
+
+Run against the pre-fix core it fails on the first `SUB`, at `pc=0x0c`: the
+reference vectors to `0x80000180` with `Cause` = `0x30` (code 12), and the RTL
+carries on and writes `r7`.
+
+The overflow tests themselves are the same sign-bit form `ADD` already used, for
+the same reason — a 33-bit or 65-bit adder costs about 10% of the clock on a
+path that is already critical, while the sign comparison runs beside the adder
+instead of after it:
+
+| instruction | overflow when |
+|---|---|
+| `SUB` | `a(31) /= b(31)` and `diff(31) /= a(31)` |
+| `DADD` | `a(63) = b(63)` and `sum(63) /= a(63)` |
+| `DSUB` | `a(63) /= b(63)` and `diff(63) /= a(63)` |
+| `DADDI` | `a(63) = simm(63)` and `sum(63) /= a(63)` |
+
+## Branch-likely and the conditional traps — 2026-09-14
+
+Auditing for more faults of the kind above — where the model and the RTL agree
+because the same misunderstanding went into both — turned up two whole groups
+that were in neither.
+
+**The four likely branches** `BEQL`, `BNEL`, `BLEZL`, `BGTZL`, and the four
+REGIMM forms `BLTZL`, `BGEZL`, `BLTZALL`, `BGEZALL`. **The twelve conditional
+traps** `TGE`, `TGEU`, `TLT`, `TLTU`, `TEQ`, `TNE` and their immediate partners
+`TGEI`, `TGEIU`, `TLTI`, `TLTIU`, `TEQI`, `TNEI`.
+
+Neither group was reachable by any test, because the random generator did not
+emit them and no directed program used them — so their absence was invisible
+rather than failing. That is the second failure mode worth naming: a
+differential test is blind to a fault both sides share, and it is equally blind
+to an instruction neither side implements.
+
+### Why likely branches matter for running real code
+
+"Likely" is not a hint about prediction. When the branch is **not** taken the
+delay slot is **annulled** — it does not execute at all. MIPS III added the
+forms precisely so a compiler could fill the slot with an instruction that is
+only correct on the taken path, and compilers targeting the R5900 emit them
+routinely. A core that treats `BEQL` as `BEQ` therefore executes an instruction
+the compiler guaranteed would not run, which is not a timing difference — it is
+a wrong answer, and one that surfaces far from its cause.
+
+### The annul in this pipeline
+
+Branches resolve in A1 and are acted on when they reach A2. `m_take` already
+meant *the delay slot survives and everything behind it dies, and fetch is
+redirected*. `m_annul` is the exact mirror: *the delay slot dies and everything
+behind it survives, and fetch is not redirected at all* — the instruction after
+the annulled slot is already next in the fetch stream, so an annul is cheaper
+than a taken branch rather than more expensive.
+
+The slot can be in one of the same three places when the branch reaches A2, and
+each needs different handling:
+
+| where the slot is | what the annul does |
+|---|---|
+| already in A1 | cancel the A1 → A2 transfer that happened earlier in this same process — and cancel *all* of it, not just `m_valid`, or a half-cancelled slot still writes HI/LO or COP0 |
+| entering A1 on this edge | `kill_id`, which stops the ID → A1 transfer while the fetch queue still pops: the slot is consumed and discarded, which is exactly annulment |
+| still in the fetch queue | `annul_pend`, the mirror of `redir_pend` — wait for it and kill it when it arrives |
+
+One guard is easy to miss and cannot be recovered from. A store is the one thing
+a cancellation cannot take back, so `m_annul` had to join `m_exc` and `m_eret`
+in the condition that gates the memory port. A load in an annulled slot is
+wasted bandwidth; a store in one writes memory the program guaranteed would
+never be written, **and no register trace can show it** — which is why the
+directed test seeds a word, puts a store in an annulled slot, and loads the word
+back into a register afterwards.
+
+The link forms are the other trap for the unwary: `BLTZALL` and `BGEZALL` write
+`r31` **whether or not the branch is taken**. Only the slot is annulled. The
+test checks the untaken link explicitly, because the annul makes it look as
+though nothing should happen.
+
+### What the tests actually assert
+
+`sim/ee/gen_likely.py` lays each case out so the taken and not-taken paths
+rejoin immediately — branch at `A`, slot at `A+4`, both paths continue at `A+8`
+— so the only difference between them is whether the slot ran. A slot that must
+not run writes poison over a marker; a slot that must run writes a distinctive
+value. Both directions are needed: a core that annuls *unconditionally* passes
+every test of the first kind.
+
+Reading the reference's final registers confirms each claim separately rather
+than only that the two implementations agree:
+
+```
+r05 = 55     taken slot ran            r06 = 06   annulled slot did not
+r17 = aa     BLTZALL taken, slot ran   r18 = ac   link on the taken path
+r19 = 13     BLTZALL untaken, annulled r20 = c0   link written anyway
+r26 = 5a5a   the store in an annulled slot never reached memory
+r28 = 02     a backward loop ran its slot exactly twice and annulled once
+```
+
+`sim/ee/gen_trap.py` fires exactly twelve of its nineteen conditions, confirmed
+by counting entries to the handler at `0x80000180`. Two pairs are chosen to
+separate signed from unsigned, which is the only interesting property of having
+both forms: `TLT`/`TLTU` with −1 and 1, and `TLTIU` against a **sign-extended**
+negative immediate compared as unsigned — zero-extending it instead is the
+classic way to get the `IU` forms wrong, and the case with `r24 = 0x7FFF0` gives
+opposite answers under the two readings.
+
+The random generator now emits `DADD`, `DSUB` and the four likely branches.
+Random coverage matters more for annulment than for ordinary branches, because
+the slot has to be found wherever it happens to be, and **only a random program
+run against slow memories reaches the third case** — the slot still in the fetch
+queue. Nine random programs pass at `--ilat 4 --dlat 3`.
+
+### Five more that were in neither — MOVZ, MOVN, SYNC, CACHE, PREF
+
+The same audit turned up five instructions that no test could reach because
+neither side implemented them.
+
+`MOVZ` and `MOVN` are the branchless conditional move, and compilers emit them
+constantly — a ternary or a clamp becomes one of these rather than a branch. The
+subtlety is what happens when the condition **fails**: the write is *suppressed*,
+not written back. Leaving `ex_we` clear is what says so to the forwarding
+network as well as to the register file, and writing `rd` back to itself instead
+would be wrong in a way that only shows up when `rd` is also the destination of
+something still in flight.
+
+`SYNC` is a memory barrier. This core is a single in-order pipeline with no
+store buffer, so it has nothing to order and is correctly a no-op — but it has
+to decode, or a program containing one takes a reserved-instruction trap.
+
+`CACHE` and `PREF` are the two that matter most for getting a real machine to
+boot. The PlayStation 2's BIOS invalidates and writes back cache lines
+constantly while it brings the hardware up; a core that raises a
+reserved-instruction trap on `cache` does not survive the first few hundred
+instructions of the real thing. Both retire as no-ops here.
+
+That last pair is a deliberate simplification of the **memory hierarchy**, not
+of the instruction set, and it is worth keeping the distinction visible: when a
+cache is modelled these become real instructions with real effects, and the
+no-op is a placeholder rather than an answer. Everything else in this section is
+the instruction behaving exactly as specified.
+
+All five are now emitted by the random generator — `MOVZ`, `MOVN` and `SYNC`
+among the `special` forms, `CACHE` and `PREF` among the stores, where their
+shape (base register, offset, no destination) fits and they cannot disturb the
+memory image the comparison depends on.
+
+### What the correctness cost, and half of it recovered — 2026-09-14
+
+Measured on `xcu55n-fsvh2892-2LV-e` at the console's own 3.39 ns, with
+`phys_opt_design` either side of routing so the three numbers are comparable:
+
+| core | Fmax |
+|---|---|
+| before this session's instruction work | 204.3 MHz |
+| with the overflow traps, branch-likely, the twelve conditional traps, MOVZ/MOVN/SYNC/CACHE/PREF | 194.6 MHz |
+| ...with the comparators shared | **199.1 MHz** |
+
+The 9.7 MHz was almost all the traps. Twelve conditional traps written one per
+case arm are twelve 64-bit comparators, each its own carry chain, on top of the
+four the `SLT` family already had — sixteen in total, every one of them reached
+from the instruction register through the decode, which is the path this core is
+already losing on.
+
+There are only **six** distinct comparisons in those sixteen instructions:
+signed, unsigned and equality, against either the second register or the
+sign-extended immediate. Computing those six once and selecting among them gave
+back 4.5 MHz.
+
+Both operand choices are computed unconditionally rather than muxing the operand
+first. Which one an instruction wants is only known after the decode, so waiting
+for that would put the mux *in front of* the comparator instead of behind it —
+adding to the very path being shortened. A 64-bit mux and a 64-bit comparator
+cost about the same; doing the cheap thing in the wrong order is what costs.
+
+**Net: 5.2 MHz for the whole group.** That is the price of the core being
+correct about overflow, annulment, twelve traps and five more instructions, and
+it is worth paying — a core at 204.3 MHz that executes an annulled delay slot is
+not closer to a PlayStation 2 than one at 199.1 MHz that does not. It is
+recorded here rather than absorbed silently because the gap to 294.912 MHz is
+the project's central open problem and every megahertz spent on it should be
+accounted for.
+
+All eight mutations of the new logic were caught, including the two that
+worried me: the store in an annulled slot reaching the memory port, and the
+annul failing to wait for a slot still in the fetch queue. The second is only
+reachable by random programs run against slow memories, which is why those are
+in the suite.
+
+### The critical path, cell by cell — 2026-09-14
+
+At 199.1 MHz the worst path is 5.017 ns of a 3.39 ns budget, 13 logic levels,
+**68% route**. It runs from `w_wide_reg` — a writeback control — into
+`m_val_reg[14]`, and it has two distinct halves that want opposite fixes.
+
+**The front: three broadcast control nets.**
+
+```
+w_wide_reg_rep__0/Q   net fo=99    0.136 ns
+hi[63]_i_3/O          net fo=104   0.278 ns
+m_lo[39]_i_25/O       net fo=104   0.376 ns
+```
+
+Nearly 0.8 ns spent in three hops, on nets Vivado has already replicated once.
+These are control signals fanning out across the whole HI/LO datapath, and the
+path then goes through the LO update, out as `rdv[14]`, and into the result
+mux — which means **MFLO is reading the HI/LO value being computed in the same
+cycle.** That forwarding is what ties a control decision to the result register
+through an adder.
+
+**The back: six levels of result mux.**
+
+```
+m_val[14]_i_104 -> _i_67 -> _i_34 -> _i_32 -> _i_12 -> _i_5 -> _i_1
+        0.415     0.345    0.407    0.246    0.117    0.100    0.095   ns of route
+```
+
+1.73 ns of routing and roughly 0.4 ns of logic — **about 43% of the path**, in a
+mux tree that climbs from slice Y137 to Y153 because its producers are scattered.
+Six levels for a selection that a balanced tree would do in three; the depth
+comes from `ex_val` being assigned seventy-odd times inside nested case
+statements, which synthesises as a priority chain rather than as a tree.
+
+Two candidate experiments follow from this, and they are independent:
+
+1. **Split the result mux by class.** Compute the MMI results into their own
+   variable and select once at the end, so the seventy-way chain becomes two
+   shallower ones and a final two-way choice. Cheap to express, and it changes
+   the netlist structure rather than asking the placer to do better.
+2. **Stop forwarding the in-flight HI/LO into the result mux.** That breaks the
+   front half of this path at the cost of an interlock when `MFLO` immediately
+   follows a `MULT`. It is only acceptable if the resulting stall *matches* what
+   a real R5900 does — a replication may not invent a stall the console does not
+   have, so this one needs the console measurement before it can be taken.
+
+The shared shifter is worth re-reading in this light. It attacked the mux by
+removing fourteen producers and lost 8.4 MHz, because it added one physical
+shifter everything had to route to and from. The mux is the right target; making
+the *producers* share hardware was the wrong way to shrink it. Restructuring the
+mux itself has not been tried.
+
+### Restructuring the result mux: a negative, and what it revealed — 2026-09-14
+
+The timing report put the result mux at roughly 43% of the critical path — six
+LUT levels and 1.7 ns of routing into `m_val` — so the obvious move was to stop
+`ex_val` being assigned seventy times down a nested case chain. Twenty-five of
+those assignments are the MMI arm; giving them their own variable and selecting
+once at the end turns one long priority chain into two shorter ones and a
+two-way mux.
+
+It verified clean, 35/35. It measured **185.0 MHz against 199.1** — 14.1 MHz
+worse, the sixth measured negative recorded here.
+
+**The reason is more valuable than the change would have been.** The critical
+path did not get longer where it was; it *moved*:
+
+| | before | after |
+|---|---|---|
+| worst path | `w_wide_reg` → `m_val_reg[14]` | `m_val_reg[2]` → `m_val_reg[6]` |
+| logic levels | 13 (2 × CARRY8) | 19 (**8 × CARRY8**) |
+| delay | 5.017 ns | 5.401 ns |
+
+Eight CARRY8 in series is a 64-bit adder: the new worst path runs
+`m_val` → forwarding → the MMI parallel ALU → back to `m_val`. Flattening the
+mux shortened the scalar side and put one extra two-way mux at the very end of
+the *MMI* side — which already had a full-width carry chain on it — and that
+side turned out to be only about 0.4 ns behind the first.
+
+So the core is close to **balanced**. Several unrelated paths sit within half a
+nanosecond of each other: the HI/LO forward into the result mux, the MMI adder
+through the forwarding network, and the decode fanning out to both. That is why
+every structural fix tried so far has moved the bottleneck instead of removing
+it — the shared shifter (−8.4 MHz), the seed-difference split (−15 MHz), the
+pblock, and now this.
+
+**The conclusion the evidence supports is that no single restructuring closes a
+96 MHz gap, because there is no single structure to blame.** The EX stage as a
+whole is about one and a half cycles long at 294.912 MHz. What that argues for
+is a genuine second execute stage — not the multi-cycle form measured earlier,
+which bought 8.5 MHz for 54% more SIMD CPI and was rightly rejected, but a
+*pipelined* EX1/EX2 with forwarding from EX2 so independent instructions still
+retire one per cycle.
+
+That is a large change and it carries a fidelity question that has to be
+answered first: the R5900's own pipeline has specific latencies, and a
+replication may not invent a stall the console does not have. The two-stage
+split is only correct if dependent instruction pairs still issue back to back,
+which means forwarding from EX2's *output* into EX1's operand mux — the same
+loop this core already has, one stage further along. Whether that loop then
+fits in 3.39 ns is exactly the thing to measure, and it is the next experiment
+rather than a conclusion.
+
+### Measuring the bar, then measuring the wall — 2026-09-14
+
+Before refactoring EX into two stages, two numbers were worth having.
+
+**What a two-stage execute has to beat.** A two-cycle ALU means a dependent
+instruction cannot issue back to back, so every dependent pair costs a bubble.
+`tools/ee/dep_rate.py` measures the rate rather than assuming a textbook figure:
+
+| stream | dependent on the previous instruction |
+|---|---|
+| the random generator's programs, 15,960 pairs | 2.3% |
+| **real compiled MIPS, 303,450 instructions from a PS2 BIOS** | **15.3%** |
+
+The random figure is a floor and not much else — a random instruction stream is
+far less dependent than compiled code, which is exactly why the BIOS number is
+the one to design against. At 15.3%, CPI goes 1.000 → 1.153 and **break-even is
+229.5 MHz**, not the current 199.1. Below that a two-stage execute is a loss
+however fast it clocks.
+
+It is worth being clear about why the bubbles are acceptable at all. This core
+is single-issue and a real R5900 is two-issue, so it is *already* well short of
+the console's work per cycle. The clock, however, is the specification — it can
+never be recovered later, while issue width can. Paying 15% CPI to reach
+294.912 MHz is the right trade in a way that paying it to reach 250 MHz is not.
+
+**Where the time actually goes.** The second number came from a deliberately
+broken core: forwarding disabled entirely, which cuts the
+`m_val → operand → ALU → mux → m_val` loop. It is not correct silicon — it would
+need interlocks — but Vivado's answer is the ceiling for any pipelining that
+keeps the ALU inside one stage.
+
+| core | worst path | Fmax |
+|---|---|---|
+| as it stands | 5.017 ns | 199.1 MHz |
+| **forwarding disabled** | **4.678 ns** | **213.7 MHz** |
+
+**The forwarding loop is worth 0.34 ns — about 14.6 MHz of a 96 MHz gap.** So
+the loop is not the wall. The arithmetic and the result mux are, and a
+two-stage split that cuts only at the forwarding boundary cannot reach the
+console's clock no matter how cleanly it is done.
+
+That also says where the split *must* go, and it is encouraging. The
+combinational datapath is 4.678 ns end to end. Cut in two evenly that is
+roughly 2.34 ns a stage, and re-adding the forwarding mux in front of the first
+stage brings its critical path to about 2.68 ns — **roughly 373 MHz**, with
+294.912 MHz reached with real margin rather than by a hair.
+
+So the plan is a genuine EX1/EX2 with the boundary **inside the compute**:
+arithmetic — the scalar adder, the shifter, the MMI parallel ALU's carry chains
+— in EX1, and the result mux, flags and writeback formatting in EX2. Not at the
+forwarding boundary, which this measurement has now ruled out, and not the
+multi-cycle form measured earlier, which stalled rather than pipelined and
+bought 8.5 MHz for 54% more SIMD CPI.
+
+This is the first positive signal on the EE track: every structural change so
+far has been a measured negative, and the reason was always that the bottleneck
+moved. A balanced split has roughly 1.3 ns of headroom over the target, which is
+the first time any proposal has had margin rather than needing everything to go
+right.
+
+### The first structural gain: pre-decoding the parallel ALU — 2026-09-14
+
+**206.0 MHz, up from 199.1.** +6.9 MHz, and the first positive structural result
+on this core after five measured negatives.
+
+The no-forwarding probe's critical path is what pointed at it. From
+`d_ir_reg[2]`, two LUT levels reach `par_o` — the parallel ALU's operation
+select, fan-out 113 — and two more reach the add-or-subtract line of a 64-bit
+carry chain, and only then does the chain begin. That prologue is 1.53 ns of a
+4.68 ns path, and **1.37 ns of it is routing rather than logic**.
+
+Deciding the operation in ID costs no cycle and changes no result: it is the
+same decode one latch earlier, where there is slack. An earlier attempt at this
+measured a wash (mean 196.9 against a 208.8 baseline), which is why it was not
+carried forward — but that was a different core, and, more importantly, the
+reason it should work was not understood at the time.
+
+**The reason is register replication.** `phys_opt_design` duplicates registers
+freely and LUT cones far less freely, so a control signal arriving from a flop
+can be copied next to each of its hundred-odd loads, while one arriving from a
+LUT cone has to be routed there. The proof is in the report: the new worst path
+starts at `d_par_op_reg[1]_rep` — the tool replicated it, which it could not do
+while the same signal was a LUT output.
+
+That reframes the earlier negatives. The shared shifter and the split result mux
+both tried to remove *logic* from the path; what dominates it is *routing*, and
+the lever on routing is giving the placer something it is allowed to duplicate.
+
+The decode now exists in two places — `par_decode` in ID, and the A1 arms that
+still say whether the ALU runs and decode the shuffles. That is a drift risk,
+and the guard is that `sim/ee/gen_mmi.py` exercises all thirty parallel-ALU
+sub-opcodes against the reference, so a disagreement is a failing test rather
+than one MMI instruction quietly computing a subtraction where it should have
+computed a maximum. `sim/ee/test_mmi_coverage.py` asserts that guard stays
+intact, because nothing else would notice if a future edit dropped a sub-opcode
+from the generator.
+
+Running total against the console's 294.912 MHz:
+
+| | Fmax |
+|---|---|
+| before the instruction-correctness work | 204.3 |
+| + overflow traps, branch-likely, twelve traps, five more instructions | 194.6 |
+| + shared comparators | 199.1 |
+| **+ parallel-ALU pre-decode** | **206.0** |
+| (forwarding disabled — the ceiling for a single-stage ALU) | 213.7 |
+
+The gap between 206.0 and the 213.7 ceiling is now under 8 MHz, which says most
+of what a single-stage execute can give has been taken. The two-stage split is
+what remains, and its break-even has moved with the baseline: 206.0 × 1.153 =
+**237.5 MHz**.
+
+### Pre-decoding the shuffles as well — 2026-09-14
+
+**208.8 MHz.** The same treatment applied to MMI0's and MMI1's shuffle half:
+ten arms, each naming its own permutation with a literal kind, which
+synthesises as ten specialised shufflers and therefore ten more 128-bit inputs
+to the result mux. Passing the kind as a *signal* builds one shuffler with the
+selection inside it, driven from a flop.
+
+This is deliberately the same shape as the shared shifter that lost 8.4 MHz, and
+the difference is worth stating because it is the lesson those five negatives
+were teaching. The shifter shared an **adder** — real logic that every consumer
+then had to route to and from, and routing is what this core is short of. A
+permutation is **wires**: sharing it moves a multiplexer from after the
+shufflers to inside one, which is where it was going to be either way, and pays
+for it with a select line that now arrives from a register the placer can
+duplicate.
+
+Where the EE stands against the console's 294.912 MHz:
+
+| | Fmax | note |
+|---|---|---|
+| before this session's correctness work | 204.3 | |
+| + overflow traps, branch-likely, twelve traps, five instructions | 194.6 | correctness, −9.7 |
+| + shared comparators | 199.1 | +4.5 |
+| + parallel-ALU pre-decode | 206.0 | +6.9 |
+| **+ shuffle pre-decode** | **208.8** | +2.8 |
+| forwarding disabled — the single-stage ceiling | 213.7 | |
+
+**Net for the session: 204.3 → 208.8 with four more instruction groups
+implemented correctly.** The correctness work cost 9.7 MHz and the routing work
+gave back 14.2.
+
+Only 4.9 MHz now separates the core from the ceiling a single-stage execute can
+reach even with forwarding removed entirely. That is the signal to stop looking
+for another 5 MHz here: the remaining 86 MHz is a pipeline question, not a
+routing one, and the two-stage split's break-even has moved to 208.8 × 1.153 =
+**240.7 MHz**.
+
+## The EX1/EX2 split, built — 2026-09-14
+
+A sixth pipeline stage between A1 and A2, done in two separable phases so that
+"the pipeline has an extra stage" and "the arithmetic has moved across it" could
+be got wrong one at a time.
+
+### Phase 1: the stage, carrying an already-selected result
+
+Structural only. `x_*` is a copy of the A1 → A2 latch, EX2 is a copy-through,
+and forwarding gains a third source rather than losing one — so no CPI change
+and, in principle, no timing change.
+
+Five things had to learn about the new stage, and each was found by a test
+rather than by reading:
+
+| what | symptom when missed |
+|---|---|
+| the **annul** cancels the EX1 → EX2 latch, not EX1 → A2 | twelve failures: a branch-likely that does not annul, its slot retiring one cycle later |
+| the **load-use interlock** needs two cycles, not one | loaded data appears in `w_val` and nowhere earlier, so an extra stage means an extra stall |
+| **HI/LO/SA forwarding** must check EX2 | `MFHI` reads the value from before the `MULT` two instructions back |
+| **COP0 forwarding** must check EX2 | `MFC0` reads from before the `MTC0` two back |
+| the **exception flush** must empty EX2 | a younger instruction survives a flush |
+
+The pattern is worth naming: *every* forwarding list in the core — general
+registers, HI/LO/SA, COP0 — has to gain the new stage, and missing one is not a
+partial failure. It is a stale read of exactly one instruction distance, which
+random programs hit only when they happen to space the pair correctly.
+
+It also surfaced a **latent bug from the branch-likely work**: `reads_rt` listed
+`4 | 5` for BEQ and BNE and never gained `20 | 21` for BEQL and BNEL. Nothing
+noticed because the only consumer is an interlock, and a load feeding a likely
+branch is rare in random code — but when it happens the branch compares a stale
+register and takes the other path. That was wrong in the five-stage core too and
+is now fixed there.
+
+**Phase 1 measures 201.3 MHz against 208.8** — the stage costs 7.5 MHz by
+itself, which is the honest baseline the split has to beat.
+
+### Phase 2: the result mux moves, and a measured negative
+
+The MMI arm's fifty assignments were redirected to their own variable and
+selected in EX2. **171.7 MHz** — far worse, and the report says exactly why:
+
+```
+fa_m_reg_replica/C  ->  fa_x_reg_rep__0/D     -2.435 ns
+fa_w_reg/C          ->  x_mval_reg[91]/D      -2.432 ns
+w_val_reg[6]/C      ->  x_val_reg[28]/D       -2.432 ns
+```
+
+The critical path is no longer the result mux at all — it is the **operand
+mux**. Three forwarding sources chained in front of A1 is a four-input 128-bit
+multiplexer at the head of the pipeline, and it costs more than moving the
+result mux out of the tail saves.
+
+That is the sixth measured negative, and it rhymes with the other five: each
+removed work from one place and put it somewhere the timing report had not yet
+been read carefully enough to see.
+
+### Phase 3: no forwarding from EX2 at all
+
+So the third source goes, and the bubble the dependency analysis was always
+about takes its place — one cycle on 15.3% of instructions, measured over
+303,450 instructions of real compiled MIPS. 36/36 passing; the fit is the number
+that decides whether the whole exercise returns anything, and it must clear
+**240.7 MHz** to do so.
+
+### Phase 4, and where the boundary actually belongs — 2026-09-14
+
+Two fixes turned Phase 3's 161.5 MHz into **204.3 MHz**, and both are worth
+keeping as lessons rather than as diffs.
+
+**The interlock must not read the execute decode.** Phase 3 asked `ex_we` and
+`ex_rd` whether the instruction in A1 writes a register. Those are outputs of
+the full A1 decode, so the question chained the entire execute stage into the ID
+stall condition, from there into `id_adv`, the fetch queue, and `fetch_pc` — the
+worst path ran from a forwarding flag to the program counter. Replacing it with
+`dest_of(d_ir)`, a shallow decode of the *registered* instruction word in the
+style of `is_load(d_ir)`, recovered 43 MHz.
+
+**`MULT rd, rs, rt` writes rd.** The R5900 has a three-operand multiply that
+MIPS III does not: `MULT` and `MULTU` write the low product into `rd` as well as
+into HI and LO. `dest_of` listed them with DIV as writing nothing, which was not
+a conservative simplification but a wrong one — the interlock then let the next
+instruction read `rd` before the product existed, and an `ADDU` two after a
+`MULT r11, r21, r22` took `r21`'s old value instead of `r11`'s new one. The core
+itself has always implemented the form correctly; it was the new decode that was
+wrong, and the directed hazard program found it immediately.
+
+### The verdict on the split as built
+
+**36/36 at 204.3 MHz, against 208.8 for the five-stage core** — and with a
+15.3% CPI penalty on top, so a clear loss rather than a near miss.
+
+The reason is in the timing report and it is not subtle:
+
+```
+m_val_reg[13]/C  ->  x_val_reg[12]/D    4.891 ns
+                     18 levels, 7 x CARRY8, 64% route
+```
+
+The critical path is the **whole of EX1**: forwarding from `m_val`, the decode,
+seven carry chains, and the scalar result mux. EX2 got only the two-way choice
+between the MMI result and everything else, which is nearly free.
+
+**So the stage is in the right pipeline and the boundary is in the wrong place.**
+The cut has to go between the *arithmetic* and the *result mux* — EX1 ending at
+the carry chains, EX2 carrying the whole mux — and that needs the per-class
+arithmetic results registered, which means grouping the seventy `ex_val`
+assignments into six or eight classes rather than two. Two classes moved 1 LUT
+level; six would move all six.
+
+That is the next experiment and it is well defined. What this one established,
+at the cost of four fits, is the infrastructure it needs: a six-stage pipeline
+that passes 36/36, every forwarding list taught about the new stage, an
+interlock that does not touch the fetch path, and a measured floor of 204.3 MHz
+to beat.
+
+### Six classes: the logic wall falls, and a routing wall appears — 2026-09-14
+
+The seventy result-producing assignments were split into six classes — four
+scalar, two MMI — with each arm writing its own class and setting the selector
+in the same statement, and EX2 carrying the whole six-way choice.
+
+**36/36, and 205.2 MHz.** Slower than the two-class version's 219.6. But the
+number is the least interesting part of this measurement:
+
+| | worst path | logic levels | route share |
+|---|---|---|---|
+| two classes | `m_val_reg → x_val_reg`, 4.891 ns | **18** (7 × CARRY8) | 64% |
+| **six classes** | `d_ir_reg[9] → x_c6_reg[20]`, 4.868 ns | **5** | **86%** |
+
+**The logic depth problem is solved.** Eighteen levels became five, and the
+logic portion of the path fell from 1.765 ns to 0.685 ns. The result mux that
+has been 43% of every critical path in this core since the first fit is gone
+from the critical path entirely.
+
+**What is left is routing, and almost nothing else.** 4.183 ns of a 4.868 ns
+path, across five levels of logic. Six class registers — 4 × 64 plus 2 × 128
+bits — collect values from producers scattered over the die and then feed EX2,
+and the wires are now the whole cost.
+
+That is a different problem with different tools, and it is the first time this
+core has presented it. Everything tried so far — resource sharing, mux
+restructuring, pre-decoding — addresses logic depth or fan-out. A design that is
+86% route on a five-level path wants **placement**: directive sweeps,
+floorplanning, and fewer or better-placed class registers. Those were tried
+early and dismissed because the design was logic-bound at the time and they did
+nothing; the premise has now changed.
+
+### A note on measurement variance
+
+`split4` and `split5` differ by two `return rd` cases in a decode function and
+measured **204.3 and 219.6 MHz**. Fifteen megahertz is not a structural
+difference; it is placement luck. Earlier work here recorded the same thing
+across directives, with a spread of 2.7 to 17.2 MHz on identical netlists.
+
+Single fits are therefore not a reliable way to rank designs within about
+15 MHz of each other, and several of the comparisons in this document sit inside
+that band. The ones that do not — the 213.7 MHz no-forwarding ceiling, the
+171.7 MHz three-source operand mux, the 161.5 MHz interlock-in-the-fetch-path —
+are large enough to trust, and each was explained by a named path rather than by
+the number alone. That is the standard the rest should be held to.
+
+### Where the two-stage execute stands
+
+| core | Fmax | CPI | effective |
+|---|---|---|---|
+| five-stage (in the tree) | 208.8 | 1.000 | **208.8** |
+| six-stage, two classes | 219.6 | 1.153 | 190.5 |
+| six-stage, six classes | 205.2 | 1.153 | 178.0 |
+
+Break-even is 240.7 MHz and neither reaches it, so **the five-stage core remains
+the one in the tree**. But the six-stage core is correct, passes 36/36, and has
+had its logic depth removed; what stands between it and the console's clock is
+now a routing problem on a five-level path, which is the most tractable shape
+this problem has taken yet.
+
+## 291.0 MHz — the constraint that was never the constraint — 2026-09-14
+
+| core | 0.72 V (`-2LV`) | 0.85 V (`-2L`) |
+|---|---|---|
+| five-stage (in the tree) | 208.8 | 257.7 |
+| **six-stage, six classes** | 205.2 | **291.0** |
+
+**291.0 MHz against the console's 294.912 — 98.7%, and the binding path is
+47 picoseconds short.**
+
+Two things in that table matter more than the headline.
+
+**The six-class split looked neutral at 0.72 V and is +33.3 MHz at 0.85 V.** At
+0.72 V the design is routing-bound — 86% route on a five-level path — and the
+eighteen levels of logic depth that were removed simply did not matter. At
+0.85 V the logic speeds up, the balance tips back, and removing that depth is
+exactly what pays. A change can be worthless at one operating point and decisive
+at another, and measuring it at only one is how a good idea gets thrown away.
+
+**And 0.72 V was never required.** It was adopted because the project has a
+power-parity goal, and the `-2LV` speed model characterises that rail, so every
+timing number in this document until now has been taken there. The measured
+per-rail breakdown says that was the wrong inference:
+
+```
+VCCINT at 0.720 V: dynamic 0.680 W + static 0.568 W = 1.248 W
+VCCINT at 0.850 V: dynamic 0.947 W + static 1.006 W = 1.953 W
+everything else (VCCAUX, GTYs, HBM rails):           2.932 W
+                            total 0.720 V: 4.18 W
+                            total 0.850 V: 4.89 W
+```
+
+**0.71 W.** That is the entire price of the higher rail, and the card goes from
+nine times under a slim PlayStation 2's draw to seven times under it. The power
+requirement was comfortably met either way; what it was doing was capping the
+clock at 88% of the console's, in service of a margin nobody needed.
+
+The lesson is not about voltage. It is that a constraint adopted for a good
+reason kept binding long after the measurement that justified it had been taken
+— `docs/power.md` has said "power is not the binding constraint, the clock
+ceiling is" since it was written, and the clock work carried on at 0.72 V
+regardless.
+
+### The last 47 picoseconds
+
+```
+fb_w_reg_replica/C  ->  x_c5_reg[65]/D     3.419 ns, slack -0.047
+                        15 levels, 69% route
+```
+
+The source is the **WB forwarding select**: the path runs from a forwarding flag
+through the operand multiplexer into MMI class 5's carry chains. Shortening the
+front of EX1 is the named fix, and it is the same lever Phase 2 identified from
+the other direction when a fourth operand source cost 30 MHz.
+
+47 ps is 1.4% of the path, which is inside what placement alone moves — a
+directive sweep is running. If it does not close it, the operand mux is where to
+cut.
+
+## The R5900 meets 294.912 MHz — 2026-09-14
+
+Seven placement/routing directive combinations on the six-class two-stage core
+at 0.85 V, against the PlayStation 2's own 294.912 MHz:
+
+| place / phys_opt / route | Fmax |
+|---|---|
+| **AltSpreadLogic_low / AggressiveExplore / Explore** | **297.7 MHz** |
+| **ExtraNetDelay_high / AggressiveExplore / AggressiveExplore** | **295.7 MHz** |
+| AltSpreadLogic_high / AggressiveExplore / Explore | 292.1 |
+| Default / Default / Default | 291.0 |
+| Explore / Explore / Explore | 286.3 |
+| ExtraNetDelay_low / Explore / NoTimingRelaxation | 284.6 |
+| WLDrivenBlockPlacement / Explore / MoreGlobalIterations | 284.2 |
+
+**Two independent directive combinations clear the console's clock.** That
+matters more than the best single number: a 15 MHz measurement spread has been
+documented here from the start, and one run over the line would be inside it.
+Two are not, and the spread across all seven — 284.2 to 297.7, 13.5 MHz — is
+consistent with the variance seen everywhere else in this file.
+
+### What had to be true at once
+
+None of these alone was enough, and three of them looked worthless when measured
+on their own:
+
+- **the parallel-ALU and shuffle pre-decode** (+9.7 MHz at 0.72 V) — the only
+  one that looked like a win when it was made
+- **the six-stage execute**, which measured *worse* than the five-stage core at
+  0.72 V and is what makes the rest possible
+- **six result classes**, which took the result mux from eighteen logic levels
+  to five and measured 205.2 against the two-class 219.6 — a clear loss at the
+  operating point it was measured at
+- **0.85 V**, which was never actually excluded by the power budget
+- **`AltSpreadLogic_low` placement**, worth 6.7 MHz over Default here and
+  27.3 MHz over it at 0.72 V
+
+The six-class split at 0.72 V under Default placement reads 205.2 MHz — the
+worst number in the table, and the version that was nearly abandoned. The same
+netlist at 0.85 V under `AltSpreadLogic_low` reads 297.7. **Nothing about the
+design changed between those two numbers.**
+
+### What this is, and what it is not
+
+It **is** an out-of-context fit of `ee_core` alone, routed, with the console's
+period as the constraint and positive slack at the end.
+
+It is **not** the core running on the card. The Graphics Synthesizer took
+several iterations to get from an out-of-context fit to 147.456 MHz on silicon,
+and it gained a PCIe endpoint, a clock-domain crossing and a control plane on
+the way. The same work is ahead here.
+
+Two costs are real and should be carried with the number:
+
+- **CPI is 1.153.** The two-stage execute costs a bubble on 15.3% of
+  instructions, measured over 303,450 instructions of real compiled MIPS. The
+  core runs at the console's clock and does about 15% less work per cycle than a
+  single-cycle-ALU R5900 would — and the real R5900 is two-issue, so it was
+  already ahead on that axis. The clock is the part that cannot be recovered
+  later; issue width can.
+- **0.85 V costs 0.71 W**, taking the card from 4.18 W to 4.89 W. Against a slim
+  PlayStation 2's ~35 W that is seven times under rather than nine.
+
+## The R5900 on the card — 2026-09-15
+
+**The clock is confirmed on silicon.** 294.9103 MHz measured, −7 ppm, both
+MMCMs locked — the Emotion Engine's rate produced from a 100 MHz board
+reference by two cascaded MMCMs, with the residual being the host's own clock
+error. The memory path passes a full round-trip and a walking-one address test.
+
+**The core does not yet execute correctly, and finding out why took six
+bitstreams.** Four of the defects were mine and none of them were in the R5900.
+
+### What went wrong, in order
+
+**The CSR lists were invisible.** `mem_w`, `mem_r`, `last_pc` and `dbg_gpr` were
+Python *lists* of CSRs, and LiteX's gatherer keeps only attributes that are
+themselves a CSR or have a `get_csrs()` of their own. A list is neither, so the
+first bitstream shipped without them — no error, no warning. `c1100_gs.py` binds
+each element as a named attribute for exactly this reason; I copied the list
+idiom and not the two lines that make it work.
+
+**The 64 KB memory was built out of 29,268 LUTs.** Vivado said so once, as a
+warning: `[Synth 8-6849] Infeasible attribute ram_style = "block" ... trying to
+implement using LUTRAM`. A warning, so it built, placed, routed and produced a
+bitstream — a completely different machine from the one written. Two things
+were wrong: both ports must be in one clocked process for the inference template
+to match, and port B had **two** conditional read destinations where a block RAM
+has one data output per port. Fixed: 16 RAMB36, zero LUTRAM.
+
+**An SLR floorplan solved a problem that was not there.** Confining
+`ee_bringup` to the empty SLR1 moved 56,346 LUTs exactly as intended, with none
+of the carry-chain splitting that defeated the same attempt on `gs_top`. Timing
+got *worse*, −1.139 → −1.564, because the pressure it relieved existed only
+because of the LUTRAM bug.
+
+**And the R5900 was deleted without anything failing.** A region replacement
+removed the one concurrent assignment driving `i_data`. That is legal VHDL — an
+undriven signal with an initialiser is a constant — so it compiled, elaborated,
+and synthesis trimmed the entire core. `ee_core` came back as **42 LUTs and zero
+DSPs**. The tell was timing *improving*: the design met 294.912 MHz with
+positive slack for the first time ever. An empty design always meets timing, and
+that should have been the first thing disbelieved rather than the first thing
+reported. `tools/ee/check_synth.py` now asserts DSP count, RAMB36 count, LUTRAM
+being zero, and a LUT floor.
+
+**The speed model did not match the rail.** Every EE build used `-2LV`, which
+characterises 0.72 V, while the card runs at 0.85 V. That is conservative rather
+than unsafe, but it cost real margin: rebuilding at `-2L` took WNS from −0.719
+to **−0.043 ns**. The platform now takes a `speed_grade` argument with the
+asymmetry written down — `-2LV` at 0.85 V is merely wasteful, `-2L` at 0.72 V
+would be *unsafe*, so a target asking for `-2L` asserts the rail was set first.
+
+### The measurement that was wrong
+
+The first card test reported "nondeterministic, therefore a timing violation".
+That was an artifact of the harness: it polled a retire counter and then
+asserted reset, but at 294.912 MHz thousands of instructions retire between two
+CSR reads, so three identical runs stopped in three different places. The
+differing retire counts — 1415, 1358, 1131 — looked like evidence of a fault
+when they were evidence of the measurement.
+
+`sim/ee/gen_card.py` now emits programs that park in a branch to themselves,
+which is the PlayStation 2's own idiom for the end of a program. After the park
+the register file never changes, so card and model describe the same moment.
+That alone took one program from sixteen differing registers to two.
+
+### Where it stands
+
+`sim/ee/tb_ee_bringup.sv` and `sim/ee/run_bringup_diff.sh` **reproduce the card's
+failure in simulation**, which is the thing that makes it tractable. The same
+program passes `run_diff.sh` against the core and fails `run_bringup_diff.sh`
+against the wrapper, so the fault is in `ee_bringup` or its interface, not in the
+R5900 — and `sim/ee/run_diff.sh` has been checking the core against a
+SystemVerilog memory all along while the VHDL one it actually ships with had
+never been checked against anything.
+
+One real difference has been found and fixed: the core holds `d_read`/`d_write`
+until it sees `d_ready`, and a port that answers `d_ready <= d_read or d_write`
+performs the access again and raises a second acknowledgement behind the first.
+`tb_ee_core.sv` has always had the guard (`&& !d_ready`); the VHDL did not.
+
+What remains is narrowed but not closed. On the smallest failing program
+(70 instructions) the two sides agree on **memory contents**, on **all thirteen
+data-port accesses**, and on **400 retirements of instruction order** — and
+disagree on the upper 64 bits of one register. That register's upper half comes
+from an `LQ` whose data the log shows returning zero on both sides, which means
+the remaining fault is somewhere the current tracing does not reach.
+
+### The register comparison was truncating the answer — 2026-09-15
+
+The bring-up failure was almost entirely a defect in my own measurement, and
+the way it was found is worth keeping.
+
+Bisecting on cycle count put the divergence at one instruction: `PPACH` at word
+62, whose result differed between card and model while `r24` — its only
+non-zero operand — was **identical** on both sides. Calling the model's own
+`ppac()` directly with that operand produced the *RTL's* answer, not the
+model's. Tracing the dispatch showed `w128(r11, 00000000ffffd11c…)` being called
+with the right value, and `gpr[11]` holding it afterwards — while `cpu.r(11)`
+returned zero.
+
+`r(n)` returns `gpr[n] & M64`. `r128(n)` returns all 128 bits. The model's own
+`dump()` prints 128, which is why `run_diff.sh` has always been correct. **Both
+harnesses I wrote for the card used `r()`**, so every register whose result
+lives in the upper half and whose lower half is zero compared as zero — and
+those are exactly the registers the MMI instructions exist to write. A
+comparison that truncates the answer reports a correct core as broken.
+
+| | before | after |
+|---|---|---|
+| `run_bringup_diff.sh`, nine programs | most failing | **9 of 9 pass** |
+| the card, 48 runs over four programs | 29 disagreed | **7 disagreed** |
+
+What is left is intermittent — 3, 0, 2 and 2 failures out of twelve — and
+intermittency is the real signature of a marginal timing violation, consistent
+with the build's WNS of −0.043 ns. Simulation is clean on the same programs, so
+the RTL is right and the remaining 43 picoseconds are a placement problem on a
+path that is 89% route.
+
+Three lessons, all of them about measurement rather than design:
+
+- **A harness that never fails is not evidence; a harness that fails is not
+  evidence either.** Both of the card's "failures" so far — the
+  nondeterministic retire counts and this — were the measuring instrument.
+- **Copy the accessor, not just the loop.** `dump()` used `r128` for a reason
+  that is written down in its own comment, and I reimplemented the comparison
+  from scratch with `r()`.
+- **Bisect on the machine, not on the program.** Varying program length was
+  useless because each length is a different program; varying the *cycle count*
+  found the exact instruction in four runs.
+
+### Zero slack is not enough slack — 2026-09-15
+
+Changing the implementation directives took the build from **WNS −0.043 ns to
+WNS 0.000 with zero violated paths**, and the card's failure rate did not move:
+7 of 48 runs before, 6 of 48 after. So the 43 picoseconds were not what was
+failing.
+
+What the failures look like is the useful part. Every one has the same
+signature — `r1` correct, `r2` through `r11` and `r14` reading zero — and:
+
+- the program in memory is **intact** after a failing run;
+- the register file is fine: re-running the identical program immediately
+  afterwards reads back every register correctly;
+- `last_pc` is the park and `retires` is three and a half million, so the core
+  ran to the end;
+- `traps` is zero;
+- the same programs pass **9 of 9** through `run_bringup_diff.sh` in simulation.
+
+A structured, intermittent failure of the first dozen instructions, on a design
+that simulates clean, with a correct program and a working register file, is
+what no timing margin looks like. `WNS = 0.000` is not a design that meets
+timing with room; it is a design the tool stopped optimising the instant it
+reached the target, and any on-chip variation — temperature, voltage droop, a
+different cell in the same path — takes it negative.
+
+So the margin is now **kept through routing rather than removed before it**.
+The Graphics Synthesizer's target drops its placement uncertainty to zero before
+routing so that sign-off reports the truth, which is right for a design
+finishing with slack to spare. This one needs the opposite: 0.450 ns through
+placement and **0.150 ns retained into routing and into the report**, so that a
+reported slack of zero means 0.150 ns of real margin and the number in the log
+is pessimistic rather than flattering.
+
+The clock is untouched by any of this. The MMCM produces 294.912 MHz throughout,
+measured on the card at 294.9108 MHz, −4 ppm.
+
+### It was never the timing margin — 2026-09-15
+
+The entry above was wrong, and the build that was meant to confirm it refuted
+it instead. v3 kept 0.150 ns of real margin through routing and failed **12 of
+48 runs** where v2, with none, failed 6 of 48. More margin, more failures. The
+setup margin was never what was failing.
+
+Worse, the reasoning that led there rested on a measurement that did not say
+what it was read as saying. The experiment that "re-read the registers after a
+failing run and got correct values" pulsed `ee_reset` between the two reads, so
+it re-ran the program: a second run agreeing tells you nothing about whether
+the first run's state was right. Reading three times with reset untouched --
+the core is parked in a branch to itself, so its register file cannot change --
+gives the same wrong values every time.
+
+**The failure is in the run.** The proof does not go through the debug path at
+all: a program that stores its registers to memory loses the stores too, and
+memory is read back through the host port, which shares nothing with `dbg_sel`,
+the snapshot or the toggle that crosses it. On a failing run not one store
+lands.
+
+What a failing release actually does, measured rather than inferred:
+
+- **Instruction 0 always commits.** A marker written by the first instruction
+  survived all 100 releases in a run of 100, failures included.
+- **Nothing after it ever commits.** Across four unrelated random programs the
+  card's register state matched the reference model after exactly one
+  instruction -- all 32 registers, every time. With a 403-instruction program
+  that stores a running counter after every increment, a failing run leaves all
+  200 memory words untouched.
+- **The pipeline is alive the whole time.** `retire` is `w_valid`, and the
+  retire counter advances at exactly the rate a passing run does. A
+  data-dependent `BNE` on a register the first instruction wrote is taken
+  correctly: the core parks at the taken target, never at the fall-through one.
+  So fetch, decode, execute, the register *read* ports and branch resolution
+  all work while nothing is written back.
+- **No exception is involved.** An exception would redirect to 0x180 and the
+  core would never reach the park; it reaches the park every time. `traps` is
+  zero and the stall codes are the same as a passing run's.
+- **The host cannot influence it.** Settling in reset for 50 ms, pulsing reset
+  twice, writing `pc_reset` after the load instead of before, and adding
+  microseconds of CSR traffic before the release all give the same 12 to 25 %
+  per release.
+
+There is also a second, rarer shape: a *partial* loss, where the first few
+instructions are dropped and the core then runs correctly to the end. One run
+of the counter program lost four increments and their four stores, and finished
+with the remaining 196 values written to the right addresses.
+
+So releasing reset has roughly a one-in-six chance of leaving a core that
+fetches, decodes, executes and branches correctly while committing nothing
+after the first instruction. That is not a setup violation -- more setup margin
+made it worse -- and it is not the debug path. The next question is whether it
+is frequency-dependent at all, which is what the half-rate build is for: a
+setup violation somewhere sign-off is not modelling disappears when the period
+doubles, and a hold violation or a functional fault does not care.
+
+### Not the clock either, and not the rail — 2026-09-15
+
+Two candidates died on the same afternoon.
+
+**The rail was never wrong.** The image wants 0.85 V because it is signed off
+against the `-2L` speed file, and this document's hardware study still said the
+card sat at 0.800 V. It does not: SYSMON reads **851 mV on-die**, and did so
+*before* anything was commanded. So v1, v2 and v3 all failed at exactly the
+voltage their sign-off assumes. The 0.800 V note was written on 2026-09-12 and
+had been overtaken; it is corrected in `ps2-hardware-study.md`.
+
+**The failure is frequency-independent.** A build identical to v3 except for the
+EE output divider -- 8 instead of 4, so 147.456 MHz instead of 294.912, measured
+on the card at 147.4551 -- fails at the same rate:
+
+| build | EE clock | 48-run differential | 100-release marker test |
+|---|---|---|---|
+| v2 | 294.912 MHz | 6 of 48 | — |
+| v3 | 294.912 MHz | 12 of 48 | 26 of 100 |
+| half | 147.456 MHz | 7 of 48 | **23 of 100** |
+
+Doubling the period doubles the budget of every setup path in the design and
+changes nothing. Together with v3's extra margin making it no better, **setup
+timing is ruled out**. The signature is unchanged at half rate too: instruction
+0 commits, nothing after it does, and the core still fetches, branches and
+retires normally to the park.
+
+What that leaves is a hold violation or a functional fault at reset release --
+and those two are separable by voltage rather than by frequency. Hold gets
+*worse* as silicon gets faster, so **lowering** VCCINT should reduce the failure
+rate if it is hold, and do nothing if it is logic. At 147.456 MHz there is so
+much setup headroom that a large undervolt carries no setup risk, which is
+exactly why the half-rate image is the right one to run that experiment on.
+
+### The bug: EX2 survives reset — 2026-09-15
+
+Voltage settled the last question. At 147.456 MHz, dropping VCCINT from 850 mV
+to **720 mV** — confirmed on-die by SYSMON, a large undervolt that slows the
+silicon substantially — moved the failure rate from 23 of 100 to **20 of 100**.
+Hold violations get *worse* as silicon gets faster, so a 130 mV undervolt would
+have moved a hold problem clearly. It did not.
+
+So the fault is independent of both frequency and voltage. It is not setup, it
+is not hold, it is not the rail. It is logic, and it was findable by reading
+rather than by building: **the reset branch clears `d_valid`, `m_valid` and
+`w_valid`, and does not clear `x_valid`.**
+
+Nor any of EX2's control bits — `x_we`, `x_ismem`, `x_exc`, `x_eret`, `x_take`,
+`x_annul`, `x_trap`, `x_c0_we`, `x_hi_we`, `x_lo_we`, `x_sa_we`. Thirty-nine
+signals are cleared on reset and ninety-nine are not; almost all of the ninety-
+nine are datapath payload that a valid bit qualifies, which is fine. EX2's valid
+bit is not payload.
+
+The flush path clears exactly this set, and its comment names the hazard:
+
+> EX2 holds an instruction younger than the one committing, so it dies with the
+> rest. **Forgetting this stage is the whole risk of adding it**: everything
+> else about a flush already worked.
+
+It was remembered in the flush path and forgotten in the reset path. So
+releasing reset started the pipeline with whatever EX2 held when the *previous*
+run was stopped — a stale instruction, still marked valid, advancing into M and
+W ahead of the program. Which is why:
+
+- it is **intermittent**, at about one release in five: it depends on where in
+  the park loop reset happened to land;
+- it is **environment-independent**: no amount of setup margin, no clock and no
+  voltage changes what a stale valid bit does;
+- it always looks the **same**: instruction 0 commits and nothing after it does;
+- and **simulation never caught it**, because the testbench releases reset once,
+  from a configuration in which every flop holds its declaration initial value.
+  The fault needs a *previous* run to leave something behind. Nine of nine
+  passing said only that one release from a clean pipeline works.
+
+The fix adds EX2 to the reset branch, exactly the set the flush clears.
+
+**The lesson worth keeping is about the test, not the core.** Every experiment
+that moved a physical quantity — directives, clock uncertainty, clock frequency,
+rail voltage — was answering a question nobody had established was the right
+one. What located the bug was noticing that the failure did not respond to *any*
+physical variable, and that "the same wrong answer at half the clock and at
+130 mV less" is a statement about logic. A functional fault should have been
+suspected the moment more setup margin made things worse rather than better.
+
+### Confirmed on the card — 2026-09-15
+
+v4 is v3 with EX2 added to the reset branch and nothing else changed: same
+directives, same uncertainty, same 294.912 MHz, measured on the card at
+294.9111 MHz and the rail back at 850 mV.
+
+| harness | what it checks | v3 | v4 |
+|---|---|---|---|
+| 48-run differential | four random programs against the model | 12 of 48 failed | **0 of 48** |
+| 100-release marker | instruction 0's marker plus 200 stores | 26 of 100 failed | **0 of 100** |
+| commit trace | 403 instructions, a store after every increment | partial and total losses | **0 of 40** |
+| registers vs memory | the debug path and the host port must agree | 14 of 60 failed | **0 of 60** |
+| data-dependent branch | a BNE on a register, two parks | 28 of 120 lost writes | **0 of 120** |
+
+**368 consecutive releases, no failure.** At the previous rate of roughly 23 %
+the chance of that happening by luck is about one in 10^42.
+
+One loose end is worth naming rather than leaving in the timing report. v4 signs
+off at WNS -0.080 with 10 violated paths, but the 0.150 ns of uncertainty that
+v3 introduced is still being retained into routing, so those paths really have
+**+0.070 ns** and the report is pessimistic by construction. That constraint was
+added to test a theory that turned out to be wrong, and keeping it now only
+means a working design reads as VIOLATED. The next build of this target should
+go back to the GS convention -- full uncertainty through placement, zero before
+routing -- so that sign-off reports the truth about a design that no longer
+needs flattering.

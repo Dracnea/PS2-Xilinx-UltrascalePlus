@@ -101,7 +101,17 @@ class PS2Clocks(LiteXModule):
     the clock-and-reset generator itself to own `sys`, so a board whose sys
     clock *is* the console's GS clock hands its own `cd_sys` in.
     """
-    def __init__(self, platform, ref, rst, name="ps2", domains=None):
+    def __init__(self, platform, ref, rst, name="ps2", domains=None,
+                 ee_divide=None):
+        """`ee_divide` overrides the EE output divider, for diagnosis only.
+
+        The console's EE runs at 294.912 MHz and a build that ships must use it.
+        But a fault that is intermittent needs to be told apart from a fault
+        that is slow, and halving the clock is what separates them: a setup
+        violation goes away when the period doubles, and a hold violation or a
+        functional bug does not care at all. Vivado derives the period
+        constraint from this parameter, so nothing else has to be told.
+        """
         if domains is None:
             domains = {"ee": None, "gs": None, "iop": None}
         self.locked = Signal()
@@ -154,7 +164,8 @@ class PS2Clocks(LiteXModule):
             # was written, and the instance had never been through a
             # synthesiser.  A whole number in the fractional parameter is still
             # an exact integer divide, so the ratios below are unaffected.
-            p_CLKOUT0_DIVIDE_F = float(STAGE2["ee"]),
+            p_CLKOUT0_DIVIDE_F = float(STAGE2["ee"] if ee_divide is None
+                                        else ee_divide),
             p_CLKOUT1_DIVIDE   = STAGE2["gs"],
             p_CLKOUT2_DIVIDE   = STAGE2["iop"],
             i_CLKIN1   = base_b, i_CLKIN2 = 0, i_CLKINSEL = 1,

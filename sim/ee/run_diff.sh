@@ -45,7 +45,9 @@ if [[ -z $PROG && $STEPS -lt $COUNT ]]; then
 fi
 python3 "$HERE/r5900_ref.py" prog.hex --steps "$STEPS" --dump-mem 0x2000 0x400 > ref.txt 2> ref.traps
 
-xvhdl -2008 "$ROOT/rtl/ee/ee_core.vhd"      > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }
+# EE_CORE_VHD lets a candidate core be tested without disturbing the tree, so
+# a timing experiment and its correctness check can run at the same time.
+xvhdl -2008 "${EE_CORE_VHD:-$ROOT/rtl/ee/ee_core.vhd}" > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }
 xvlog -sv   "$HERE/tb_ee_core.sv"           > xvlog.log 2>&1 || { tail -20 xvlog.log; exit 1; }
 xelab -debug off tb_ee_core -s tb           > xelab.log 2>&1 || { tail -30 xelab.log; exit 1; }
 xsim tb -R -testplusarg "program=prog.hex" -testplusarg "steps=$STEPS" \

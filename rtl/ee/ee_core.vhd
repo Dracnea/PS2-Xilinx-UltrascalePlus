@@ -157,6 +157,7 @@ architecture arch of ee_core is
    constant EXC_SYSCALL : integer := 8;
    constant EXC_BREAK   : integer := 9;
    constant EXC_OV      : integer := 12;
+   constant EXC_TR      : integer := 13;   -- the conditional traps
    type cop0_t is array (0 to 31) of std_logic_vector(31 downto 0);
    signal cop0 : cop0_t := (15 => PRID, others => (others => '0'));
    signal traps  : unsigned(15 downto 0) := (others => '0');
@@ -194,6 +195,9 @@ architecture arch of ee_core is
    signal outst      : integer range 0 to MAX_OUT := 0;   -- requests in flight
    signal drop       : integer range 0 to MAX_OUT := 0;   -- of which wrong-path
    signal redir_pend : std_logic := '0';
+   -- The annul equivalent of redir_pend: the slot to be annulled had not been
+   -- fetched yet when the branch reached A2, so the kill waits for it.
+   signal annul_pend : std_logic := '0';
    -- An exception invalidates the pipeline on the cycle it commits, but the
    -- fetch redirect waits one more.  Committing and redirecting together put
    -- the vector-or-EPC mux in front of the branch redirect that was already
@@ -239,6 +243,78 @@ architecture arch of ee_core is
    signal d_link    : std_logic_vector(63 downto 0) := (others => '0');
 
    -- ---- A1/A2 -------------------------------------------------------------
+
+   -- ---- EX2 -----------------------------------------------------------
+   --
+   -- A new pipeline stage, between A1 and A2.
+   --
+   -- Why: with forwarding disabled entirely the datapath still only reaches
+   -- 213.7 MHz, so the result-to-operand loop is not what stands between this
+   -- core and the console's 294.912 MHz -- the arithmetic and the result mux
+   -- are, and they are 4.79 ns of combinational logic that no amount of
+   -- replication or resource sharing has been able to shorten. Five measured
+   -- negatives say the same thing from five directions. The remaining move is
+   -- to give that logic two cycles.
+   --
+   -- This latch is a copy of the A1 -> A2 one. In this first form it carries
+   -- the *already selected* result, so the extra stage is purely structural:
+   -- no timing changes, no CPI changes, and forwarding gains a third source
+   -- rather than losing one. Moving the result mux across the boundary is the
+   -- step after, and it is separated deliberately -- a pipeline with an extra
+   -- stage and a pipeline whose arithmetic has moved are two different things
+   -- to get wrong, and debugging them together is how a refactor becomes a
+   -- rewrite.
+   signal x_valid   : std_logic := '0';
+   signal x_pc      : unsigned(31 downto 0) := (others => '0');
+   signal x_we      : std_logic := '0';
+   signal x_rd      : integer range 0 to 31 := 0;
+   -- The six result classes as they cross into EX2. Only the MMI classes ever
+   -- write the upper half, so the latch is 4 x 64 + 2 x 128 bits rather than
+   -- six full quadwords.
+   signal x_c1, x_c2 : std_logic_vector(63 downto 0) := (others => '0');
+   signal x_c3, x_c4 : std_logic_vector(63 downto 0) := (others => '0');
+   signal x_c5, x_c6 : std_logic_vector(127 downto 0) := (others => '0');
+   signal x_sel      : integer range 0 to 6 := 0;
+   constant x_zero   : std_logic_vector(63 downto 0) := (others => '0');
+   signal x_w128    : std_logic := '0';
+   signal x_p1      : std_logic := '0';
+   signal x_exc     : std_logic := '0';
+   signal x_exc_code: integer range 0 to 31 := 0;
+   signal x_eret    : std_logic := '0';
+   signal x_bd      : std_logic := '0';
+   signal x_c0_we   : std_logic := '0';
+   signal x_c0_idx  : integer range 0 to 31 := 0;
+   signal x_c0_val  : std_logic_vector(31 downto 0) := (others => '0');
+   signal x_hi_we   : std_logic := '0';
+   signal x_lo_we   : std_logic := '0';
+   signal x_sa_we   : std_logic := '0';
+   signal x_wide    : std_logic := '0';
+   signal x_sa      : std_logic_vector(3 downto 0) := (others => '0');
+   signal x_hi      : std_logic_vector(63 downto 0) := (others => '0');
+   signal x_lo      : std_logic_vector(63 downto 0) := (others => '0');
+   signal x_hiu, x_lou : std_logic_vector(63 downto 0) := (others => '0');
+   signal x_take    : std_logic := '0';
+   signal x_annul   : std_logic := '0';
+   signal x_tgt     : unsigned(31 downto 0) := (others => '0');
+   signal x_ismem   : std_logic := '0';
+   signal x_unal    : std_logic := '0';
+   signal x_unal_dw : std_logic := '0';
+   signal x_unal_l  : std_logic := '0';
+   signal x_mbase   : std_logic_vector(63 downto 0) := (others => '0');
+   signal x_isload  : std_logic := '0';
+   signal x_width   : integer range 1 to 16 := 4;
+   signal x_sign    : std_logic := '0';
+   signal x_shift   : integer range 0 to 15 := 0;
+   -- The memory request is built in A1 and issued from EX2, so that the data
+   -- arrives in A2 on the cycle A2 expects it rather than one cycle early.
+   signal x_addr    : std_logic_vector(31 downto 0) := (others => '0');
+   signal x_be      : std_logic_vector(15 downto 0) := (others => '0');
+   signal x_wdata   : std_logic_vector(127 downto 0) := (others => '0');
+   signal x_trap    : std_logic := '0';
+   -- Forwarding from EX2, which is possible only while x_val holds the final
+   -- value. When the result mux moves into EX2 this source disappears and a
+   -- one-cycle interlock replaces it.
+   signal fa_x, fb_x : std_logic := '0';
    signal m_valid   : std_logic := '0';
    signal m_pc      : unsigned(31 downto 0) := (others => '0');
    signal m_we      : std_logic := '0';
@@ -271,6 +347,12 @@ architecture arch of ee_core is
    signal m_lo      : std_logic_vector(63 downto 0) := (others => '0');
    -- the branch decision, made in A1 and acted on in A2
    signal m_take    : std_logic := '0';
+   -- A not-taken branch-likely annuls its delay slot.  That is the mirror of a
+   -- taken branch: m_take says "the slot runs and everything behind it dies",
+   -- m_annul says "the slot dies and everything behind it runs".  Both are
+   -- decided in A1 and acted on when the branch reaches A2, so both are
+   -- registered across that boundary.
+   signal m_annul   : std_logic := '0';
    signal m_tgt     : unsigned(31 downto 0) := (others => '0');
    signal m_ismem   : std_logic := '0';
    -- the unaligned group: which of LWL/LWR/LDL/LDR is in flight, and the value
@@ -423,6 +505,89 @@ architecture arch of ee_core is
    -- One lane's result, from the operands, that lane's sum, and its carry out.
    -- Bounds come from the lane's own width so that one cannot be right at 16
    -- bits and wrong at 8.
+   -- MMI0's and MMI1's parallel ALU, decoded a stage early.
+   --
+   -- The measurement that motivates this: with forwarding disabled, the worst
+   -- path starts at bit 2 of the instruction word, spends two LUT levels
+   -- reaching `par_o` -- a net with a fan-out of 113 -- and two more reaching
+   -- the add-or-subtract line of a sixty-four-bit carry chain, and only then
+   -- enters the chain. That prologue is 1.53 ns of a 4.68 ns path, and 1.37 ns
+   -- of it is routing rather than logic.
+   --
+   -- Deciding the operation in ID instead costs no cycle and no result: it is
+   -- the same decode one latch earlier, where there is slack. It also changes
+   -- what the placer can do about the fan-out, which is the part that actually
+   -- matters here -- phys_opt_design replicates registers freely and LUT
+   -- outputs far less freely, so a control signal that arrives from a flop can
+   -- be duplicated next to its loads in a way that one arriving from a LUT
+   -- cone cannot.
+   --
+   -- The arms in A1 still stand, to say whether the parallel ALU runs at all
+   -- and to decode the shuffles. Two descriptions of one mapping is a drift
+   -- risk; the guard is that sim/ee/gen_mmi.py exercises every one of the
+   -- thirty sub-opcodes against the reference, so a disagreement is a failing
+   -- test rather than a subtle wrong answer.
+   type par_dec_t is record
+      en : boolean;
+      op : par_op_t;
+      w  : natural range 8 to 32;
+   end record;
+
+   function par_decode(ir : std_logic_vector(31 downto 0)) return par_dec_t is
+      variable iop : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn  : integer := to_integer(unsigned(ir(5 downto 0)));
+      variable sa  : integer := to_integer(unsigned(ir(10 downto 6)));
+      variable r   : par_dec_t := (false, P_ADD, 32);
+   begin
+      if iop /= 28 then return r; end if;
+      if fn = 16#08# then                                  -- MMI0
+         case sa is
+            when 16#00# => r := (true, P_ADD,  32);
+            when 16#01# => r := (true, P_SUB,  32);
+            when 16#02# => r := (true, P_CGT,  32);
+            when 16#03# => r := (true, P_MAX,  32);
+            when 16#04# => r := (true, P_ADD,  16);
+            when 16#05# => r := (true, P_SUB,  16);
+            when 16#06# => r := (true, P_CGT,  16);
+            when 16#07# => r := (true, P_MAX,  16);
+            when 16#08# => r := (true, P_ADD,   8);
+            when 16#09# => r := (true, P_SUB,   8);
+            when 16#0A# => r := (true, P_CGT,   8);
+            when 16#10# => r := (true, P_ADDS, 32);
+            when 16#11# => r := (true, P_SUBS, 32);
+            when 16#14# => r := (true, P_ADDS, 16);
+            when 16#15# => r := (true, P_SUBS, 16);
+            when 16#18# => r := (true, P_ADDS,  8);
+            when 16#19# => r := (true, P_SUBS,  8);
+            when others => null;
+         end case;
+      elsif fn = 16#28# then                               -- MMI1
+         case sa is
+            when 16#01# => r := (true, P_ABS,  32);
+            when 16#02# => r := (true, P_CEQ,  32);
+            when 16#03# => r := (true, P_MIN,  32);
+            when 16#05# => r := (true, P_ABS,  16);
+            when 16#06# => r := (true, P_CEQ,  16);
+            when 16#07# => r := (true, P_MIN,  16);
+            when 16#0A# => r := (true, P_CEQ,   8);
+            when 16#10# => r := (true, P_ADDU, 32);
+            when 16#11# => r := (true, P_SUBU, 32);
+            when 16#14# => r := (true, P_ADDU, 16);
+            when 16#15# => r := (true, P_SUBU, 16);
+            when 16#18# => r := (true, P_ADDU,  8);
+            when 16#19# => r := (true, P_SUBU,  8);
+            when others => null;
+         end case;
+      end if;
+      return r;
+   end function;
+
+   -- The ID/A1 latch's two extra fields. They live here rather than with the
+   -- rest of the latch because par_op_t is declared with the parallel ALU, and
+   -- VHDL wants the type before the signal.
+   signal d_par_op  : par_op_t := P_ADD;
+   signal d_par_w   : natural range 8 to 32 := 32;
+
    function par_out(op : par_op_t; a, b, sum : std_logic_vector;
                     cout : std_logic) return std_logic_vector is
       constant W    : natural := a'length;
@@ -552,6 +717,62 @@ architecture arch of ee_core is
    -- two are encoded adjacently.
    type shf_op_t is (S_PEXTL, S_PEXTU, S_PPAC, S_PEXT5, S_PPAC5,
                      S_PADSBH, S_QFSRV);
+
+   -- The shuffle half of MMI0 and MMI1, decoded in ID as well.
+   --
+   -- There are ten of these and each arm names its own permutation with a
+   -- literal kind, so synthesis specialises ten separate shufflers -- and ten
+   -- separate 128-bit inputs to the result mux, which the timing report puts at
+   -- 1.78 ns and six levels deep. Passing the kind as a *signal* instead builds
+   -- one shuffler with a ten-way mux inside it, and that mux's select arrives
+   -- from a flop.
+   --
+   -- This is the same shape as the shared shifter that lost 8.4 MHz, and it is
+   -- worth being explicit about why it is not the same bet. That change shared
+   -- an *adder* -- real logic that everything then had to route to and from.
+   -- A permutation is wires: sharing it moves a multiplexer from after the
+   -- shufflers to inside one, which is where it was going to be either way.
+   -- Whether that is actually better is a measurement, not an argument.
+   type shf_dec_t is record
+      en : boolean;
+      op : shf_op_t;
+      w  : natural range 8 to 32;
+   end record;
+
+   function shf_decode(ir : std_logic_vector(31 downto 0)) return shf_dec_t is
+      variable iop : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn  : integer := to_integer(unsigned(ir(5 downto 0)));
+      variable sa  : integer := to_integer(unsigned(ir(10 downto 6)));
+      variable r   : shf_dec_t := (false, S_PEXTL, 32);
+   begin
+      if iop /= 28 then return r; end if;
+      if fn = 16#08# then                                  -- MMI0
+         case sa is
+            when 16#12# => r := (true, S_PEXTL, 32);
+            when 16#13# => r := (true, S_PPAC,  32);
+            when 16#16# => r := (true, S_PEXTL, 16);
+            when 16#17# => r := (true, S_PPAC,  16);
+            when 16#1A# => r := (true, S_PEXTL,  8);
+            when 16#1B# => r := (true, S_PPAC,   8);
+            when 16#1E# => r := (true, S_PEXT5, 32);
+            when 16#1F# => r := (true, S_PPAC5, 32);
+            when others => null;
+         end case;
+      elsif fn = 16#28# then                               -- MMI1
+         case sa is
+            when 16#04# => r := (true, S_PADSBH, 16);
+            when 16#12# => r := (true, S_PEXTU,  32);
+            when 16#16# => r := (true, S_PEXTU,  16);
+            when 16#1A# => r := (true, S_PEXTU,   8);
+            when 16#1B# => r := (true, S_QFSRV,   8);
+            when others => null;
+         end case;
+      end if;
+      return r;
+   end function;
+
+   signal d_shf_op  : shf_op_t := S_PEXTL;
+   signal d_shf_w   : natural range 8 to 32 := 32;
 
    function par_shuf(op : shf_op_t; w : natural;
                      a, b : std_logic_vector(127 downto 0);
@@ -826,6 +1047,69 @@ architecture arch of ee_core is
       end case;
    end function;
 
+   -- Which register an instruction writes, decided from the instruction word
+   -- alone.
+   --
+   -- The EX2 interlock needs this, and the obvious source -- ex_we and ex_rd
+   -- out of the A1 decode -- is the wrong one: using it chains the whole
+   -- execute decode into the ID stall condition, and from there into id_adv,
+   -- the fetch queue and fetch_pc. That measured 161.5 MHz with the worst path
+   -- running from a forwarding flag all the way to the program counter.
+   --
+   -- So the interlock reads a shallow decode of the *registered* instruction
+   -- word instead, exactly as the load-use interlock already does with
+   -- is_load(d_ir). It is deliberately **conservative**: where the destination
+   -- is not obvious it returns the field an instruction of that shape would
+   -- write, so the answer is never "writes nothing" when something is written.
+   -- A spurious stall costs a cycle; a missed one is a stale operand.
+   function dest_of(ir : std_logic_vector(31 downto 0)) return integer is
+      variable op : integer := to_integer(unsigned(ir(31 downto 26)));
+      variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
+      variable rt : integer := to_integer(unsigned(ir(20 downto 16)));
+      variable rd : integer := to_integer(unsigned(ir(15 downto 11)));
+   begin
+      case op is
+         when 0 =>
+            case fn is
+               when 8 | 12 | 13 | 15 | 17 | 19 => return 0;   -- JR, SYSCALL, BREAK, SYNC, MTHI, MTLO
+               -- MULT and MULTU write **rd as well as HI and LO**. That is an
+               -- R5900 extension -- MIPS III has only the two-operand form --
+               -- and listing them here as writing nothing was not a
+               -- conservative simplification but a wrong one: the interlock
+               -- then let the next instruction read rd before the product
+               -- existed, and the ADDU two after a `MULT r11, r21, r22` took
+               -- r21's old value.
+               --
+               -- DIV and DIVU have no such form and genuinely write only HI
+               -- and LO.
+               when 24 | 25                    => return rd;  -- MULT, MULTU
+               when 26 | 27                    => return 0;   -- DIV, DIVU
+               when 48 | 49 | 50 | 51 | 52 | 54 => return 0;  -- the traps
+               -- JALR links to rd, and to r31 when rd is zero -- which is how
+               -- it is nearly always written. Returning rd here says "writes
+               -- nothing" for exactly the common form.
+               when 9 => if rd = 0 then return 31; else return rd; end if;
+               when others                     => return rd;
+            end case;
+         when 28 =>                                           -- MMI
+            case fn is
+               when 17 | 19            => return 0;           -- MTHI1, MTLO1
+               when 24 | 25            => return rd;          -- MULT1, MULTU1
+               when 26 | 27            => return 0;           -- DIV1, DIVU1
+               when others             => return rd;
+            end case;
+         when 1 =>                                            -- REGIMM
+            if rt = 16 or rt = 17 or rt = 18 or rt = 19 then return 31; end if;
+            return 0;
+         when 2 => return 0;                                  -- J
+         when 3 => return 31;                                 -- JAL
+         when 4 | 5 | 6 | 7 | 20 | 21 | 22 | 23 => return 0;  -- branches
+         when 40 | 41 | 43 | 63 | 42 | 46 | 31 => return 0;   -- stores
+         when 47 | 51 => return 0;                            -- CACHE, PREF
+         when others => return rt;
+      end case;
+   end function;
+
    function reads_rt(ir : std_logic_vector(31 downto 0)) return boolean is
       variable op : integer := to_integer(unsigned(ir(31 downto 26)));
       variable fn : integer := to_integer(unsigned(ir(5 downto 0)));
@@ -845,7 +1129,13 @@ architecture arch of ee_core is
                when 16 | 18 | 17 | 19 => return false;
                when others            => return true;
             end case;
-         when 4 | 5 => return true;                             -- BEQ, BNE
+         -- BEQL and BNEL read rt exactly as BEQ and BNE do. They were left
+         -- out when the likely forms were added, and nothing noticed: the only
+         -- consumer of this function is an interlock, and a load feeding a
+         -- likely branch is rare in random code. It is a wrong *branch
+         -- decision* when it happens, not a wrong value in a register, so it
+         -- shows up as a program taking the other path.
+         when 4 | 5 | 20 | 21 => return true;                   -- BEQ, BNE, BEQL, BNEL
          when 40 | 41 | 43 | 63 => return true;                 -- stores
          -- LWL/LWR/LDL/LDR merge into rt, so they *read* the register they
          -- write; the store forms read it for their data.  Leaving these out
@@ -876,6 +1166,10 @@ architecture arch of ee_core is
    begin
       case op is
          when 1 | 2 | 3 | 4 | 5 | 6 | 7 => return true;
+         -- BEQL, BNEL, BLEZL, BGTZL.  A likely branch still has a delay slot;
+         -- what is different is only that the slot is annulled when the branch
+         -- is not taken.
+         when 20 | 21 | 22 | 23 => return true;
          when 0 => return fn = 8 or fn = 9;                 -- JR, JALR
          when others => return false;
       end case;
@@ -1019,6 +1313,56 @@ begin
       variable ex_exc, ex_eret        : std_logic;
       variable ex_code                : integer range 0 to 31;
       variable sum32                  : std_logic_vector(31 downto 0);
+      variable wide64                 : std_logic_vector(63 downto 0);
+      -- Phase 2: the result mux crosses into EX2.
+      --
+      -- ex_val is assigned about seventy times down a nested case, which
+      -- synthesises as a priority chain six LUT levels deep and 1.78 ns of
+      -- routing -- roughly 43% of the critical path. Splitting it in two by
+      -- class and selecting once turns that into two shorter chains; doing it
+      -- *without* a register between, as an earlier experiment did, lost
+      -- 14.1 MHz because the final two-way mux landed on the end of the MMI
+      -- side, which already carried a full-width carry chain.
+      --
+      -- With EX2 in place the two-way choice gets its own cycle instead.
+      variable mmi_use                : boolean;
+      variable mmi_val, mmi_valhi     : std_logic_vector(63 downto 0);
+      -- Six result classes, and the selector saying which one was written.
+      --
+      -- The two-class version moved one LUT level into EX2 and left EX1
+      -- carrying forwarding, the decode, seven carry chains and a fifty-arm
+      -- mux -- 4.891 ns. Fifty arms down a nested case synthesise as a
+      -- priority chain; twelve arms do not. Six groups of about a dozen make
+      -- each class's mux two LUT6 levels and EX2's six-way choice one more.
+      --
+      -- The grouping is by position in the case rather than by meaning,
+      -- deliberately: a semantic grouping would need maintaining by hand as
+      -- instructions are added and would be wrong silently. Correctness does
+      -- not depend on the grouping at all -- whichever arm executes writes its
+      -- own class and sets the selector in the same statement, so the two
+      -- cannot disagree.
+      variable c1_val, c2_val         : std_logic_vector(63 downto 0);
+      variable c3_val, c4_val         : std_logic_vector(63 downto 0);
+      variable c5_val, c5_valhi       : std_logic_vector(63 downto 0);
+      variable c6_val, c6_valhi       : std_logic_vector(63 downto 0);
+      variable ex_sel                 : integer range 0 to 6;
+      -- Sixteen instructions compare the same two operands: SLT, SLTU, SLTI,
+      -- SLTIU and the twelve conditional traps.  Written out one per case arm
+      -- that is sixteen 64-bit comparators, each its own carry chain, and each
+      -- reached from the instruction register through the decode -- which is
+      -- the path this core is already losing on.  There are only six distinct
+      -- comparisons: signed, unsigned and equality, against either the second
+      -- register or the sign-extended immediate.  Computing those six once and
+      -- selecting among them turns sixteen carry chains into six.
+      --
+      -- Both operand choices are computed unconditionally rather than muxing
+      -- the operand first, because which one an instruction wants is only known
+      -- after the decode, and waiting for that would put the mux in front of
+      -- the comparator instead of behind it -- adding to the very path being
+      -- shortened.  A 64-bit mux and a 64-bit comparator cost about the same;
+      -- doing the cheap thing in the wrong order is what costs.
+      variable lt_s_b, lt_u_b, eq_b   : boolean;   -- a against b
+      variable lt_s_i, lt_u_i, eq_i   : boolean;   -- a against the immediate
       variable ex_c0_we               : std_logic;
       variable ex_c0_idx              : integer range 0 to 31;
       variable ex_c0_val              : std_logic_vector(31 downto 0);
@@ -1056,6 +1400,7 @@ begin
       variable ex_mbase               : std_logic_vector(63 downto 0);
       variable kk, hw, dh             : integer range 0 to 7;
       variable ex_take                : boolean;
+      variable ex_annul               : boolean;   -- likely branch, not taken
       variable ex_trap                : boolean;
       variable ex_busy                : boolean;
       variable dvd_mag, dvsr_mag      : unsigned(31 downto 0);
@@ -1073,6 +1418,15 @@ begin
       -- of the process it holds exactly what the signal will hold next cycle.
       variable n_d_rs, n_d_rt          : integer range 0 to 31;
       variable n_m_valid, n_m_we       : std_logic;
+      -- EX2 has no reason of its own to stall, so it advances exactly when A2
+      -- does. Keeping it as a separate name rather than writing a2_adv is not
+      -- decoration: when the result mux moves across the boundary EX2 gains a
+      -- reason to stall, and every place that should follow it is already
+      -- written.
+      variable ex2_adv                 : boolean;
+      variable n_x_valid, n_x_we       : std_logic;
+      variable n_x_rd                  : integer range 0 to 31;
+      variable n_x_sel                 : integer range 0 to 6;
       variable n_m_rd                  : integer range 0 to 31;
       variable n_w_valid, n_w_we       : std_logic;
       variable n_w_rd                  : integer range 0 to 31;
@@ -1137,16 +1491,47 @@ begin
             redir_pend <= '0';
             q_cnt      <= 0;
             d_valid    <= '0';
+            -- **EX2 has to be cleared here too.**
+            --
+            -- The flush path clears this stage and says why: "EX2 holds an
+            -- instruction younger than the one committing, so it dies with the
+            -- rest.  Forgetting this stage is the whole risk of adding it."
+            -- Reset forgot it.  Every other stage's valid bit is cleared here
+            -- and x_valid was not, so releasing reset started the pipeline with
+            -- whatever EX2 happened to hold when the *previous* run was stopped
+            -- -- a stale instruction, still marked valid, that advances into M
+            -- and W ahead of the program and takes the program with it.
+            --
+            -- That is what the bring-up failure was: roughly one release in
+            -- five committed the first instruction and nothing after it, at
+            -- any clock and any voltage, because the fault is not timing at
+            -- all.  The signals below are exactly the set the flush clears.
+            x_valid    <= '0';
+            x_ismem    <= '0';
+            x_we       <= '0';
+            x_hi_we    <= '0';
+            x_lo_we    <= '0';
+            x_sa_we    <= '0';
+            x_c0_we    <= '0';
+            x_take     <= '0';
+            x_annul    <= '0';
+            x_exc      <= '0';
+            x_eret     <= '0';
+            x_trap     <= '0';
             m_valid    <= '0';
             m_ismem    <= '0';
             m_unal     <= '0';
             m_take     <= '0';
+            m_annul    <= '0';
+            annul_pend <= '0';
             w_valid    <= '0';
             ex_cnt     <= 0;
             d_read     <= '0';
             d_write    <= '0';
             fa_m       <= '0';
             fb_m       <= '0';
+            fa_x       <= '0';
+            fb_x       <= '0';
             fa_w       <= '0';
             fb_w       <= '0';
          else
@@ -1156,6 +1541,10 @@ begin
             n_d_rs    := d_rs;
             n_d_rt    := d_rt;
             n_m_valid := m_valid;
+            n_x_valid := x_valid;
+            n_x_we    := x_we;
+            n_x_rd    := x_rd;
+            n_x_sel   := x_sel;
             n_m_we    := m_we;
             n_m_rd    := m_rd;
             n_w_valid := w_valid;
@@ -1166,8 +1555,10 @@ begin
             -- A2: can the instruction in the A1/A2 latch leave this cycle?
             -- ============================================================
             a2_adv := true;
+            ex2_adv := true;
             if m_valid = '1' and m_ismem = '1' and d_ready = '0' then
                a2_adv := false;
+               ex2_adv := false;
             end if;
 
             -- ============================================================
@@ -1225,6 +1616,12 @@ begin
                if m_w128 = '1' then b128 := m_val;
                else b128 := b128(127 downto 64) & m_val(63 downto 0); end if;
             end if;
+            -- There is deliberately no third source here. EX2 holds the
+            -- instruction immediately ahead of this one, and forwarding from it
+            -- would mean a fourth input to a 128-bit multiplexer at the head of
+            -- the pipeline -- which measured 171.7 MHz, worse than not having
+            -- the stage at all. An interlock takes its place: the consumer
+            -- waits one cycle and reads the value from A2 instead.
             -- Everything but MMI defines only the low 64 bits, so the ALU below
             -- reads the halves it always did and the upper half travels
             -- alongside for the instructions that want it.
@@ -1260,6 +1657,23 @@ begin
                   elsif m_p1 = '1' then lo1_f := m_lo; else lo_f := m_lo; end if;
                end if;
             end if;
+            -- EX2 is younger than both and so is checked last. HI, LO and SA
+            -- are forwarded exactly as the general registers are, and adding a
+            -- stage without adding it here leaves MFHI reading the value from
+            -- before the MULT two instructions back -- which the directed
+            -- multiply program finds immediately and random programs find only
+            -- when they happen to space the pair two apart.
+            if x_valid = '1' then
+               if x_sa_we = '1' then sa_f := x_sa; end if;
+               if x_hi_we = '1' then
+                  if x_wide = '1' then hi_f := x_hi; hi1_f := x_hiu;
+                  elsif x_p1 = '1' then hi1_f := x_hi; else hi_f := x_hi; end if;
+               end if;
+               if x_lo_we = '1' then
+                  if x_wide = '1' then lo_f := x_lo; lo1_f := x_lou;
+                  elsif x_p1 = '1' then lo1_f := x_lo; else lo_f := x_lo; end if;
+               end if;
+            end if;
             -- MFC0 reads a register MTC0 may have written two instructions
             -- ago, so it needs the same two forwarding steps as HI and LO.
             c0_f := cop0(rd);
@@ -1268,6 +1682,15 @@ begin
             end if;
             if m_valid = '1' and m_c0_we = '1' and m_c0_idx = rd then
                c0_f := m_c0_val;
+            end if;
+            -- and EX2 last, being the youngest. The COP0 file is forwarded on
+            -- exactly the same terms as the general registers and HI/LO: every
+            -- stage between the write and the commit has to be looked at, and
+            -- adding a stage means adding it to all three lists. Missing one is
+            -- not a partial failure -- it is an MFC0 that reads the value from
+            -- before the MTC0 two instructions back.
+            if x_valid = '1' and x_c0_we = '1' and x_c0_idx = rd then
+               c0_f := x_c0_val;
             end if;
 
             -- what the MFHI/MFLO arms below read, chosen by the same flag that
@@ -1281,8 +1704,17 @@ begin
             ex_we     := '0';
             ex_w128   := '0';
             ex_rd     := 0;
-            ex_val    := (others => '0');
+            c1_val    := (others => '0');  ex_sel := 1;
             ex_valhi  := (others => '0');
+            ex_sel    := 1;
+            c1_val    := (others => '0');
+            c2_val    := (others => '0');
+            c3_val    := (others => '0');
+            c4_val    := (others => '0');
+            c5_val    := (others => '0');
+            c5_valhi  := (others => '0');
+            c6_val    := (others => '0');
+            c6_valhi  := (others => '0');
             ex_hi_we  := '0';
             ex_sa_we  := '0';
             ex_wide   := '0';
@@ -1304,6 +1736,16 @@ begin
             ex_eret    := '0';
             ex_code    := 0;
             sum32      := (others => '0');
+            wide64     := (others => '0');
+            mmi_use    := false;
+            c5_val    := (others => '0');  ex_sel := 5;
+            c5_valhi  := (others => '0');
+            lt_s_b := signed(a)   < signed(b);
+            lt_u_b := unsigned(a) < unsigned(b);
+            eq_b   := a = b;
+            lt_s_i := signed(a)   < simm;
+            lt_u_i := unsigned(a) < unsigned(simm);
+            eq_i   := signed(a)   = simm;
             ex_c0_we   := '0';
             ex_c0_idx  := 0;
             ex_c0_val  := (others => '0');
@@ -1313,6 +1755,7 @@ begin
             ex_mbase   := (others => '0');
             kk := 0; hw := 0;
             ex_take   := false;
+            ex_annul  := false;
             ex_trap   := false;
             tgt       := (others => '0');
             ea        := (others => '0');
@@ -1321,34 +1764,34 @@ begin
                when 0 =>                               -- SPECIAL
                   case fn is
                      when 0  => ex_we := '1'; ex_rd := rd;   -- SLL
-                                ex_val := sext32(std_logic_vector(shift_left(unsigned(b(31 downto 0)), sa)));
+                                c1_val := sext32(std_logic_vector(shift_left(unsigned(b(31 downto 0)), sa)));  ex_sel := 1;
                      when 2  => ex_we := '1'; ex_rd := rd;   -- SRL
-                                ex_val := sext32(std_logic_vector(shift_right(unsigned(b(31 downto 0)), sa)));
+                                c1_val := sext32(std_logic_vector(shift_right(unsigned(b(31 downto 0)), sa)));  ex_sel := 1;
                      when 3  => ex_we := '1'; ex_rd := rd;   -- SRA
-                                ex_val := sext32(std_logic_vector(shift_right(signed(b(31 downto 0)), sa)));
+                                c1_val := sext32(std_logic_vector(shift_right(signed(b(31 downto 0)), sa)));  ex_sel := 1;
                      when 4  => ex_we := '1'; ex_rd := rd;   -- SLLV
-                                ex_val := sext32(std_logic_vector(shift_left(unsigned(b(31 downto 0)), to_integer(unsigned(a(4 downto 0))))));
+                                c1_val := sext32(std_logic_vector(shift_left(unsigned(b(31 downto 0)), to_integer(unsigned(a(4 downto 0))))));  ex_sel := 1;
                      when 6  => ex_we := '1'; ex_rd := rd;   -- SRLV
-                                ex_val := sext32(std_logic_vector(shift_right(unsigned(b(31 downto 0)), to_integer(unsigned(a(4 downto 0))))));
+                                c1_val := sext32(std_logic_vector(shift_right(unsigned(b(31 downto 0)), to_integer(unsigned(a(4 downto 0))))));  ex_sel := 1;
                      when 7  => ex_we := '1'; ex_rd := rd;   -- SRAV
-                                ex_val := sext32(std_logic_vector(shift_right(signed(b(31 downto 0)), to_integer(unsigned(a(4 downto 0))))));
+                                c1_val := sext32(std_logic_vector(shift_right(signed(b(31 downto 0)), to_integer(unsigned(a(4 downto 0))))));  ex_sel := 1;
                      when 8  => ex_take := true; tgt := unsigned(a(31 downto 0));  -- JR
                      when 9  => ex_we := '1';                                      -- JALR
                                 if rd = 0 then ex_rd := 31; else ex_rd := rd; end if;
-                                ex_val := d_link;
+                                c1_val := d_link;  ex_sel := 1;
                                 ex_take := true; tgt := unsigned(a(31 downto 0));
-                     when 16 => ex_we := '1'; ex_rd := rd; ex_val := hi_r;         -- MFHI
+                     when 16 => ex_we := '1'; ex_rd := rd; c1_val := hi_r;  ex_sel := 1;         -- MFHI
                      when 17 => ex_hi_we := '1'; ex_hi := a;                       -- MTHI
-                     when 18 => ex_we := '1'; ex_rd := rd; ex_val := lo_r;         -- MFLO
+                     when 18 => ex_we := '1'; ex_rd := rd; c1_val := lo_r;  ex_sel := 1;         -- MFLO
                      when 19 => ex_lo_we := '1'; ex_lo := a;                       -- MTLO
                      when 12 => ex_exc := '1'; ex_code := EXC_SYSCALL;             -- SYSCALL
                      when 13 => ex_exc := '1'; ex_code := EXC_BREAK;               -- BREAK
                      when 20 => ex_we := '1'; ex_rd := rd;                         -- DSLLV
-                                ex_val := std_logic_vector(shift_left(unsigned(b), to_integer(unsigned(a(5 downto 0)))));
+                                c1_val := std_logic_vector(shift_left(unsigned(b), to_integer(unsigned(a(5 downto 0)))));  ex_sel := 1;
                      when 22 => ex_we := '1'; ex_rd := rd;                         -- DSRLV
-                                ex_val := std_logic_vector(shift_right(unsigned(b), to_integer(unsigned(a(5 downto 0)))));
+                                c1_val := std_logic_vector(shift_right(unsigned(b), to_integer(unsigned(a(5 downto 0)))));  ex_sel := 1;
                      when 23 => ex_we := '1'; ex_rd := rd;                         -- DSRAV
-                                ex_val := std_logic_vector(shift_right(signed(b), to_integer(unsigned(a(5 downto 0)))));
+                                c2_val := std_logic_vector(shift_right(signed(b), to_integer(unsigned(a(5 downto 0)))));  ex_sel := 2;
 
                      when 24 | 25 =>                                               -- MULT / MULTU
                         -- The operands are captured and the product is walked
@@ -1360,7 +1803,7 @@ begin
                         ex_lo_we := '1';
                         ex_we    := '1';
                         ex_rd    := rd;          -- rd = 0 writes nothing, at WB
-                        ex_val   := ex_lo;
+                        c2_val   := ex_lo;  ex_sel := 2;
 
                      when 26 | 27 =>                                               -- DIV / DIVU
                         -- Magnitudes go through the iterative unit and the
@@ -1401,40 +1844,107 @@ begin
                            ex_exc := '1'; ex_code := EXC_OV;   -- and rd is left alone
                         else
                            ex_we := '1'; ex_rd := rd;
-                           ex_val := sext32(sum32);
+                           c2_val := sext32(sum32);  ex_sel := 2;
                         end if;
-                     when 34 | 35 => ex_we := '1'; ex_rd := rd;                    -- SUB/SUBU
-                        ex_val := sext32(std_logic_vector(signed(a(31 downto 0)) - signed(b(31 downto 0))));
-                     when 36 => ex_we := '1'; ex_rd := rd; ex_val := a and b;      -- AND
-                     when 37 => ex_we := '1'; ex_rd := rd; ex_val := a or b;       -- OR
-                     when 38 => ex_we := '1'; ex_rd := rd; ex_val := a xor b;      -- XOR
-                     when 39 => ex_we := '1'; ex_rd := rd; ex_val := not (a or b); -- NOR
+                     when 34 | 35 =>                                               -- SUB/SUBU
+                        sum32 := std_logic_vector(signed(a(31 downto 0)) - signed(b(31 downto 0)));
+                        if fn = 34 and (a(31) /= b(31)) and (sum32(31) /= a(31)) then
+                           ex_exc := '1'; ex_code := EXC_OV;   -- and rd is left alone
+                        else
+                           ex_we := '1'; ex_rd := rd;
+                           c2_val := sext32(sum32);  ex_sel := 2;
+                        end if;
+                     -- MOVZ / MOVN, the branchless conditional move.  When
+                     -- the condition fails the write is suppressed rather than
+                     -- written back: rd keeps whatever it had, and leaving
+                     -- ex_we clear is what says so to the forwarding network as
+                     -- well as to the register file.
+                     when 10 =>                                                    -- MOVZ
+                        if b = std_logic_vector'(x"0000000000000000") then
+                           ex_we := '1'; ex_rd := rd; c2_val := a;  ex_sel := 2;
+                        end if;
+                     when 11 =>                                                    -- MOVN
+                        if b /= std_logic_vector'(x"0000000000000000") then
+                           ex_we := '1'; ex_rd := rd; c2_val := a;  ex_sel := 2;
+                        end if;
+                     -- SYNC orders memory.  This core is a single in-order
+                     -- pipeline with no store buffer, so there is nothing to
+                     -- order and the instruction is correctly a no-op -- but it
+                     -- still has to decode, or a program containing one takes a
+                     -- reserved-instruction trap.
+                     when 15 => null;                                              -- SYNC
+                     when 36 => ex_we := '1'; ex_rd := rd; c2_val := a and b;  ex_sel := 2;      -- AND
+                     when 37 => ex_we := '1'; ex_rd := rd; c2_val := a or b;  ex_sel := 2;       -- OR
+                     when 38 => ex_we := '1'; ex_rd := rd; c2_val := a xor b;  ex_sel := 2;      -- XOR
+                     when 39 => ex_we := '1'; ex_rd := rd; c2_val := not (a or b);  ex_sel := 2; -- NOR
                      when 42 => ex_we := '1'; ex_rd := rd;                         -- SLT
-                        if signed(a) < signed(b) then ex_val := (0 => '1', others => '0');
-                        else ex_val := (others => '0'); end if;
+                        if lt_s_b then c2_val := (0 => '1', others => '0');  ex_sel := 2;
+                        else c2_val := (others => '0');  ex_sel := 2; end if;
                      when 43 => ex_we := '1'; ex_rd := rd;                         -- SLTU
-                        if unsigned(a) < unsigned(b) then ex_val := (0 => '1', others => '0');
-                        else ex_val := (others => '0'); end if;
+                        if lt_u_b then c2_val := (0 => '1', others => '0');  ex_sel := 2;
+                        else c3_val := (others => '0');  ex_sel := 3; end if;
                      when 40 => ex_we := '1'; ex_rd := rd;                         -- MFSA
-                        ex_val := x"000000000000000" & sa_f;
+                        c3_val := x"000000000000000" & sa_f;  ex_sel := 3;
                      when 41 =>                                                    -- MTSA
                         ex_sa_we := '1'; ex_sa := a(3 downto 0);
-                     when 44 | 45 => ex_we := '1'; ex_rd := rd;                    -- DADD/DADDU
-                        ex_val := std_logic_vector(signed(a) + signed(b));
-                     when 46 | 47 => ex_we := '1'; ex_rd := rd;                    -- DSUB/DSUBU
-                        ex_val := std_logic_vector(signed(a) - signed(b));
+                     when 44 | 45 =>                                               -- DADD/DADDU
+                        wide64 := std_logic_vector(signed(a) + signed(b));
+                        if fn = 44 and (a(63) = b(63)) and (wide64(63) /= a(63)) then
+                           ex_exc := '1'; ex_code := EXC_OV;   -- and rd is left alone
+                        else
+                           ex_we := '1'; ex_rd := rd;
+                           c3_val := wide64;  ex_sel := 3;
+                        end if;
+                     when 46 | 47 =>                                               -- DSUB/DSUBU
+                        wide64 := std_logic_vector(signed(a) - signed(b));
+                        if fn = 46 and (a(63) /= b(63)) and (wide64(63) /= a(63)) then
+                           ex_exc := '1'; ex_code := EXC_OV;   -- and rd is left alone
+                        else
+                           ex_we := '1'; ex_rd := rd;
+                           c3_val := wide64;  ex_sel := 3;
+                        end if;
+                     -- The six conditional traps.  They write no register, so
+                     -- a core missing them looks like it is working: the
+                     -- instruction decodes as reserved or as nothing at all,
+                     -- and the only visible difference is the exception that
+                     -- never arrives.  Comparisons are 64-bit, and the U forms
+                     -- are unsigned comparisons of the same 64 bits.
+                     when 48 =>                                                    -- TGE
+                        if not lt_s_b then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 49 =>                                                    -- TGEU
+                        if not lt_u_b then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 50 =>                                                    -- TLT
+                        if lt_s_b then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 51 =>                                                    -- TLTU
+                        if lt_u_b then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 52 =>                                                    -- TEQ
+                        if eq_b then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 54 =>                                                    -- TNE
+                        if not eq_b then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
                      when 56 => ex_we := '1'; ex_rd := rd;                         -- DSLL
-                        ex_val := std_logic_vector(shift_left(unsigned(b), sa));
+                        c3_val := std_logic_vector(shift_left(unsigned(b), sa));  ex_sel := 3;
                      when 58 => ex_we := '1'; ex_rd := rd;                         -- DSRL
-                        ex_val := std_logic_vector(shift_right(unsigned(b), sa));
+                        c3_val := std_logic_vector(shift_right(unsigned(b), sa));  ex_sel := 3;
                      when 59 => ex_we := '1'; ex_rd := rd;                         -- DSRA
-                        ex_val := std_logic_vector(shift_right(signed(b), sa));
+                        c3_val := std_logic_vector(shift_right(signed(b), sa));  ex_sel := 3;
                      when 60 => ex_we := '1'; ex_rd := rd;                         -- DSLL32
-                        ex_val := std_logic_vector(shift_left(unsigned(b), sa + 32));
+                        c3_val := std_logic_vector(shift_left(unsigned(b), sa + 32));  ex_sel := 3;
                      when 62 => ex_we := '1'; ex_rd := rd;                         -- DSRL32
-                        ex_val := std_logic_vector(shift_right(unsigned(b), sa + 32));
+                        c3_val := std_logic_vector(shift_right(unsigned(b), sa + 32));  ex_sel := 3;
                      when 63 => ex_we := '1'; ex_rd := rd;                         -- DSRA32
-                        ex_val := std_logic_vector(shift_right(signed(b), sa + 32));
+                        c3_val := std_logic_vector(shift_right(signed(b), sa + 32));  ex_sel := 3;
                      when others => ex_trap := true;
                   end case;
 
@@ -1442,10 +1952,52 @@ begin
                   case rt is
                      when 0  => ex_take := signed(a) < 0;
                      when 1  => ex_take := signed(a) >= 0;
-                     when 16 => ex_we := '1'; ex_rd := 31; ex_val := d_link;
+                     when 16 => ex_we := '1'; ex_rd := 31; c3_val := d_link;  ex_sel := 3;
                                 ex_take := signed(a) < 0;
-                     when 17 => ex_we := '1'; ex_rd := 31; ex_val := d_link;
+                     when 17 => ex_we := '1'; ex_rd := 31; c3_val := d_link;  ex_sel := 3;
                                 ex_take := signed(a) >= 0;
+                     -- The four likely forms.  The link is written whether
+                     -- or not the branch is taken -- that is what the manual
+                     -- says and it is easy to get wrong, because the annul
+                     -- makes it look as though nothing should happen.
+                     when 2  =>                                  -- BLTZL
+                        ex_take  := signed(a) < 0;
+                        ex_annul := not ex_take;
+                     when 3  =>                                  -- BGEZL
+                        ex_take  := signed(a) >= 0;
+                        ex_annul := not ex_take;
+                     when 18 =>                                  -- BLTZALL
+                        ex_we := '1'; ex_rd := 31; c3_val := d_link;  ex_sel := 3;
+                        ex_take  := signed(a) < 0;
+                        ex_annul := not ex_take;
+                     when 19 =>                                  -- BGEZALL
+                        ex_we := '1'; ex_rd := 31; c4_val := d_link;  ex_sel := 4;
+                        ex_take  := signed(a) >= 0;
+                        ex_annul := not ex_take;
+                     when 8  =>                                  -- TGEI
+                        if not lt_s_i then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 9  =>                                  -- TGEIU
+                        if not lt_u_i then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 10 =>                                  -- TLTI
+                        if lt_s_i then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 11 =>                                  -- TLTIU
+                        if lt_u_i then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 12 =>                                  -- TEQI
+                        if eq_i then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
+                     when 14 =>                                  -- TNEI
+                        if not eq_i then
+                           ex_exc := '1'; ex_code := EXC_TR;
+                        end if;
                      -- The two members of REGIMM that neither branch nor link:
                      -- they set the shift-amount register.  The exclusive-or is
                      -- what the manual specifies and is not a slip -- it lets a
@@ -1465,8 +2017,21 @@ begin
                when 2 =>                                    -- J
                   ex_take := true;  tgt := d_tgt;
                when 3 =>                                    -- JAL
-                  ex_we := '1'; ex_rd := 31; ex_val := d_link;
+                  ex_we := '1'; ex_rd := 31; c4_val := d_link;  ex_sel := 4;
                   ex_take := true;  tgt := d_tgt;
+               -- BEQL / BNEL / BLEZL / BGTZL.  Identical to their ordinary
+               -- partners on the taken path; on the not-taken path the delay
+               -- slot is annulled rather than executed, which is the reason
+               -- MIPS III added them -- a compiler can fill the slot with an
+               -- instruction that is only valid when the branch is taken.
+               when 20 => ex_take := (a = b);        tgt := d_tgt;
+                          ex_annul := not ex_take;
+               when 21 => ex_take := (a /= b);       tgt := d_tgt;
+                          ex_annul := not ex_take;
+               when 22 => ex_take := signed(a) <= 0; tgt := d_tgt;
+                          ex_annul := not ex_take;
+               when 23 => ex_take := signed(a) > 0;  tgt := d_tgt;
+                          ex_annul := not ex_take;
                when 4 => ex_take := (a = b);        tgt := d_tgt;
                when 5 => ex_take := (a /= b);       tgt := d_tgt;
                when 6 => ex_take := signed(a) <= 0; tgt := d_tgt;
@@ -1478,25 +2043,25 @@ begin
                      ex_exc := '1'; ex_code := EXC_OV;         -- and rt is left alone
                   else
                      ex_we := '1'; ex_rd := rt;
-                     ex_val := sext32(sum32);
+                     c4_val := sext32(sum32);  ex_sel := 4;
                   end if;
                when 10 => ex_we := '1'; ex_rd := rt;         -- SLTI
-                  if signed(a) < simm then ex_val := (0 => '1', others => '0');
-                  else ex_val := (others => '0'); end if;
+                  if lt_s_i then c4_val := (0 => '1', others => '0');  ex_sel := 4;
+                  else c4_val := (others => '0');  ex_sel := 4; end if;
                when 11 => ex_we := '1'; ex_rd := rt;         -- SLTIU
-                  if unsigned(a) < unsigned(simm) then ex_val := (0 => '1', others => '0');
-                  else ex_val := (others => '0'); end if;
-               when 12 => ex_we := '1'; ex_rd := rt; ex_val := a and (std_logic_vector'(x"000000000000") & imm);
-               when 13 => ex_we := '1'; ex_rd := rt; ex_val := a or  (std_logic_vector'(x"000000000000") & imm);
-               when 14 => ex_we := '1'; ex_rd := rt; ex_val := a xor (std_logic_vector'(x"000000000000") & imm);
+                  if lt_u_i then c4_val := (0 => '1', others => '0');  ex_sel := 4;
+                  else c4_val := (others => '0');  ex_sel := 4; end if;
+               when 12 => ex_we := '1'; ex_rd := rt; c4_val := a and (std_logic_vector'(x"000000000000") & imm);  ex_sel := 4;
+               when 13 => ex_we := '1'; ex_rd := rt; c4_val := a or  (std_logic_vector'(x"000000000000") & imm);  ex_sel := 4;
+               when 14 => ex_we := '1'; ex_rd := rt; c4_val := a xor (std_logic_vector'(x"000000000000") & imm);  ex_sel := 4;
                when 15 => ex_we := '1'; ex_rd := rt;         -- LUI
-                  ex_val := sext32(imm & std_logic_vector'(x"0000"));
+                  c4_val := sext32(imm & std_logic_vector'(x"0000"));  ex_sel := 4;
                when 16 =>                                    -- COP0
                   case rs is
                      when 0 =>                                 -- MFC0
                         ex_we  := '1';
                         ex_rd  := rt;
-                        ex_val := sext32(c0_f);
+                        c4_val := sext32(c0_f);  ex_sel := 4;
                      when 16 =>                                -- the CO forms
                         if fn = 24 then
                            ex_eret := '1';                     -- ERET
@@ -1513,6 +2078,7 @@ begin
                   end case;
 
                when 28 =>                                    -- MMI2 / MMI3
+                  mmi_use := true;
                   -- The SIMD half of MMI, and the first instructions to touch
                   -- the upper 64 bits of a register.  The sub-opcode is in sa
                   -- rather than fn, which is why these cannot share the decode
@@ -1559,14 +2125,14 @@ begin
                            when 16#15# => par_alu_on := true; par_o := P_SUBS; par_w := 16;
                            when 16#18# => par_alu_on := true; par_o := P_ADDS; par_w := 8;
                            when 16#19# => par_alu_on := true; par_o := P_SUBS; par_w := 8;
-                           when 16#12# => par_v := par_shuf(S_PEXTL,  32, a128, b128, sa_f);
-                           when 16#13# => par_v := par_shuf(S_PPAC,   32, a128, b128, sa_f);
-                           when 16#16# => par_v := par_shuf(S_PEXTL,  16, a128, b128, sa_f);
-                           when 16#17# => par_v := par_shuf(S_PPAC,   16, a128, b128, sa_f);
-                           when 16#1A# => par_v := par_shuf(S_PEXTL,   8, a128, b128, sa_f);
-                           when 16#1B# => par_v := par_shuf(S_PPAC,    8, a128, b128, sa_f);
-                           when 16#1E# => par_v := par_shuf(S_PEXT5,  32, a128, b128, sa_f);
-                           when 16#1F# => par_v := par_shuf(S_PPAC5,  32, a128, b128, sa_f);
+                           when 16#12# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#13# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#16# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#17# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#1A# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#1B# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#1E# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#1F# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
                            when others => par_ok := false;
                         end case;
                      else                                    -- MMI1
@@ -1584,20 +2150,24 @@ begin
                            when 16#15# => par_alu_on := true; par_o := P_SUBU; par_w := 16;
                            when 16#18# => par_alu_on := true; par_o := P_ADDU; par_w := 8;
                            when 16#19# => par_alu_on := true; par_o := P_SUBU; par_w := 8;
-                           when 16#04# => par_v := par_shuf(S_PADSBH, 16, a128, b128, sa_f);
-                           when 16#12# => par_v := par_shuf(S_PEXTU,  32, a128, b128, sa_f);
-                           when 16#16# => par_v := par_shuf(S_PEXTU,  16, a128, b128, sa_f);
-                           when 16#1A# => par_v := par_shuf(S_PEXTU,   8, a128, b128, sa_f);
-                           when 16#1B# => par_v := par_shuf(S_QFSRV,   8, a128, b128, sa_f);
+                           when 16#04# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#12# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#16# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#1A# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
+                           when 16#1B# => par_v := par_shuf(d_shf_op, d_shf_w, a128, b128, sa_f);
                            when others => par_ok := false;
                         end case;
                      end if;
                      if par_alu_on then
-                        par_v := par_alu(par_o, a128, b128, par_w);
+                        -- The op and the width come from ID's decode, not from
+                        -- the arms above: those still run, and still say
+                        -- *whether* the ALU is used, but the two control lines
+                        -- that reach the carry chain now arrive from a flop.
+                        par_v := par_alu(d_par_op, a128, b128, d_par_w);
                      end if;
                      if par_ok then
-                        ex_val   := par_v(63 downto 0);
-                        ex_valhi := par_v(127 downto 64);
+                        c5_val   := par_v(63 downto 0);  ex_sel := 5;
+                        c5_valhi := par_v(127 downto 64);
                      else
                         ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                      end if;
@@ -1605,18 +2175,18 @@ begin
                   elsif fn = 16#09# then                     -- MMI2
                      case sa is
                         when 16#12# =>                       -- PAND
-                           ex_val   := a128(63 downto 0) and b128(63 downto 0);
-                           ex_valhi := a128(127 downto 64) and b128(127 downto 64);
+                           c5_val   := a128(63 downto 0) and b128(63 downto 0);  ex_sel := 5;
+                           c5_valhi := a128(127 downto 64) and b128(127 downto 64);
                         when 16#13# =>                       -- PXOR
-                           ex_val   := a128(63 downto 0) xor b128(63 downto 0);
-                           ex_valhi := a128(127 downto 64) xor b128(127 downto 64);
+                           c5_val   := a128(63 downto 0) xor b128(63 downto 0);  ex_sel := 5;
+                           c5_valhi := a128(127 downto 64) xor b128(127 downto 64);
                         when 16#0E# =>                       -- PCPYLD
-                           ex_val   := b128(63 downto 0);
-                           ex_valhi := a128(63 downto 0);
+                           c5_val   := b128(63 downto 0);  ex_sel := 5;
+                           c5_valhi := a128(63 downto 0);
                         when 16#0C# =>                       -- PMULTW
                            pmultw(mul_p(63 downto 0), mul2_p(63 downto 0),
                                   pv, plo, phi);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c5_val := pv(63 downto 0);  ex_sel := 5; c5_valhi := pv(127 downto 64);
                            ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
                            ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
                            ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
@@ -1629,7 +2199,7 @@ begin
                            -- onto a value one instruction out of date.
                            hmac(sa, hm_p, lo1_f & lo_f, hi1_f & hi_f,
                                 pv, plo, phi);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c5_val := pv(63 downto 0);  ex_sel := 5; c5_valhi := pv(127 downto 64);
                            ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
                            ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
                            ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
@@ -1655,47 +2225,47 @@ begin
                                      & dfix32(div_negr, div_rem(31 downto 0));
                         when 16#02# =>                       -- PSLLVW
                            pv := pshiftv('l', a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c5_val := pv(63 downto 0);  ex_sel := 5; c5_valhi := pv(127 downto 64);
                         when 16#03# =>                       -- PSRLVW
                            pv := pshiftv('r', a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c5_val := pv(63 downto 0);  ex_sel := 5; c5_valhi := pv(127 downto 64);
                         when 16#08# =>                       -- PMFHI
-                           ex_val := hi_f; ex_valhi := hi1_f;
+                           c5_val := hi_f;  ex_sel := 5; c5_valhi := hi1_f;
                         when 16#09# =>                       -- PMFLO
-                           ex_val := lo_f; ex_valhi := lo1_f;
+                           c5_val := lo_f;  ex_sel := 5; c5_valhi := lo1_f;
                         when 16#0A# =>                       -- PINTH
                            pv := perm_h("tstststs", (0,4,1,5,2,6,3,7), a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c5_val := pv(63 downto 0);  ex_sel := 5; c5_valhi := pv(127 downto 64);
                         when 16#1A# =>                       -- PEXEH
                            pv := perm_h("tttttttt", (2,1,0,3,6,5,4,7), a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c5_val := pv(63 downto 0);  ex_sel := 5; c5_valhi := pv(127 downto 64);
                         when 16#1B# =>                       -- PREVH
                            pv := perm_h("tttttttt", (3,2,1,0,7,6,5,4), a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                         when 16#1E# =>                       -- PEXEW
                            pv := perm_w((2,1,0,3), b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                         when 16#1F# =>                       -- PROT3W
                            pv := perm_w((1,2,0,3), b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                         when others =>
                            ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                      end case;
                   elsif fn = 16#29# then                     -- MMI3
                      case sa is
                         when 16#12# =>                       -- POR
-                           ex_val   := a128(63 downto 0) or b128(63 downto 0);
-                           ex_valhi := a128(127 downto 64) or b128(127 downto 64);
+                           c6_val   := a128(63 downto 0) or b128(63 downto 0);  ex_sel := 6;
+                           c6_valhi := a128(127 downto 64) or b128(127 downto 64);
                         when 16#13# =>                       -- PNOR
-                           ex_val   := not (a128(63 downto 0) or b128(63 downto 0));
-                           ex_valhi := not (a128(127 downto 64) or b128(127 downto 64));
+                           c6_val   := not (a128(63 downto 0) or b128(63 downto 0));  ex_sel := 6;
+                           c6_valhi := not (a128(127 downto 64) or b128(127 downto 64));
                         when 16#0E# =>                       -- PCPYUD
-                           ex_val   := a128(127 downto 64);
-                           ex_valhi := b128(127 downto 64);
+                           c6_val   := a128(127 downto 64);  ex_sel := 6;
+                           c6_valhi := b128(127 downto 64);
                         when 16#0C# =>                       -- PMULTUW
                            pmultw(mul_p(63 downto 0), mul2_p(63 downto 0),
                                   pv, plo, phi);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                            ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
                            ex_hi := phi(63 downto 0);  ex_hiu := phi(127 downto 64);
                            ex_lo := plo(63 downto 0);  ex_lou := plo(127 downto 64);
@@ -1712,14 +2282,14 @@ begin
                                  acc64 := acc64 + unsigned(mul_p(63 downto 0));
                                  ex_lo    := sext32(std_logic_vector(acc64(31 downto 0)));
                                  ex_hi    := sext32(std_logic_vector(acc64(63 downto 32)));
-                                 ex_val   := std_logic_vector(acc64);
+                                 c6_val   := std_logic_vector(acc64);  ex_sel := 6;
                               else
                                  acc64 := unsigned(hi1_f(31 downto 0))
                                           & unsigned(lo1_f(31 downto 0));
                                  acc64 := acc64 + unsigned(mul2_p(63 downto 0));
                                  ex_lou   := sext32(std_logic_vector(acc64(31 downto 0)));
                                  ex_hiu   := sext32(std_logic_vector(acc64(63 downto 32)));
-                                 ex_valhi := std_logic_vector(acc64);
+                                 c6_valhi := std_logic_vector(acc64);
                               end if;
                            end loop;
                            ex_hi_we := '1'; ex_lo_we := '1'; ex_wide := '1';
@@ -1736,7 +2306,7 @@ begin
                            ex_hiu := dfix('0', div2_rem(31 downto 0));
                         when 16#03# =>                       -- PSRAVW
                            pv := pshiftv('a', a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                         when 16#08# =>                       -- PMTHI
                            ex_we := '0'; ex_w128 := '0';
                            ex_hi_we := '1'; ex_wide := '1';
@@ -1747,16 +2317,16 @@ begin
                            ex_lo := a128(63 downto 0); ex_lou := a128(127 downto 64);
                         when 16#0A# =>                       -- PINTEH
                            pv := perm_h("tstststs", (0,0,2,2,4,4,6,6), a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                         when 16#1A# =>                       -- PEXCH
                            pv := perm_h("tttttttt", (0,2,1,3,4,6,5,7), a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                         when 16#1B# =>                       -- PCPYH
                            pv := perm_h("tttttttt", (0,0,0,0,4,4,4,4), a128, b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                         when 16#1E# =>                       -- PEXCW
                            pv := perm_w((0,2,1,3), b128);
-                           ex_val := pv(63 downto 0); ex_valhi := pv(127 downto 64);
+                           c6_val := pv(63 downto 0);  ex_sel := 6; c6_valhi := pv(127 downto 64);
                         when others =>
                            ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                      end case;
@@ -1764,8 +2334,23 @@ begin
                      ex_we := '0'; ex_w128 := '0'; ex_trap := true;
                   end if;
 
-               when 24 | 25 => ex_we := '1'; ex_rd := rt;    -- DADDI/DADDIU
-                  ex_val := std_logic_vector(signed(a) + simm);
+               when 24 | 25 =>                               -- DADDI/DADDIU
+                  wide64 := std_logic_vector(signed(a) + simm);
+                  if op = 24 and (a(63) = simm(63)) and (wide64(63) /= a(63)) then
+                     ex_exc := '1'; ex_code := EXC_OV;         -- and rt is left alone
+                  else
+                     ex_we := '1'; ex_rd := rt;
+                     c4_val := wide64;  ex_sel := 4;
+                  end if;
+
+               -- CACHE and PREF.  No register is written and there is no
+               -- cache here to operate on, so both retire as no-ops -- but they
+               -- have to decode.  The PlayStation 2's BIOS issues `cache`
+               -- constantly while it brings the machine up, and a core that
+               -- raises a reserved-instruction trap on one never reaches the
+               -- second screen.  This is a simplification of the memory
+               -- hierarchy rather than of the instruction set.
+               when 47 | 51 => null;                        -- CACHE, PREF
 
                when 32 | 33 | 35 | 36 | 37 | 39 | 55 =>      -- loads
                   ea := unsigned(signed(a) + simm);
@@ -1968,6 +2553,38 @@ begin
                   load_use := true;
                end if;
             end if;
+            -- A load whose value is still in flight now has one more stage to
+            -- cross. Loaded data appears in w_val and nowhere earlier -- A2 is
+            -- where the port answers, WB is where the value exists -- so with
+            -- EX2 in the way a consumer has to wait two cycles rather than one,
+            -- and the interlock has to see the load in EX2 as well as in A1.
+            --
+            -- Leaving this at one cycle lets the consumer read a stale register
+            -- exactly when the load is the instruction two ahead of it, which
+            -- is common enough that the directed hazard program finds it and
+            -- rare enough that plenty of random programs do not.
+            -- Any instruction in A1 will be in EX2 next cycle, and EX2 is not
+            -- a forwarding source. A consumer entering A1 next cycle therefore
+            -- has to wait one cycle, by which time the producer is in A2 and
+            -- m_val holds its value.
+            --
+            -- This is the bubble the whole two-stage execute is paid for with.
+            -- It costs one cycle on 15.3% of instructions, measured over 303,450
+            -- instructions of real compiled MIPS from a PlayStation 2 BIOS --
+            -- so the split has to clear 240.7 MHz before it returns anything at
+            -- all.
+            if d_valid = '1' and q_cnt > 0 and dest_of(d_ir) /= 0 then
+               if (reads_rs(id_ir) and id_rs = dest_of(d_ir)) or
+                  (reads_rt(id_ir) and id_rt = dest_of(d_ir)) then
+                  load_use := true;
+               end if;
+            end if;
+            if x_valid = '1' and x_isload = '1' and x_rd /= 0 and q_cnt > 0 then
+               if (reads_rs(id_ir) and id_rs = x_rd) or
+                  (reads_rt(id_ir) and id_rt = x_rd) then
+                  load_use := true;
+               end if;
+            end if;
 
             id_adv := a1_adv and q_cnt > 0 and not load_use;
 
@@ -2150,95 +2767,165 @@ begin
             end if;
 
             -- ============================================================
-            -- A1 -> A2
+            -- A1 -> EX2
             -- ============================================================
-            if a2_adv then
+            if ex2_adv then
                if a1_adv then
-                  m_valid  <= d_valid;   n_m_valid := d_valid;
-                  m_pc     <= d_pc;
-                  m_we     <= ex_we;     n_m_we    := ex_we;
-                  m_rd     <= ex_rd;     n_m_rd    := ex_rd;
-                  m_val    <= ex_valhi & ex_val;
-                  m_w128   <= ex_w128;
-                  m_p1     <= ex_p1;
-                  m_exc     <= ex_exc and d_valid;
-                  m_exc_code<= ex_code;
-                  m_eret    <= ex_eret and d_valid;
-                  m_bd      <= d_bd;
-                  m_c0_we  <= ex_c0_we and d_valid;
-                  m_c0_idx <= ex_c0_idx;
-                  m_c0_val <= ex_c0_val;
-                  m_hi_we  <= ex_hi_we;
-                  m_lo_we  <= ex_lo_we;
-                  m_sa_we  <= ex_sa_we;
-                  m_wide   <= ex_wide;
-                  m_hiu    <= ex_hiu;
-                  m_lou    <= ex_lou;
-                  m_sa     <= ex_sa;
-                  m_hi     <= ex_hi;
-                  m_lo     <= ex_lo;
-                  m_ismem  <= ex_ismem and d_valid;
-                  m_unal    <= ex_unal;
-                  m_unal_dw <= ex_unal_dw;
-                  m_unal_l  <= ex_unal_l;
-                  m_mbase   <= ex_mbase;
+                  x_valid  <= d_valid;   n_x_valid := d_valid;
+                  x_pc     <= d_pc;
+                  x_we     <= ex_we;     n_x_we    := ex_we;
+                  x_rd     <= ex_rd;     n_x_rd    := ex_rd;
+                  x_c1     <= c1_val;
+                  x_c2     <= c2_val;
+                  x_c3     <= c3_val;
+                  x_c4     <= c4_val;
+                  x_c5     <= c5_valhi & c5_val;
+                  x_c6     <= c6_valhi & c6_val;
+                  x_sel    <= ex_sel;   n_x_sel := ex_sel;
+                  x_w128   <= ex_w128;
+                  x_p1     <= ex_p1;
+                  x_exc     <= ex_exc and d_valid;
+                  x_exc_code<= ex_code;
+                  x_eret    <= ex_eret and d_valid;
+                  x_bd      <= d_bd;
+                  x_c0_we  <= ex_c0_we and d_valid;
+                  x_c0_idx <= ex_c0_idx;
+                  x_c0_val <= ex_c0_val;
+                  x_hi_we  <= ex_hi_we;
+                  x_lo_we  <= ex_lo_we;
+                  x_sa_we  <= ex_sa_we;
+                  x_wide   <= ex_wide;
+                  x_hiu    <= ex_hiu;
+                  x_lou    <= ex_lou;
+                  x_sa     <= ex_sa;
+                  x_hi     <= ex_hi;
+                  x_lo     <= ex_lo;
+                  x_ismem  <= ex_ismem and d_valid;
+                  x_unal    <= ex_unal;
+                  x_unal_dw <= ex_unal_dw;
+                  x_unal_l  <= ex_unal_l;
+                  x_mbase   <= ex_mbase;
                   if ex_take and d_valid = '1' then
-                     m_take <= '1';
+                     x_take <= '1';
                   else
-                     m_take <= '0';
+                     x_take <= '0';
                   end if;
-                  m_tgt    <= tgt;
-                  m_isload <= ex_isload;
-                  m_width  <= ex_width;
-                  m_sign   <= ex_sign;
-                  m_shift  <= ex_shift;
-                  -- A store is the one thing an exception cannot take back.
-                  -- Registers and HI/LO are still in latches when the exception
-                  -- commits, so invalidating those latches is enough for them;
-                  -- a store has already been handed to the memory port and is
-                  -- gone.  So an instruction older than this one that is about
-                  -- to raise -- sitting in A2 with m_exc set, one edge from
-                  -- committing -- has to stop the port request being issued at
-                  -- all, rather than being undone afterwards.
-                  --
-                  -- Found by a wide random campaign: an ADD overflowed, the
-                  -- store behind it should never have run, and it left a word in
-                  -- memory that no register trace could show, because a store
-                  -- writes no register.
-                  if d_valid = '1' and ex_ismem = '1'
-                     and m_exc = '0' and m_eret = '0'
-                     and w_exc = '0' and w_eret = '0' then
-                     d_addr <= ex_addr;
-                     if ex_isload = '1' then
-                        d_read <= '1';
-                     else
-                        d_write <= '1';
-                        d_be    <= ex_be;
-                        d_wdata <= ex_wdata;
-                     end if;
+                  if ex_annul and d_valid = '1' then
+                     x_annul <= '1';
+                  else
+                     x_annul <= '0';
                   end if;
+                  x_tgt    <= tgt;
+                  x_isload <= ex_isload;
+                  x_width  <= ex_width;
+                  x_sign   <= ex_sign;
+                  x_shift  <= ex_shift;
+                  x_addr   <= ex_addr;
+                  x_be     <= ex_be;
+                  x_wdata  <= ex_wdata;
                   if d_valid = '1' and ex_trap then
-                     traps <= traps + 1;
+                     x_trap <= '1';
+                  else
+                     x_trap <= '0';
                   end if;
                else
-                  m_valid <= '0';        n_m_valid := '0';
-                  m_ismem <= '0';
-                  m_unal  <= '0';
-                  m_we    <= '0';        n_m_we    := '0';
-                  m_hi_we <= '0';
-                  m_lo_we <= '0';
-                  m_sa_we <= '0';
-                  m_take  <= '0';
-                  m_c0_we <= '0';
-                  m_exc   <= '0';
-                  m_eret  <= '0';
+                  x_valid <= '0';        n_x_valid := '0';
+                  x_ismem <= '0';
+                  x_unal  <= '0';
+                  x_we    <= '0';        n_x_we    := '0';
+                  x_hi_we <= '0';
+                  x_lo_we <= '0';
+                  x_sa_we <= '0';
+                  x_take  <= '0';
+                  x_annul <= '0';
+                  x_trap  <= '0';
+                  x_c0_we <= '0';
+                  x_exc   <= '0';
+                  x_eret  <= '0';
+               end if;
+            end if;
+
+
+            -- ============================================================
+            -- EX2 -> A2
+            -- ============================================================
+            -- A straight copy-through in this form. The result mux has not
+            -- moved yet, so x_val already holds the final value and this stage
+            -- adds latency without adding work -- which is exactly what makes
+            -- it verifiable on its own.
+            if a2_adv then
+               m_valid   <= x_valid;   n_m_valid := x_valid;
+               m_pc      <= x_pc;
+               m_we      <= x_we;      n_m_we    := x_we;
+               m_rd      <= x_rd;      n_m_rd    := x_rd;
+               -- The whole result selection, in a stage of its own: six
+               -- inputs, one LUT level, and none of the arithmetic that used to
+               -- stand in front of it.
+               case x_sel is
+                  when 2      => m_val <= x_zero & x_c2;
+                  when 3      => m_val <= x_zero & x_c3;
+                  when 4      => m_val <= x_zero & x_c4;
+                  when 5      => m_val <= x_c5;
+                  when 6      => m_val <= x_c6;
+                  when others => m_val <= x_zero & x_c1;
+               end case;
+               m_w128    <= x_w128;
+               m_p1      <= x_p1;
+               m_exc     <= x_exc;
+               m_exc_code<= x_exc_code;
+               m_eret    <= x_eret;
+               m_bd      <= x_bd;
+               m_c0_we   <= x_c0_we;
+               m_c0_idx  <= x_c0_idx;
+               m_c0_val  <= x_c0_val;
+               m_hi_we   <= x_hi_we;
+               m_lo_we   <= x_lo_we;
+               m_sa_we   <= x_sa_we;
+               m_wide    <= x_wide;
+               m_sa      <= x_sa;
+               m_hi      <= x_hi;
+               m_lo      <= x_lo;
+               m_hiu     <= x_hiu;
+               m_lou     <= x_lou;
+               m_take    <= x_take;
+               m_annul   <= x_annul;
+               m_tgt     <= x_tgt;
+               m_ismem   <= x_ismem;
+               m_unal    <= x_unal;
+               m_unal_dw <= x_unal_dw;
+               m_unal_l  <= x_unal_l;
+               m_mbase   <= x_mbase;
+               m_isload  <= x_isload;
+               m_width   <= x_width;
+               m_sign    <= x_sign;
+               m_shift   <= x_shift;
+
+               -- A store is the one thing an exception cannot take back, so
+               -- the request is issued here, on the edge the instruction
+               -- enters A2, and only if nothing older is about to raise.
+               -- The guards read the stages ahead -- A2 and WB -- exactly as
+               -- they did when this lived one stage earlier.
+               if x_valid = '1' and x_ismem = '1'
+                  and m_exc = '0' and m_eret = '0' and m_annul = '0'
+                  and w_exc = '0' and w_eret = '0' then
+                  d_addr <= x_addr;
+                  if x_isload = '1' then
+                     d_read <= '1';
+                  else
+                     d_write <= '1';
+                     d_be    <= x_be;
+                     d_wdata <= x_wdata;
+                  end if;
+               end if;
+               if x_trap = '1' then
+                  traps <= traps + 1;
                end if;
             end if;
 
             -- ============================================================
             -- the multi-cycle units, stepped only when A1 may make progress
             -- ============================================================
-            if a2_adv and d_valid = '1' and is_muldiv(d_ir) then
+            if ex2_adv and d_valid = '1' and is_muldiv(d_ir) then
                pdiv   := is_pdiv(d_ir);
                pdivbw := is_pdivbw(d_ir);
                -- PMADDUW loads the multipliers exactly as PMULTUW does --
@@ -2430,13 +3117,30 @@ begin
                w_exc    <= '0';
                w_eret   <= '0';
                d_valid  <= '0';
+               -- EX2 holds an instruction younger than the one committing, so
+               -- it dies with the rest. Forgetting this stage is the whole risk
+               -- of adding it: everything else about a flush already worked.
+               x_valid  <= '0';       n_x_valid := '0';
+               x_ismem  <= '0';
+               x_we     <= '0';       n_x_we    := '0';
+               x_hi_we  <= '0';
+               x_lo_we  <= '0';
+               x_sa_we  <= '0';
+               x_c0_we  <= '0';
+               x_take   <= '0';
+               x_annul  <= '0';
+               x_exc    <= '0';
+               x_eret   <= '0';
+               x_trap   <= '0';
                m_valid  <= '0';       n_m_valid := '0';
                m_ismem  <= '0';
                m_exc    <= '0';
                m_eret   <= '0';
                m_take   <= '0';
+               m_annul  <= '0';
                m_c0_we  <= '0';
                redir_pend <= '0';
+               annul_pend <= '0';
                bd_pend    <= '0';
                exc_redir  <= '1';
                if exc_now then
@@ -2450,7 +3154,7 @@ begin
                else
                   exc_pc <= unsigned(cop0(C0_EPC));
                end if;
-            elsif a2_adv and m_valid = '1' and m_take = '1' then
+            elsif ex2_adv and x_valid = '1' and x_take = '1' then
                -- The branch is leaving A2.  Whatever is in A1 is its delay slot
                -- and must run; everything behind that is wrong-path and dies --
                -- including the instruction ID is holding, which is one more
@@ -2461,7 +3165,7 @@ begin
                   -- Already in A1.  Whatever ID is holding is wrong-path.
                   do_flush := true;
                   kill_id  := true;
-                  new_pc   := m_tgt;
+                  new_pc   := x_tgt;
                elsif id_adv then
                   -- Entering A1 on this very edge.  Flush everything behind it
                   -- but let it through -- killing it here, or deferring as if
@@ -2474,14 +3178,68 @@ begin
                   -- often makes true -- that late redirect re-fetches an
                   -- instruction already in the pipeline and executes it twice.
                   do_flush := true;
-                  new_pc   := m_tgt;
+                  new_pc   := x_tgt;
                else
                   -- Still in the fetch path: the queue ran dry and the reply is
                   -- in flight.  Flushing now would discard the delay slot
                   -- itself, so the redirect waits for it.
                   redir_pend <= '1';
-                  redir_tgt  <= m_tgt;
+                  redir_tgt  <= x_tgt;
                end if;
+            elsif ex2_adv and x_valid = '1' and x_annul = '1' then
+               -- A branch-likely that was not taken is leaving EX2, and its
+               -- delay slot must not run.  This is the exact mirror of the
+               -- m_take case above: there the slot survives and everything
+               -- behind it dies, here the slot dies and everything behind it
+               -- survives.  Nothing is redirected -- the instruction after the
+               -- annulled slot is already the next one in the fetch stream --
+               -- so there is no flush and no new_pc, which is what makes this
+               -- cheaper than a taken branch rather than more expensive.
+               --
+               -- The slot is in one of the same three places.
+               if d_valid = '1' then
+                  -- In A1, and moving into **EX2** on this very edge -- not A2,
+                  -- which is where it went before this stage existed. That
+                  -- transfer happened earlier in this process, so cancelling it
+                  -- means overriding what it just wrote, and it is the EX2
+                  -- latch that has to be overridden.
+                  --
+                  -- Cancelling A2's latch instead leaves the slot alive in EX2
+                  -- and it retires one cycle later: the symptom is a
+                  -- branch-likely that does not annul, which is what twelve of
+                  -- the fourteen regression failures were.
+                  --
+                  -- Everything EX2 could carry has to go, not just x_valid --
+                  -- a half-cancelled slot would still write HI/LO or COP0, and
+                  -- a store would still reach the port from EX2 next cycle.
+                  x_valid  <= '0';       n_x_valid := '0';
+                  x_we     <= '0';       n_x_we    := '0';
+                  x_ismem  <= '0';
+                  x_unal   <= '0';
+                  x_hi_we  <= '0';
+                  x_lo_we  <= '0';
+                  x_sa_we  <= '0';
+                  x_c0_we  <= '0';
+                  x_take   <= '0';
+                  x_exc    <= '0';
+                  x_eret   <= '0';
+                  x_trap   <= '0';
+               elsif id_adv then
+                  -- Entering A1 on this edge.  kill_id stops the ID -> A1
+                  -- transfer while the queue still pops, so the slot is
+                  -- consumed and discarded, which is precisely annulment.
+                  kill_id := true;
+               else
+                  -- Still in the fetch path.  Wait for it, the same way the
+                  -- redirect waits for a delay slot it must not discard.
+                  annul_pend <= '1';
+               end if;
+               x_annul <= '0';
+            elsif annul_pend = '1' and id_adv then
+               -- The slot to annul has reached ID at last.  Consume it without
+               -- letting it into A1.
+               kill_id    := true;
+               annul_pend <= '0';
             elsif redir_pend = '1' and id_adv then
                -- The delay slot has reached A1 at last.  It is the instruction
                -- entering A1 on this edge, so it is *not* killed -- only the
@@ -2497,6 +3255,10 @@ begin
                   d_valid <= '1';
                   d_pc    <= q_pc(0);
                   d_ir    <= id_ir;
+                  d_par_op <= par_decode(id_ir).op;
+                  d_par_w  <= par_decode(id_ir).w;
+                  d_shf_op <= shf_decode(id_ir).op;
+                  d_shf_w  <= shf_decode(id_ir).w;
                   d_a     <= id_a;
                   d_b     <= id_b;
                   d_rs    <= id_rs;      n_d_rs := id_rs;
@@ -2614,6 +3376,7 @@ begin
             -- fa_m of '1' overrides fa_w in A1 exactly as the nested ifs did.
             fa_m <= '0';  fb_m <= '0';
             fa_w <= '0';  fb_w <= '0';
+            fa_x <= '0';  fb_x <= '0';
             if n_w_valid = '1' and n_w_we = '1' and n_w_rd /= 0 then
                if n_w_rd = n_d_rs then fa_w <= '1'; end if;
                if n_w_rd = n_d_rt then fb_w <= '1'; end if;
@@ -2622,6 +3385,7 @@ begin
                if n_m_rd = n_d_rs then fa_m <= '1'; end if;
                if n_m_rd = n_d_rt then fb_m <= '1'; end if;
             end if;
+
          end if;
       end if;
    end process;

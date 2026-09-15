@@ -116,13 +116,32 @@ class Platform(XilinxUSPPlatform):
     default_clk_name   = "clk100"
     default_clk_period = 1e9/100e6
 
-    def __init__(self, toolchain="vivado"):
+    def __init__(self, toolchain="vivado", speed_grade="2LV"):
         # -2LV-e is what our shipped bitstreams were built with (build_sweep.tcl
         # defaults to it). The c1100.xdc header comment says -2L-e; the build
         # script is the one that actually produced silicon-tested images, so it
-        # wins. Speed grade changes the timing solution, so this is not cosmetic.
-        XilinxUSPPlatform.__init__(self, "xcu55n-fsvh2892-2LV-e", _io, _connectors,
-                                   toolchain=toolchain)
+        # is the default. Speed grade changes the timing solution, so this is
+        # not cosmetic.
+        #
+        # **The speed file has to match the rail the card is actually on.**
+        # -2LV characterises VCCINT at 0.72 V and -2L at 0.85 V, and the
+        # satellite controller can put the card on either. The two directions
+        # are not equally safe:
+        #
+        #   * -2LV while running at 0.85 V is *conservative* -- the silicon is
+        #     faster than the model and the reported slack understates the
+        #     margin. Wasteful, never wrong.
+        #   * -2L while running at 0.72 V is **unsafe**: the model says the
+        #     part is faster than it is, and a design that signs off clean can
+        #     fail on the bench.
+        #
+        # So a target asking for "2L" is asserting that whoever loads it will
+        # have set VCCINT to 850 mV first:
+        #
+        #     UltrascalePlusVoltageControl/changeVoltage.sh --vccint 850 --vccbram 850
+        assert speed_grade in ("2L", "2LV"), speed_grade
+        XilinxUSPPlatform.__init__(self, f"xcu55n-fsvh2892-{speed_grade}-e",
+                                   _io, _connectors, toolchain=toolchain)
 
     def create_programmer(self):
         return VivadoProgrammer()

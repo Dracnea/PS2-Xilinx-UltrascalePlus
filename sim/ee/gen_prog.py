@@ -70,9 +70,12 @@ def emit(rng, kind, branches):
     sa = rng.randrange(32)
 
     if kind == "special":
-        fn = rng.choice([0, 2, 3, 4, 6, 7, 16, 18, 24, 25, 26, 27,
+        # 44 and 46 are DADD and DSUB, the trapping halves of the doubleword
+        # pairs.  They were missing while only DADDU and DSUBU were emitted,
+        # which is part of why nothing noticed that neither of them trapped.
+        fn = rng.choice([0, 2, 3, 4, 6, 7, 10, 11, 15, 16, 18, 24, 25, 26, 27,
                          32, 33, 34, 35, 36, 37, 38, 39, 42, 43,
-                         45, 47, 56, 58, 59, 60, 62, 63])
+                         44, 45, 46, 47, 56, 58, 59, 60, 62, 63])
         return (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | fn
 
     if kind == "imm":
@@ -80,7 +83,11 @@ def emit(rng, kind, branches):
         return (op << 26) | (rs << 21) | (rd << 16) | rng.randrange(0x10000)
 
     if kind == "store":
-        op = rng.choice([40, 41, 43, 63])
+        # 47 and 51 are CACHE and PREF.  They have a store's shape -- base
+        # register, offset, no destination -- and write nothing, so emitting
+        # them here exercises their decode without disturbing the memory image
+        # the comparison depends on.
+        op = rng.choice([40, 41, 43, 63, 47, 51])
         off = SCRATCH + rng.randrange(0, 0x400, 8)
         return (op << 26) | (0 << 21) | (rt << 16) | (off & 0xFFFF)
 
@@ -168,7 +175,12 @@ def emit(rng, kind, branches):
         if branches:
             # only ever forward, only ever a couple of instructions, so the
             # program cannot leave itself
-            op = rng.choice([4, 5, 6, 7])
+            # 20..23 are the likely forms.  Random coverage matters more for
+            # these than for the ordinary branches, because annulment has to
+            # find the delay slot wherever it happens to be -- already in A1,
+            # entering it, or still in the fetch queue -- and only a random
+            # program run against slow memories reaches the third case.
+            op = rng.choice([4, 5, 6, 7, 20, 21, 22, 23])
             return (op << 26) | (rs << 21) | (rt << 16) | rng.choice([1, 2])
         return 0x00000020 | (rs << 21) | (rt << 16) | (rd << 11)     # ADD
 
