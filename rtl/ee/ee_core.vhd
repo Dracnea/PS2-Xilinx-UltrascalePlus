@@ -217,6 +217,22 @@ architecture arch of ee_core is
 
    -- ---- ID/A1 --------------------------------------------------------------
    signal d_valid   : std_logic := '0';
+   -- A delay slot that must be annulled but cannot leave A1 yet.
+   --
+   -- Annulment cancels the slot in whichever of three places it is, and the
+   -- first of those -- "in A1, and moving into EX2 on this very edge" -- was
+   -- assumed rather than tested. A1 advances only when
+   -- `a1_adv := a2_adv and not ex_busy`, and a multiply or divide in the slot
+   -- holds ex_busy for the length of its run. On that edge the slot does not
+   -- move: the A1 -> EX2 transfer sends a bubble, the annul cancels that
+   -- bubble, and the slot stays in A1 and finishes. A BGTZL on r0 -- never
+   -- taken -- with a DIVU in its slot wrote HI and LO the model never wrote.
+   --
+   -- So the decision is carried instead, the way annul_pend, redir_pend and
+   -- x_annul each carry one until the edge that can act on it. Set while the
+   -- slot is stuck, it makes the A1 -> EX2 transfer send a bubble whenever the
+   -- slot finally moves, however many cycles that takes.
+   signal d_annul   : std_logic := '0';
    signal d_pc      : unsigned(31 downto 0) := (others => '0');
    signal d_ir      : std_logic_vector(31 downto 0) := (others => '0');
    signal d_a, d_b  : std_logic_vector(127 downto 0) := (others => '0');
@@ -1491,6 +1507,7 @@ begin
             redir_pend <= '0';
             q_cnt      <= 0;
             d_valid    <= '0';
+            d_annul    <= '0';
             -- **EX2 has to be cleared here too.**
             --
             -- The flush path clears this stage and says why: "EX2 holds an
@@ -2843,6 +2860,39 @@ begin
                   x_exc   <= '0';
                   x_eret  <= '0';
                end if;
+
+               -- A slot marked annulled leaves A1 as a bubble.
+               --
+               -- **Where this test goes is worth 164 ps of the clock.** Putting
+               -- `d_annul` into the transfer's own condition above reads more
+               -- naturally and costs the whole EX2 latch: x_c1..x_c6 are the
+               -- forwarding candidates, the widest registers in the stage, and
+               -- adding a term to their enable put w_val -> x_c2 and
+               -- w_val -> x_c4 over the line. Sign-off went from +0.070 ns with
+               -- zero violated paths to -0.094 with ten, all of them on those
+               -- two nets.
+               --
+               -- Overriding afterwards costs one gate on each *narrow* control
+               -- signal and nothing on the wide ones, which still transfer --
+               -- harmlessly, because x_valid = '0' is what makes this a bubble.
+               -- It is also the idiom the annul dispatch already uses on this
+               -- same latch: cancelling a transfer by overriding what it just
+               -- wrote.
+               if a1_adv and d_annul = '1' then
+                  x_valid <= '0';        n_x_valid := '0';
+                  x_ismem <= '0';
+                  x_unal  <= '0';
+                  x_we    <= '0';        n_x_we    := '0';
+                  x_hi_we <= '0';
+                  x_lo_we <= '0';
+                  x_sa_we <= '0';
+                  x_take  <= '0';
+                  x_annul <= '0';
+                  x_trap  <= '0';
+                  x_c0_we <= '0';
+                  x_exc   <= '0';
+                  x_eret  <= '0';
+               end if;
             end if;
 
 
@@ -3100,6 +3150,7 @@ begin
                new_pc     := exc_pc;
                exc_redir  <= '0';
                d_valid    <= '0';
+               d_annul <= '0';
             elsif exc_now or eret_now then
                -- Everything younger than the committing instruction is in a
                -- latch, so invalidating those latches is the whole flush; there
@@ -3117,6 +3168,7 @@ begin
                w_exc    <= '0';
                w_eret   <= '0';
                d_valid  <= '0';
+               d_annul <= '0';
                -- EX2 holds an instruction younger than the one committing, so
                -- it dies with the rest. Forgetting this stage is the whole risk
                -- of adding it: everything else about a flush already worked.
@@ -3197,7 +3249,14 @@ begin
                -- cheaper than a taken branch rather than more expensive.
                --
                -- The slot is in one of the same three places.
-               if d_valid = '1' then
+               if d_valid = '1' and not a1_adv then
+                  -- In A1 and going nowhere: a multiply or divide is running in
+                  -- the slot itself, and ex_busy holds A1 until it finishes.
+                  -- The EX2 latch took a bubble on this edge, so cancelling it
+                  -- cancels nothing -- the slot is still behind us. Mark it and
+                  -- let the transfer drop it whenever it finally moves.
+                  d_annul <= '1';
+               elsif d_valid = '1' then
                   -- In A1, and moving into **EX2** on this very edge -- not A2,
                   -- which is where it went before this stage existed. That
                   -- transfer happened earlier in this process, so cancelling it
@@ -3250,6 +3309,11 @@ begin
             end if;
 
             if a1_adv then
+               -- Whatever was in A1 is leaving, so its annul mark leaves with
+               -- it. Safe against the branch above because the two are mutually
+               -- exclusive on a1_adv: the mark is only ever set when A1 is
+               -- stalled, and this runs only when it is not.
+               d_annul <= '0';
                br_leaving := (d_valid = '1' and is_branch(d_ir));
                if id_adv and not kill_id then
                   d_valid <= '1';

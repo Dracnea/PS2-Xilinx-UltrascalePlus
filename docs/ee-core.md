@@ -2972,3 +2972,73 @@ report attached — which is why both land on exactly +0.070, and why v5's
 -0.032 is the regression rather than the baseline. On the card v6 repeats v4
 exactly: 48 of 48, 100 of 100, 40 of 40, 60 of 60 and 120 of 120, at
 294.9102 MHz and 851 mV.
+
+### The annul fix: carrying the decision — 2026-09-15
+
+The bug was a missing handshake test, so the fix is a missing case rather than a
+missing write-enable. Annulment dispatches on where the delay slot is when the
+branch-likely leaves EX2, and it knew three places: moving into EX2, entering
+A1, still in the fetch queue. There is a fourth — **in A1 and going nowhere** —
+because `a1_adv := a2_adv and not ex_busy` and a multiply or divide in the slot
+holds `ex_busy` for the length of its run.
+
+`d_annul`, a bit in the ID/A1 latch, carries the decision across that stall:
+
+- the dispatch tests `d_valid = '1' and not a1_adv` **first** and sets the mark;
+- the A1 -> EX2 transfer sends a bubble when the mark is set, taking the branch
+  that already clears everything EX2 can carry;
+- the mark is cleared when A1 advances, carrying it off with the instruction it
+  belongs to.
+
+The two paths are mutually exclusive on `a1_adv` — the mark is only set when A1
+is stalled, and the clear only runs when it is not — which is what makes it
+safe that the clear appears later in the process than the set.
+
+**It is cleared in the reset branch and in both flush paths.** That is not a
+detail: forgetting exactly that for `x_valid` is what produced the EX2 reset
+bug, and a new latch bit added without it would have been the same bug again in
+a new place.
+
+Verified in simulation:
+
+| test | before | after |
+|---|---|---|
+| `BGTZL r0` + `DIVU` in the slot | `hi=2, lo=0xe` — executed | **annulled** |
+| `BGTZL r0` + `MULT` in the slot | executed | **annulled** |
+| `BGTZL r0` + `ADDIU` in the slot | annulled | annulled |
+| seed 34 | FAIL | **PASS** |
+| forty-seed sweep | 39 of 40 | **40 of 40** |
+| `run_bringup_diff.sh` | PASS | PASS |
+
+**Confirmed on the card.** v8 carries the fix at the console's 294.912 MHz,
+measured at 294.9099 MHz with the rail at 850 mV. The same three slot types,
+twenty-five releases each, with `MFLO` and `MFHI` bringing HI and LO back into
+registers the debug port can read:
+
+| slot | card |
+|---|---|
+| `DIVU` | 25 of 25 annulled — LO and HI both zero |
+| `MULT` | 25 of 25 annulled |
+| `ADDIU` | 25 of 25 annulled |
+
+and the five reset-fault harnesses are unchanged at 368 of 368, so nothing
+regressed. Those five do not generate a branch-likely with a multiply or divide
+in its slot, which is why the three programs above exist: without them the card
+run would only have shown the absence of a regression, not the presence of the
+fix.
+
+**Where the test goes cost 164 ps.** The first form of this fix put `d_annul`
+into the A1 -> EX2 transfer's own condition, which reads more naturally and
+gates the widest registers in the stage — `x_c1..x_c6`, the forwarding
+candidates. Sign-off went from +0.070 ns with no violated paths to **-0.094
+with ten**, all of them on `w_val -> x_c2` and `w_val -> x_c4`. Overriding the
+narrow control bits after the transfer instead costs one gate on each and
+nothing on the wide ones, which still transfer harmlessly because `x_valid =
+'0'` is what makes a bubble. That is also the idiom the annul dispatch already
+uses on this same latch.
+
+The rebuilt image signs off at **+0.135 ns with no violated paths**. That is
+better than the +0.070 of the build before it, and the honest reading is not
+that the fix bought margin: adding a latch bit moves placement, and this build
+routed better. What can be claimed is that the change is timing-neutral once
+the test is off the wide latch's enable.
