@@ -99,23 +99,42 @@ class _EECRG(LiteXModule):
         platform.toolchain.pre_placement_commands.append(
             "set_clock_uncertainty -setup 0.450 "
             "[get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT0]]")
-        # **Zero before routing, as the GS target does it.**
+        # **The inflated target is an optimisation goal, not a claim.**
         #
-        # For a while this target kept 0.150 ns applied through routing instead,
-        # on the theory that a card failing about one run in eight while passing
-        # every simulation was a design with no real margin. That theory was
-        # wrong: the failure was `x_valid` surviving reset, and it was
-        # indifferent to margin, to the clock and to the rail. Keeping the
-        # inflated target after the cause was found bought nothing and made a
-        # working design report WNS -0.080 with ten violated paths that really
-        # had +0.070 ns -- a sign-off that has to be explained before it can be
-        # read is worse than one that is simply true.
+        # These two things were once tangled together and have to be kept apart.
+        # The *diagnosis* that this design's card failures came from thin timing
+        # margin was wrong -- they were `x_valid` surviving reset, indifferent to
+        # margin, to the clock and to the rail. But the *technique* the wrong
+        # diagnosis came wrapped in is sound and this design needs it: the router
+        # stops the moment it reaches its target, so a target of zero produces a
+        # design that just barely does not make it.
         #
-        # So sign-off is told the truth again. The clock is untouched either
-        # way: the MMCM produces 294.912 MHz throughout.
+        # Measured, at 294.912 MHz on this netlist:
+        #
+        #   uncertainty through routing   reported WNS   real slack
+        #   0.150 ns                      -0.080         +0.070
+        #   0.000 ns                      -0.032         -0.032
+        #
+        # Dropping the goal to zero cost 100 ps of real margin and left ten
+        # genuinely violated paths, the worst from the memory's read port into
+        # the writeback register. So the goal stays at 0.150 through routing.
+        #
+        # Sign-off still gets to be honest, because the two can be separated:
+        # bitstream_commands run after report_timing_summary has written the
+        # build's own report, so relaxing the constraint there and reporting
+        # again produces `*_timing_signoff.rpt` -- the same routed design
+        # measured against the real 294.912 MHz, with nothing added. Read that
+        # file for the truth and the build's own report for what the router was
+        # chasing. The MMCM produces 294.912 MHz throughout either way.
         platform.toolchain.pre_routing_commands.append(
+            "set_clock_uncertainty -setup 0.150 "
+            "[get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT0]]")
+        platform.toolchain.bitstream_commands.append(
             "set_clock_uncertainty -setup 0.000 "
             "[get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT0]]")
+        platform.toolchain.bitstream_commands.append(
+            "report_timing_summary -datasheet -max_paths 10 "
+            "-file {build_name}_timing_signoff.rpt")
 
         # ---- the SLR1 floorplan, tried and reverted ------------------------
         #

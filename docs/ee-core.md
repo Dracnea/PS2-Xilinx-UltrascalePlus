@@ -2860,3 +2860,115 @@ means a working design reads as VIOLATED. The next build of this target should
 go back to the GS convention -- full uncertainty through placement, zero before
 routing -- so that sign-off reports the truth about a design that no longer
 needs flattering.
+
+### Known bug: a branch-likely does not annul a multiply or divide — 2026-09-15
+
+Found by sweeping forty seeds through `run_diff.sh` rather than the single
+program the harness runs by default. Two of the forty disagree with the
+reference, and they are **not** the same fault.
+
+**Seed 34 is a real RTL bug**, and the mechanism is a stage handshake rather
+than a missing write-enable. `BGTZL` at `0x120` reads `r0`, so it is never taken
+and its delay slot must be annulled; the slot at `0x124` is a `DIVU`. The
+reference skips it; the RTL retires it.
+
+Reduced to four instructions, the failure is unambiguous. `ADDIU r1,r0,100`,
+`ADDIU r2,r0,7`, `BGTZL r0,+2`, then the slot, then `MFLO`/`MFHI`:
+
+| slot | result |
+|---|---|
+| `ADDIU r5,r0,0x55` | **annulled correctly** |
+| `MULT r1,r2` | executed |
+| `DIVU r1,r2` | executed — `hi=2, lo=0xe`, which is 100 ÷ 7 = 14 remainder 2 |
+
+Only multiplies and divides are affected, and that says where to look.
+Annulment dispatches on where the slot is when the branch acts in A2:
+
+```vhdl
+if d_valid = '1' then          -- "in A1, and moving into EX2 on this very edge"
+   x_valid <= '0'; x_we <= '0'; x_hi_we <= '0'; ...   -- override the EX2 latch
+elsif id_adv then      kill_id := true;
+else                   annul_pend <= '1';
+```
+
+The first branch is not wrong about *what* to clear — it clears everything EX2
+can carry, deliberately, and its comment says why. It is wrong about *whether
+the slot is going there*. A1 advances only when
+
+```vhdl
+ex_busy := d_valid = '1' and is_muldiv(d_ir) and ex_cnt /= 1;
+a1_adv  := a2_adv and not ex_busy;
+```
+
+so a multiply or divide in the slot holds A1 for the length of its run. On that
+edge `a1_adv` is false: the slot stays in A1, and the A1 -> EX2 transfer fills
+EX2 with a bubble (`else x_valid <= '0'`). The annul then clears that bubble —
+harmless, and useless — while the slot itself is never annulled at all. It
+finishes its divide and writes HI and LO.
+
+**So the fix is not to gate the writeback enables on annul, and not to clear the
+`x_*` we-bits.** Both are already done. The defect is the missing `a1_adv` test
+and the absent fourth case: *the slot is in A1 and is not moving*. Two ways to
+close it:
+
+- **Carry the decision (preferred).** Add an annul bit to the ID/A1 latch, set
+  it in the new `d_valid = '1' and not a1_adv` case, and force every we-bit to
+  zero on the A1 -> EX2 transfer when it is set. This is the pattern the design
+  already uses three times — `annul_pend`, `redir_pend`, `x_annul` all exist to
+  carry a decision until the edge that can act on it — and it is indifferent to
+  how many cycles the stall lasts. It must be added to the reset branch and the
+  flush path, which is the mistake that produced the EX2 reset bug.
+- **Cancel the slot in A1.** Clearing `d_valid` drops `ex_busy`, releases the
+  stall and lets a bubble through. Simpler to write, but it abandons the
+  multi-cycle unit mid-run: `ex_cnt` is left wherever it was, and the next
+  multiply or divide sees a stale count. It needs `ex_cnt` unwound with it, and
+  that sequencing is the risky part.
+
+**Seed 21 is not a bug, it is the generator.** `BLEZL` at `0x244` has another
+`BLEZL` at `0x248` in its delay slot. A branch in a branch delay slot is
+architecturally undefined on MIPS, so model and RTL are both free to do as they
+like and neither is wrong. `gen_prog.py` should not emit it — a random program
+that tests undefined behaviour tests nothing, and a failure there costs the time
+of a real one. One such pair in forty seeds.
+
+Neither is the EX2 reset fault and neither is affected by it: reconstructing the
+pre-fix core and running both seeds against it fails identically. They were
+always there; the default harness runs one program and never met them.
+
+### Sign-off that does not have to be explained — 2026-09-15
+
+Three builds settled how this target should be constrained, and the middle one
+was the informative failure.
+
+| build | uncertainty through routing | reported WNS | **real slack** | card |
+|---|---|---|---|---|
+| v4 | 0.150 ns | -0.080 | **+0.070** | 0 of 368 |
+| v5 | 0.000 ns | -0.032 | **-0.032** | not loaded |
+| v6 | 0.150 ns, then re-reported at 0.000 | -0.080 / **0 violated** | **+0.070** | **0 of 368** |
+
+v5 was built to restore the GS target's convention — full uncertainty through
+placement, zero before routing, so that sign-off reports the truth. It reported
+the truth and the truth was worse: ten genuinely violated paths, the worst from
+the memory's read port into the writeback register, and 100 ps of real margin
+gone. The router stops when it reaches its target, so a target of zero produces
+a design that only just fails to make it.
+
+The mistake behind v5 was treating one idea as two halves of the same claim.
+The *diagnosis* that thin margin caused the card failures was wrong. The
+*technique* it came wrapped in — give the router a goal it cannot quite reach —
+is sound, and this design needs it. Removing both when only the first was wrong
+cost a working timing result.
+
+v6 keeps them apart, and nothing had to be traded. `bitstream_commands` run
+after Vivado has written the build's own report, so the goal stays at 0.150 ns
+through routing and the constraint is then relaxed and the design reported
+again into `*_timing_signoff.rpt`. Two reports with different jobs: the build's
+own shows what the router was chasing, the sign-off report is what the design
+is. Same netlist, measured twice, and the honest one says **0 violated paths,
+WNS +0.070, WHS +0.006**.
+
+v6 and v4 share every constraint through routing, so v6 is v4 with a truthful
+report attached — which is why both land on exactly +0.070, and why v5's
+-0.032 is the regression rather than the baseline. On the card v6 repeats v4
+exactly: 48 of 48, 100 of 100, 40 of 40, 60 of 60 and 120 of 120, at
+294.9102 MHz and 851 mV.
