@@ -90,6 +90,26 @@ is 35 % of the C1100 and **70 % of the FK33**, and 128 of the 224 are the 4 MB
 BIOS ROM. The Graphics Synthesizer's local memory is another 128. Both cards
 have unused HBM, which is where those two are likely to end up.
 
+## Related projects and dependencies
+
+Nothing here is a submodule except PSX_MiSTer; the rest are tools you install or
+clone beside this repository.
+
+| | what it is | needed for |
+|---|---|---|
+| [UltraScale+ Voltage Control](https://github.com/Dracnea/UltrascalePlusVoltageControl) | sets VCCINT / VCCBRAM / VCCMEM on a C1100 / U55N from the host and confirms the result on the die | **the Emotion Engine images.** They are built against the `-2L` speed file, which characterises VCCINT at 0.85 V, and the card does not ship there |
+| [PSX_MiSTer](https://github.com/MiSTer-devel/PSX_MiSTer) | the R3000A, SPU, timers and memory controller the IOP reuses | the IOP, as `third_party/PSX_MiSTer` |
+| [LiteX](https://github.com/enjoy-digital/litex) + [LitePCIe](https://github.com/enjoy-digital/litepcie) | SoC, PCIe transport and the CSR bank every host tool talks to | every image |
+| Vivado 2026.1 | synthesis, place and route, JTAG programming | building and loading images |
+
+**The voltage dependency is not optional and not cosmetic.** A speed file
+describes silicon at a stated voltage, so building against `-2L` and running the
+card at its lower default means the timing sign-off is describing a part faster
+than the one in the slot. `boards/c1100_ee.py` names the rail it needs, and
+[docs/user-guide.md](docs/user-guide.md) gives the order to set it in — the rail
+first, because the setpoint is global and survives reconfiguration, so the card
+keeps whatever it was last told until something tells it otherwise.
+
 ## BIOS and disc images
 
 None are in this repository and none ever will be. A PS2 BIOS is Sony's, and

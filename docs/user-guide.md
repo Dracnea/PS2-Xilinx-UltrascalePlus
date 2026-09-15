@@ -27,6 +27,10 @@ are in the linked pages.
 - **To load bitstreams:** Vivado, or the free **Vivado Lab Edition**, on PATH.
   Nothing else is needed to use the prebuilt images in `bitstreams/`.
 - **To build them:** Vivado 2026.1 and a LiteX virtualenv (README.md).
+- **For the Emotion Engine images only:** a way to set VCCINT, and a card whose
+  satellite controller runs firmware that allows it. See *Setting the rail*
+  below — without it the EE images will load and run, and will fail
+  intermittently in a way that looks like anything but a voltage problem.
 - **Your own PS2 BIOS**, dumped from your own console. It is not in this
   repository and is not downloaded from anywhere.
 
@@ -84,6 +88,71 @@ Width x4`, and `Region 0: Memory at ... (64-bit, prefetchable) [size=128K]`.
 that is the host's memory window, not the card — the whole investigation is in
 [c1100-pcie-transport.md](c1100-pcie-transport.md). Every image here declares
 its BAR 64-bit prefetchable for that reason.
+
+## Setting the rail — required for the Emotion Engine images
+
+The IOP and GS images run at the card's default VCCINT and need nothing here.
+**The EE images do not.** They are built against the `-2L` speed file, which
+characterises VCCINT at **0.85 V**, and the C1100's default is 0.800 V. A speed
+file describes silicon at a stated voltage, so running below it means the timing
+sign-off is describing a faster part than the one in your slot.
+
+Setting rails needs [UltraScale+ Voltage
+Control](https://github.com/Dracnea/UltrascalePlusVoltageControl), and a card
+whose satellite controller runs extended firmware — stock firmware has no
+rail-setting command and will refuse. That tool is a separate repository;
+clone it beside this one.
+
+The order matters, because setting a rail programs a bridge bitstream over JTAG
+and JTAG programming drops a live PCIe link:
+
+```sh
+# 1. off the bus first -- programming under a bound driver gives you bus errors
+echo 1 | sudo tee /sys/bus/pci/devices/0000:c1:00.0/remove
+
+# 2. the rail (your PCI address may differ; lspci -d 10ee: finds it)
+../UltrascalePlusVoltageControl/changeVoltage.sh --vccint 850 --vccbram 850
+
+# 3. the image, and back on the bus with its matching driver
+sudo tools/reload.sh c1100_ee
+```
+
+**The setpoint is global and it survives reconfiguration.** The card keeps
+whatever it was last told, across bitstream loads and across reboots of the
+host, until something tells it otherwise. So a rail moved for one experiment is
+still moved for the next thing you load — check it rather than assume it. The
+tool prints SYSMON before and after and confirms the value on the die, and
+`tools/reload.sh` prints the rails on its way through.
+
+If you have no way to set the rail, build the EE yourself against the speed file
+that matches the voltage you can actually run at, rather than running a `-2L`
+image at 0.800 V. `boards/c1100_ee.py` takes the speed grade from
+`platforms/xilinx_c1100.py`, where `-2LV` is 0.72 V and `-2L` is 0.85 V.
+
+## Running a program on the Emotion Engine
+
+The EE image is a bring-up target: an R5900 with its own memory, loaded and
+driven from the host, with no VU, no GS and no BIOS behind it. It exists to
+prove the core executes what the reference model says it should.
+
+```sh
+# what clock the core is actually running at
+python3 tools/ee/eerun.py --csr build/c1100_ee/csr.csv --clock
+
+# run a program and diff the final register state against the model
+python3 tools/ee/eerun.py --csr build/c1100_ee/csr.csv --prog prog.hex --compare
+```
+
+`--clock` is worth running first and on its own. It reports whether both PS2
+MMCMs locked and what `cd_ee` measures; if the clock tree did not lock, nothing
+else on the page means anything.
+
+**Diagnostic flag:** `boards/c1100_ee.py --ee-div 8` halves the EE clock to
+147.456 MHz instead of the console's 294.912. It is for telling one class of
+fault from another and not for anything that ships — a setup-timing problem goes
+away when the period doubles, and a hold violation or a logic fault does not
+care. A build made with it will fail `--clock`, correctly, because that check
+hard-compares against the console's rate.
 
 ## Driving the card with no driver and no root
 

@@ -102,6 +102,66 @@ log and invisible in the result.
 - These are passively cooled datacenter cards. Watch temperatures in a desktop
   chassis.
 
+## 6a. A fault that answers to nothing physical is not a timing fault
+
+The EE bring-up spent days being treated as a timing problem because it looked
+exactly like one: intermittent, about one release in five, structured, and
+passing every simulation. It was `x_valid` — the EX2 stage's valid bit — not
+being cleared by reset, so releasing reset started the pipeline holding whatever
+EX2 contained when the *previous* run was stopped.
+
+The way to have found it sooner is a rule, not a hunch:
+
+- **Change one physical quantity and see if the fault notices.** Implementation
+  directives, clock uncertainty, the clock itself (`--ee-div 8` halves it), and
+  the rail are four independent knobs. The failure rate did not move for any of
+  them — 26 of 100 at 294.912 MHz and 850 mV, 23 of 100 at 147.456 MHz, 20 of
+  100 at 720 mV. Setup timing scales with the period; hold does not, but hold
+  scales with voltage. Something indifferent to *both* is logic.
+- **Extra margin making the card worse is a redirect, not noise.** The build
+  with 0.150 ns of real margin failed twice as often as the one with none. That
+  was the moment to stop building bitstreams and start reading RTL.
+- **A passing simulation may be answering a narrower question than you asked.**
+  The testbench released reset once, from configuration, where every flop holds
+  its declaration value. Nine of nine passing said "one release from a clean
+  pipeline works" — never "reset clears the pipeline". A fault that needs a
+  *previous* run to leave state behind is invisible to that shape of test.
+- **When reset is suspect, diff the reset branch against the flush path.** Both
+  exist to put the pipeline in a known state and they should clear the same
+  set. Here the flush cleared EX2 and reset did not, and the flush's own comment
+  named the risk. `grep` for every signal assigned in the clocked process and
+  subtract the ones the reset branch clears; the survivors are the candidates.
+
+Corollary for measurement, and it is the same lesson as §4: **a re-test that
+disturbs the thing being tested proves nothing.** An experiment here "re-read
+the registers after a failing run and got correct values", which was read as
+clearing the core — but it pulsed reset between the reads, so it had re-run the
+program. Reading three times without touching reset gave the same wrong values
+every time, and the opposite conclusion.
+
+## 6b. The rail is part of the build, and it is sticky
+
+The EE images are built against the `-2L` speed file, which characterises
+VCCINT at 0.85 V; the C1100's default is 0.800 V. A speed file describes silicon
+at a stated voltage, so a `-2L` image at 0.800 V is signed off against a faster
+part than the one in the slot.
+
+- **Setting a rail needs a separate tool**, [UltraScale+ Voltage
+  Control](https://github.com/Dracnea/UltrascalePlusVoltageControl), and a card
+  whose satellite controller runs extended firmware. It is not in this
+  repository.
+- **The setpoint is global and survives reconfiguration and host reboots.** A
+  rail moved for one experiment is still moved for the next thing loaded. Read
+  it rather than assume it — `tools/reload.sh` prints the rails on the way
+  through, and the voltage tool confirms on the die with SYSMON.
+- **A recorded voltage goes stale.** `docs/ps2-hardware-study.md` said the card
+  sat at 0.800 V for three days after it had been moved to 0.851 V, and that
+  stale line sent one investigation down a wrong path. Any voltage written into
+  a document should carry the date it was read.
+- Reading the rail needs a JTAG session, which drops PCIe. There is no on-chip
+  monitor exposed over PCIe in these images, so the cheap moment to read it is
+  during a reload you were doing anyway.
+
 ## 7. Licence
 
 The IOP derives from PSX_MiSTer, so **the work as a whole is GPL-2.0** — see
