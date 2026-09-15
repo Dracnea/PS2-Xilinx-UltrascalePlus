@@ -195,11 +195,30 @@ def gen(rng, n, branches, census=None):
     for r in range(8, 12):
         out.append(0x3C000000 | (r << 16) | rng.randrange(0x10000))         # lui
     kinds, weights = list(MIX), list(MIX.values())
+    # **A branch must never land in a branch delay slot.**
+    #
+    # MIPS leaves that case architecturally undefined, so the reference model
+    # and the RTL are both free to do as they like and neither can be called
+    # wrong. A generated program that contains one tests nothing and costs the
+    # time of a real failure: a forty-seed sweep produced exactly one such pair,
+    # and chasing it took longer than the genuine bug in the same sweep.
+    #
+    # "tail" is the only kind that emits a branch, and only when `branches` is
+    # set -- without it the same kind emits an ADD, which is why the guard tests
+    # both. Re-drawing rather than substituting keeps the mix as MIX declares it
+    # for every instruction that is allowed to be a branch.
+    prev_branch = False
     while len(out) < n:
         kind = rng.choices(kinds, weights)[0]
+        if prev_branch:
+            guard = 0
+            while branches and kind == "tail" and guard < 100:
+                kind = rng.choices(kinds, weights)[0]
+                guard += 1
         if census is not None:
             census[kind] = census.get(kind, 0) + 1
         out.append(emit(rng, kind, branches))
+        prev_branch = branches and kind == "tail"
     return out[:n]
 
 
