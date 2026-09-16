@@ -5,9 +5,12 @@ accelerator cards rather than the Intel parts the MiSTer/MiSTeX world is built
 around. The card is a peripheral: an ordinary PC loads it over PCIe, feeds it
 a BIOS, and gets the picture back.
 
-**Where this is today: the I/O processor works and boots a real BIOS.** The
-Emotion Engine, the Vector Units and the Graphics Synthesizer do not exist
-yet. Nothing here plays a game.
+**Where this is today: the I/O processor works and boots a real BIOS, and the
+first block of each of the other two processors runs on the card.** The
+Emotion Engine's R5900 executes at the console's 294.912 MHz and the Graphics
+Synthesizer's rasteriser draws at its 147.456 MHz — one block of thirteen and
+one of four. There is no texture unit, no vector unit, and no main memory.
+Nothing here plays a game, and nothing draws a recognisable one.
 [docs/roadmap.md](docs/roadmap.md) counts what exists against what does not
 and says which milestone is which — including the one three blocks away where
 your own game disc first becomes a useful test.

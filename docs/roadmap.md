@@ -32,17 +32,35 @@ separate design and separate verification:
 | **SIF** (the link to the EE) | **works** — `rtl/iop/iop_sif.vhd`, with the host playing the EE; the IOP kernel boots to BOOTEND through it |
 | SSBUS2 config | **stub**, and that is probably fine forever |
 
-### The Emotion Engine — 0 of 12
+### The Emotion Engine — 1 of 13, updated 2026-09-16
 
-R5900 core (64-bit MIPS III plus the 128-bit MMI SIMD set) · FPU (COP1, with
-its non-IEEE rules) · 32 MB main memory · 16 KB scratchpad · EE DMAC (10
-channels) · EE INTC and timers · SIF (EE side) · VIF0 · VIF1 · VU0 (macro and
-micro mode) · VU1 · GIF · IPU (MPEG-2). **None of these exists.**
+| block | state |
+|---|---|
+| **R5900 core** | **works on the card** — 64-bit MIPS III plus the 128-bit MMI SIMD set, 35 differential tests, mutation-checked, and running at **the console's 294.912 MHz** with +0.135 ns of margin. The ~204 MHz that was the open problem is closed: a sixth pipeline stage, the 0.85 V rail and its matching speed file between them bought the difference |
+| FPU (COP1) | *reference model done* — `sim/ee/ps2_float.py`, exact-rational, 33 checks. No RTL |
+| 32 MB main memory | not started. Needs HBM, and therefore `--vccmem default` |
+| 16 KB scratchpad | not started |
+| EE DMAC, 10 channels | not started |
+| EE INTC and timers | not started |
+| SIF, EE side | not started — the IOP side works with the host standing in |
+| VIF0 / VIF1 | not started |
+| VU0 (macro and micro mode) | not started |
+| **VU1** | not started. Every scrap of PlayStation 2 geometry runs here |
+| GIF | *the GS-facing half works* — tag parsing, the three modes, A+D writes, inside `rtl/gs/gs_gif.vhd`. The EE-facing half, fed by DMA rather than by the host a quadword at a time, does not exist |
+| IPU (MPEG-2) | not started |
+| TLB / MMU | not started — currently counted as traps, and the BIOS uses it |
 
-### The Graphics Synthesizer — 0 of 4
+### The Graphics Synthesizer — 1 of 4, updated 2026-09-16
 
-Rasteriser with 4 MB of local memory · texture unit · alpha/Z/dither back end
-· PCRTC video output. **None of these exists.**
+| block | state |
+|---|---|
+| **rasteriser + 4 MB local memory** | *works on the card* — sprites, Gouraud triangles, the page/block/column swizzle cross-checked exhaustively against a second implementation, PSMCT32/24/16/16S, 14 differential streams byte-identical by full 4 MB checksum, running at **147.456 MHz, the console's own clock**, four pixels per clock on all three paths |
+| **texture unit** | **no RTL** — and nothing renders like a PlayStation 2 without it. But the reference model is **complete**: `gs-texture.md` runs from the PSMT8/PSMT4 address permutations through the H formats and the CLUT to UV sampling, STQ with the perspective divide, mipmap and bilinear. The RTL will have an exhaustively cross-checked oracle to diff against from its first line |
+| alpha / Z / dither back end | *partial* — alpha blending and the depth test work and are 4-wide; dither is not started, and alpha test and destination-alpha test are not started |
+| PCRTC video output | *partial* — the read circuit works and is verified against a model; no sync generator, and it is not yet wired into `gs_top` or out to the host |
+
+Also not started in the GS: lines and points, local-to-host and local-to-local
+transfers, host-to-local beyond PSMCT32, and the comparing depth tests 4-wide.
 
 ### Host-side plumbing
 
@@ -50,7 +68,18 @@ PCIe transport **works**; the video path from card to host **works** (verified
 at 60 fps with a test pattern). Still needed: a disc-image server, a real
 controller path, and an audio path.
 
-**Totals: 10 blocks working, 2 partial, 1 stubbed, 16 not started.**
+**Totals, 2026-09-16: 12 blocks working, 5 partial, 1 stubbed, 15 not
+started.** The count has not moved since 2026-09-14 and the change behind it is
+not visible in a count: the R5900 has gone from working in simulation to
+working on the card, at the console's own clock. That is the difference between
+a design that is believed and one that is known, and it cost two bugs that only
+hardware could show — a pipeline stage the reset branch did not clear, which
+lost everything after the first instruction on about one release in five, and a
+branch-likely that failed to annul a multiply or divide in its delay slot.
+Neither reproduced in simulation until a test was written to provoke it.
+
+The count also understates how much is left, because a texture unit and two
+vector units are each larger than most of the entries above them.
 
 The shape of that total is the thing to keep in view. The IOP is nearly
 finished, and the IOP is the *small* processor — it is a PS1 CPU whose job on a
@@ -196,7 +225,7 @@ The next thing to do with those bytes is run them, and that needs the EE.
 **So: loading a game image is now a real and useful test.**
 It is not playing the game. It is the console proving it can find one.
 
-### 3. The Emotion Engine — 12 blocks
+### 3. The Emotion Engine — 12 blocks — **the core runs, 2026-09-16**
 
 This is the multi-year item, and the order that keeps it testable is in
 [ps2-hardware-study.md](ps2-hardware-study.md) §7: the R5900 integer core
@@ -204,9 +233,22 @@ first, verified instruction-by-instruction against PCSX2's interpreter, then
 MMI, then the FPU, then VU1 in micro mode, then VU0 and the COP2 coupling,
 then the DMAC/VIF/GIF paths and the IPU.
 
-Main memory is worth calling out: the PS2 has 32 MB of RDRAM, which on the
-C1100 means HBM rather than on-chip RAM — a memory controller and its
-arbitration are part of this step, not a detail of it.
+**The first of those is done and runs on the card** at the console's
+294.912 MHz ([ee-core.md](ee-core.md)). The integer core and MMI are one block
+of thirteen, so this milestone has barely started — but it has started in the
+place that decides whether the rest is worth building, because a core that
+cannot reach the console's clock makes every block behind it moot.
+
+**Next is the FPU (COP1).** Its reference model is finished and exact
+([ee-fpu.md](ee-fpu.md)), so the RTL has an oracle from the first line — with
+the caveat that page records honestly, that part of the FPU's behaviour cannot
+be checked against anything and has to be built another way.
+
+Main memory is worth calling out and is the other candidate for next: the PS2
+has 32 MB of RDRAM, which on the C1100 means HBM rather than on-chip RAM — a
+memory controller and its arbitration are part of this step, not a detail of
+it. Nothing above the core needs more than the 64 KB it has now; everything
+from the DMAC upwards does.
 
 *Milestone:* with the EE and the SIF real, the BIOS boots past the IOP into
 `OSDSYS` — the PS2's own browser screen — which is the first moment the thing
@@ -229,6 +271,12 @@ second implementation, never an authority, and never a source of code, since it
 is GPL-3 and this repository is GPL-2.
 
 *Milestone:* a picture, through the video path that already works.
+
+**That milestone is now the cheapest one left, and worth taking before the
+texture unit.** The rasteriser draws correctly on the card and the host video
+path is verified at 60 fps with a test pattern; what stands between those two
+is a sync generator and wiring PCRTC into `gs_top`. Everything else on this
+page is measured in checksums. This one ends in something you can look at.
 
 ### 5. Integration, then a game
 
@@ -322,3 +370,68 @@ have to be made until step 3, but it should not be a surprise when it arrives.
 | **load your own game disc and have the console read it** | **2** | **the next thing being worked on** |
 | see the PS2 browser screen | ~15 | after the EE |
 | play a game | ~19 plus integration | the end of the road |
+
+## Two parallel tracks opened — 2026-09-14
+
+Texture and VU1 both started, chosen because they are the two largest unbuilt
+blocks and neither contends with the EE's timing work for files or for a
+toolchain slot.
+
+**Texture** is at step 2 of 5: the H formats are done and the indexed addressing
+is assembled and bijectivity-checked (`docs/gs-texture.md`). Step 3, the CLUT,
+is the last one before a textured triangle can be drawn at all.
+
+**VU1** has a reference model rather than RTL, for the same reason the R5900 and
+the GS did: the model is what the hardware gets checked against, and a model
+written afterwards tends to agree with the hardware rather than with the
+machine. `sim/vu/vu_ref.py` has the register file, the memories, and the whole
+upper (FMAC) unit — field masks, broadcasts, the accumulator forms, the outer
+product, ITOF/FTOI, ABS and CLIP. Its arithmetic is `sim/ee/ps2_float.py`,
+imported rather than reimplemented: the VU and COP1 share a number system, and
+two blocks that must agree bit for bit should share one implementation of what a
+number is.
+
+The lower unit — loads, stores, the integer ALU, branches and the divide unit —
+is next, and after that the pipeline timing, which is deliberately a layer on
+top of a functional model that is already right.
+
+### VU1: the lower unit, and the CLUT — 2026-09-14
+
+`sim/vu/vu_ref.py` now has both slots. The lower unit is the harder decode —
+three dispatch levels, `code >> 25` then `code & 0x3F` then `(code >> 6) & 0x1F`
+— and all 69 defined entries cross-check against the oracle, with the check also
+asserting that nothing PCSX2 leaves undefined decodes here either. Inventing an
+instruction is as wrong as missing one.
+
+The tests target the asymmetries, because those are where a model written from
+instruction *names* goes wrong silently:
+
+- **`LQI` post-increments but `LQD` pre-decrements.** They are not mirror
+  images. A model that made them symmetric is off by one on every backwards walk
+  and still produces a picture.
+- **`MFIR` sign-extends** from 16 bits rather than zero-extending, and does not
+  convert — the bits cross as an integer and something else is expected to
+  `ITOF` them.
+- **The integer registers wrap at 16 bits**, they do not saturate. A pointer
+  walked past the end of VU Mem reads something else rather than faulting.
+- **Bits 24:21 are not always a field mask.** `MTIR`, `DIV`, `SQRT` and `RSQRT`
+  overload them as `fsf` and `ftf`, naming one field of each operand. The first
+  version of the test passed the default mask of `0xF` to them, which selected
+  `w` for both — so `MTIR` read an empty field and `DIV` divided by zero and
+  saturated. **The model was right and the test was wrong**, which is the
+  failure that wastes the most time, so the two encodings now have separate
+  helpers rather than one with a trap in it.
+
+On the texture side, the CLUT's CSM1 layout was **derived rather than
+tabulated**: a 16-entry CLUT is one PSMCT32 column read in raster order, and a
+256-entry CLUT is that pattern stepped over four consecutive blocks alternating
+between two at a time. One expression reproduces PCSX2's whole 128-entry table
+and is a bijection over all 256. The plausible wrong answer — that a CLUT is a
+16 × 16 image — is also a bijection, so `tools/gs/xcheck_clut.py` asserts
+explicitly that the derivation is *not* that one.
+
+The 16-bit CSM1 layout is deliberately **not implemented**: its first eight
+entries match a half-word raster and then it diverges by offsets of 4, 1 and 5.
+The structure is "one row pattern, four offsets" and only the offsets are open.
+That is written down in `gs_ref.py` rather than guessed at, because a wrong
+palette layout looks like a wrong palette, not like a wrong address.
