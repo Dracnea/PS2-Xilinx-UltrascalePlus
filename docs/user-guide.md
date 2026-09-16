@@ -147,6 +147,18 @@ python3 tools/ee/eerun.py --csr build/c1100_ee/csr.csv --prog prog.hex --compare
 MMCMs locked and what `cd_ee` measures; if the clock tree did not lock, nothing
 else on the page means anything.
 
+A second tool checks one thing the general harnesses cannot see:
+
+```sh
+python3 tools/ee/annul_card.py --csr build/c1100_ee/csr.csv
+```
+
+A not-taken branch-likely must nullify its delay slot, and a multiply or divide
+in that slot is the case that once got through — it stalls the pipeline stage
+the annul was written around. Randomly generated programs almost never place
+one there, so this builds the three cases directly and diffs each against the
+reference model. It needs an image already loaded and takes a few seconds.
+
 **Diagnostic flag:** `boards/c1100_ee.py --ee-div 8` halves the EE clock to
 147.456 MHz instead of the console's 294.912. It is for telling one class of
 fault from another and not for anything that ships — a setup-timing problem goes
