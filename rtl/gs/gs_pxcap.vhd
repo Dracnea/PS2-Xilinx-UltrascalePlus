@@ -68,10 +68,27 @@ begin
    done  <= fin;
    count <= wptr;
 
+   -- **One write statement, one write address.**
+   --
+   -- The first version of this block wrote `ram(0)` on the start-of-frame path
+   -- and `ram(wptr)` on every other pixel. That reads naturally and is two
+   -- write addresses into one array, which no block RAM has: synthesis gave up
+   -- on inference and built the whole 4096 x 24 in fabric -- **30,725 LUTs and
+   -- 98,428 flip-flops**, against the four block RAMs this block's comment
+   -- claimed. It cost the Graphics Synthesizer its timing, and the failing
+   -- paths were inside the rasteriser, where nothing had changed.
+   --
+   -- So the address is chosen first and written once. The lesson is the cheap
+   -- one: a comment asserting a cost is not a measurement of it.
    process (clk)
+      variable waddr : unsigned(ADDR_BITS-1 downto 0);
+      variable wen   : std_logic;
    begin
       if rising_edge(clk) then
          rd_data <= ram(to_integer(unsigned(rd_addr)));
+
+         waddr := wptr(ADDR_BITS-1 downto 0);
+         wen   := '0';
 
          if reset = '1' then
             cap   <= '0';
@@ -95,9 +112,10 @@ begin
                -- Start on the first pixel of a frame, and store that pixel:
                -- px_sof arrives *with* a valid pixel, not before one.
                if px_valid = '1' and px_sof = '1' then
-                  cap  <= '1';
-                  ram(0) <= px_rgb;
-                  wptr <= to_unsigned(1, wptr'length);
+                  cap   <= '1';
+                  waddr := (others => '0');
+                  wen   := '1';
+                  wptr  <= to_unsigned(1, wptr'length);
                end if;
             elsif cap = '1' then
                if px_valid = '1' and px_sof = '1' then
@@ -106,7 +124,7 @@ begin
                   fin <= '1';
                elsif px_valid = '1' then
                   if wptr < 2**ADDR_BITS then
-                     ram(to_integer(wptr(ADDR_BITS-1 downto 0))) <= px_rgb;
+                     wen  := '1';
                      wptr <= wptr + 1;
                   else
                      -- full. Stop rather than wrap: a torn picture that looks
@@ -116,6 +134,11 @@ begin
                   end if;
                end if;
             end if;
+         end if;
+
+         -- the only write to `ram` anywhere in this block
+         if wen = '1' then
+            ram(to_integer(waddr)) <= px_rgb;
          end if;
       end if;
    end process;

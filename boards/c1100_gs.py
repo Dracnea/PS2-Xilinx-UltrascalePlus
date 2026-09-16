@@ -83,7 +83,7 @@ def add_gs_sources(platform, root=REPO_ROOT):
     """The Graphics Synthesizer's RTL, in dependency order."""
     rtl = join(root, "rtl", "gs")
     for f in ("gs_addr_pkg.vhd", "gs_edge_dda.vhd", "gs_chan_dda.vhd", "gs_gif.vhd",
-              "gs_lmem.vhd", "gs_pcrtc.vhd", "gs_top.vhd"):
+              "gs_lmem.vhd", "gs_pcrtc.vhd", "gs_pxcap.vhd", "gs_top.vhd"):
         platform.add_source(join(rtl, f), language="vhdl")
 
 
@@ -180,9 +180,32 @@ class _GSCRG(LiteXModule):
         platform.toolchain.pre_placement_commands.append(
             "set_clock_uncertainty -setup 0.400 "
             "[get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT1]]")
+        # **The goal is kept through routing, and sign-off is told the truth
+        # separately.**
+        #
+        # This target used to drop the uncertainty to zero here, so that the
+        # build's own report was honest. The Emotion Engine measured what that
+        # convention costs, on its own netlist and at its own clock: routing
+        # against a target of zero gave -0.032 ns of *real* slack where routing
+        # against an inflated one gave +0.070. The router stops the moment it
+        # reaches its target, so a target it can reach is a design that only
+        # just fails.
+        #
+        # The two concerns separate cleanly. bitstream_commands run after
+        # report_timing_summary has written the build's own report, so the goal
+        # stays inflated through routing and the constraint is then relaxed and
+        # the design reported again into *_timing_signoff.rpt. Read that file
+        # for what the design is, and the build's own report for what the router
+        # was chasing.
         platform.toolchain.pre_routing_commands.append(
+            "set_clock_uncertainty -setup 0.150 "
+            "[get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT1]]")
+        platform.toolchain.bitstream_commands.append(
             "set_clock_uncertainty -setup 0.000 "
             "[get_clocks -of_objects [get_pins ps2_mmcm2/CLKOUT1]]")
+        platform.toolchain.bitstream_commands.append(
+            "report_timing_summary -datasheet -max_paths 10 "
+            "-file {build_name}_timing_signoff.rpt")
 
         # Named by MMCM pin, not by net: a net name that no longer exists makes
         # Vivado print "No clocks matched" and apply nothing, which is the trap
@@ -252,6 +275,31 @@ class GSBringup(LiteXModule, AutoCSR):
         #            known wall-clock apart and the difference is the frequency,
         #            measured rather than assumed.  It wraps every 29 seconds at
         #            this rate, which is far longer than any sensible gap.
+        # ---- the display, and a frame of it -------------------------------
+        # PCRTC composites two read circuits and blends them; a C1100 has no
+        # video connector, so the only way to see whether the card does that
+        # correctly is to catch a frame and read it back. gsgrab.py reads the
+        # *frame buffer* instead, which skips exactly the part PCRTC does.
+        self.pr_addr    = CSRStorage(8,  description="privileged register offset from 0x12000000")
+        self.pr_d0      = CSRStorage(32, description="that register, bits 31:0")
+        self.pr_d1      = CSRStorage(32, description="that register, bits 63:32")
+        self.pr_push    = CSRStorage(1,  description="write to present the privileged register write")
+        self.h_total    = CSRStorage(12, reset=64, description="raster width, until there is a sync generator")
+        self.v_total    = CSRStorage(12, reset=64, description="raster height")
+        self.disp_en    = CSRStorage(1,  description="1 runs PCRTC; it reads local memory when it does")
+        self.cap_arm    = CSRStorage(1,  description="1 arms the frame grab; it starts at the next frame")
+        self.cap_stat   = CSRStatus(fields=[
+            CSRField("busy", size=1, description="capturing now"),
+            CSRField("done", size=1, description="a frame is in the buffer"),
+        ])
+        # Free-running while a capture is in flight, so it means something only
+        # once `done` is set -- which is the point at which it stops moving.
+        self.cap_count  = CSRStatus(13, description="pixels captured; read it after done")
+        self.cap_addr   = CSRStorage(12, description="which captured pixel to show")
+        self.cap_data   = CSRStatus(24, description="that pixel, 0xBBGGRR")
+        self.crtc_rd    = CSRStatus(32, description="display reads the arbiter granted")
+        self.crtc_stall = CSRStatus(32, description="display reads it refused")
+
         self.clk_locked = CSRStatus(1, description="both PS2 MMCMs are locked")
         self.clk_ticks  = CSRStatus(32, description="free-running cd_gs counter")
 
@@ -404,6 +452,60 @@ class GSBringup(LiteXModule, AutoCSR):
             self.dbg_hi.status.eq(hold[80:112]),
         ]
 
+        # ---- the display's crossings ---------------------------------------
+        # Same three patterns as everything above: a level crosses in two flops,
+        # a request that must happen exactly once crosses as a toggle, and the
+        # data beside it is stable across the crossing because the host wrote it
+        # before the request and does not touch it until the answer comes back.
+        pr_we   = Signal()
+        pr_addr = Signal(8)
+        pr_data = Signal(64)
+        disp_en_gs = Signal()
+        px_valid, px_sof = Signal(), Signal()
+        px_rgb  = Signal(24)
+        px_x, px_y = Signal(12), Signal(12)
+        crtc_rd_gs, crtc_st_gs = Signal(32), Signal(32)
+        cap_arm_gs, cap_busy_gs, cap_done_gs = Signal(), Signal(), Signal()
+        cap_count_gs = Signal(13)
+        cap_data_gs  = Signal(24)
+
+        self.comb += pr_addr.eq(self.pr_addr.storage)
+        self.comb += pr_data.eq(Cat(self.pr_d0.storage, self.pr_d1.storage))
+        self.specials += MultiReg(self.disp_en.storage[0], disp_en_gs, "gs")
+        self.specials += MultiReg(self.cap_arm.storage[0], cap_arm_gs, "gs")
+        self.specials += MultiReg(cap_busy_gs, self.cap_stat.fields.busy, "sys")
+        self.specials += MultiReg(cap_done_gs, self.cap_stat.fields.done, "sys")
+        self.specials += MultiReg(cap_count_gs, self.cap_count.status, "sys")
+        self.specials += MultiReg(cap_data_gs,  self.cap_data.status,  "sys")
+        self.specials += MultiReg(crtc_rd_gs,   self.crtc_rd.status,   "sys")
+        self.specials += MultiReg(crtc_st_gs,   self.crtc_stall.status,"sys")
+
+        pr_req, pr_ack, pr_ack_s, pr_busy = Signal(), Signal(), Signal(), Signal()
+        self.specials += MultiReg(pr_ack, pr_ack_s, "sys")
+        self.comb += pr_busy.eq(pr_req != pr_ack_s)
+        self.sync += If(self.pr_push.re & ~pr_busy, pr_req.eq(~pr_req))
+        pr_req_s = Signal()
+        self.specials += MultiReg(pr_req, pr_req_s, "gs")
+        self.sync.gs += [
+            pr_we.eq(0),
+            If(pr_req_s != pr_ack, pr_we.eq(1), pr_ack.eq(pr_req_s)),
+        ]
+
+        self.specials += Instance("gs_pxcap",
+            p_ADDR_BITS = 12,
+            i_clk     = ClockSignal("gs"),
+            i_reset   = gs_rst,
+            i_px_valid= px_valid,
+            i_px_rgb  = px_rgb,
+            i_px_sof  = px_sof,
+            i_arm     = cap_arm_gs,
+            o_busy    = cap_busy_gs,
+            o_done    = cap_done_gs,
+            o_count   = cap_count_gs,
+            i_rd_addr = self.cap_addr.storage,
+            o_rd_data = cap_data_gs,
+        )
+
         self.specials += Instance("gs_top",
             p_ADDR_BITS = 17,
             i_clk       = ClockSignal("gs"),
@@ -419,6 +521,19 @@ class GSBringup(LiteXModule, AutoCSR):
             o_dbg_reg   = dbg_reg,
             o_dbg_unknown = dbg_unk,
             o_dbg_pixels  = dbg_pix,
+            i_pr_we       = pr_we,
+            i_pr_addr     = pr_addr,
+            i_pr_data     = pr_data,
+            i_h_total     = self.h_total.storage,
+            i_v_total     = self.v_total.storage,
+            i_disp_enable = disp_en_gs,
+            o_px_valid    = px_valid,
+            o_px_rgb      = px_rgb,
+            o_px_x        = px_x,
+            o_px_y        = px_y,
+            o_px_sof      = px_sof,
+            o_dbg_crtc_rd    = crtc_rd_gs,
+            o_dbg_crtc_stall = crtc_st_gs,
         )
         add_gs_sources(platform)
 
@@ -537,5 +652,16 @@ def build(nlanes=4, speed="gen3", do_build=False, build_dir="build/c1100_gs"):
 
 
 if __name__ == "__main__":
-    build(nlanes = 16 if "--x16" in sys.argv else 4,
-          do_build = "--build" in sys.argv)
+    # **--out exists because eliding it is destructive.** Running this file
+    # without --build still writes csr.csv, so elaborating to check a change
+    # overwrites the CSR map of whatever bitstream is already in the default
+    # directory -- leaving a .bit and a csr.csv that disagree, which is the one
+    # failure tools/pcie-bringup.sh exists to catch and the user guide warns
+    # about. c1100_ee.py has taken --out from the start; this file had not.
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--build", action="store_true")
+    ap.add_argument("--x16",   action="store_true")
+    ap.add_argument("--out",   default="build/c1100_gs")
+    a = ap.parse_args()
+    build(nlanes = 16 if a.x16 else 4, do_build = a.build, build_dir = a.out)
