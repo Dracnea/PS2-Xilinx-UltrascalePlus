@@ -299,6 +299,644 @@ def block4(by, bx):
     return block32(bx, by)
 
 
+PAGE_BYTES  = 8192
+BLOCK_BYTES = 256
+
+# Assembling the pieces.  Two things differ from the colour formats and both are
+# easy to get wrong in a way that looks right for small textures:
+#
+#   * **The page is a different shape.**  A PSMCT32 page is 64 x 32 texels; a
+#     PSMT8 page is 128 x 64 and a PSMT4 page is 128 x 128.  Same 8 KB, more
+#     texels in it.
+#   * **TBW is in units of 64 texels whatever the format**, so it does not count
+#     pages for the indexed formats the way it does for PSMCT32.  A PSMT8 page
+#     is 128 texels wide, so the number of *pages* across a row is TBW / 2, and
+#     the same for PSMT4.  Forget the halving and every texture wider than one
+#     page is sheared -- and a texture exactly one page wide, which is what a
+#     first test naturally uses, comes out perfect.
+
+def addr8p(pagebase, bw, x, y):
+    """Byte address of texel (x, y) in PSMT8, base in *pages*."""
+    page = pagebase + (y >> 6) * (bw >> 1) + (x >> 7)
+    return (page * PAGE_BYTES
+            + block8((y >> 4) & 3, (x >> 4) & 7) * BLOCK_BYTES
+            + column8(y & 15, x & 15))
+
+
+def addr8(bp, bw, x, y):
+    """The same, from a TEX0/BITBLTBUF pointer in 256-byte blocks."""
+    return addr8p(bp >> 5, bw, x, y)
+
+
+def addr4p(pagebase, bw, x, y):
+    """**Nibble** address of texel (x, y) in PSMT4, base in *pages*.
+
+    Nibbles, not bytes: a 4-bit texel has no byte of its own, and returning a
+    byte address plus a half would push the split onto every caller -- the same
+    argument addr16p makes for returning its half separately, reached the other
+    way because here the sub-unit is the natural address.
+    """
+    page = pagebase + (y >> 7) * (bw >> 1) + (x >> 7)
+    return (page * PAGE_BYTES * 2
+            + block4((y >> 4) & 7, (x >> 5) & 3) * BLOCK_BYTES * 2
+            + column4(y & 15, x & 31))
+
+
+def addr4(bp, bw, x, y):
+    """The same, from a pointer in 256-byte blocks."""
+    return addr4p(bp >> 5, bw, x, y)
+
+
+# ---- the pixel-storage-mode codes -------------------------------------------
+#
+# Named rather than written as bare numbers at each use, because several of them
+# differ by one bit and the indexed ones are easy to transpose.
+
+PSMCT32, PSMCT24, PSMCT16, PSMCT16S = 0x00, 0x01, 0x02, 0x0A
+PSMT8, PSMT4                        = 0x13, 0x14
+PSMT8H                              = 0x1B
+PSMT4HL, PSMT4HH                    = 0x24, 0x2C
+PSMZ32, PSMZ24, PSMZ16, PSMZ16S     = 0x30, 0x31, 0x32, 0x3A
+
+INDEXED = (PSMT8, PSMT4, PSMT8H, PSMT4HL, PSMT4HH)
+
+# How many bits an index has, and where the H formats find it inside the 32-bit
+# word they share with a colour.
+IDX_BITS = {PSMT8: 8, PSMT4: 4, PSMT8H: 8, PSMT4HL: 4, PSMT4HH: 4}
+
+
+# ---- the H formats ----------------------------------------------------------
+#
+# PSMT8H, PSMT4HL and PSMT4HH are the same indices as PSMT8 and PSMT4, but
+# stored in the **spare bits of a PSMCT32 buffer** rather than in a buffer of
+# their own.  A 24-bit colour occupies bits 23:0 of each 32-bit word and leaves
+# the top byte unused; these three formats put a palette index there.
+#
+# That is the whole of it, and it is why the study put them immediately after
+# the addressing: they need no addressing of their own at all.  The word is
+# found exactly as PSMCT32 finds it -- same page, same block, same column -- and
+# only the extraction differs:
+#
+#     PSMT8H    bits 31:24     the whole spare byte
+#     PSMT4HL   bits 27:24     its low nibble
+#     PSMT4HH   bits 31:28     its high nibble
+#
+# So a game can keep a 24-bit image and an 8-bit index image in one buffer at no
+# cost in memory, or two 4-bit index images, which is what PSMT4HL and PSMT4HH
+# being separate formats is for.
+#
+# The consequence that matters for the rasteriser is the reverse: a write to a
+# PSMCT24 frame buffer must leave the top byte alone, because something else may
+# be living in it.  The model already does that, for that reason.
+
+H_SHIFT = {PSMT8H: 24, PSMT4HL: 24, PSMT4HH: 28}
+H_MASK  = {PSMT8H: 0xFF, PSMT4HL: 0xF, PSMT4HH: 0xF}
+
+
+def texel_index(vm, psm, tbp, tbw, x, y):
+    """The palette index of texel (x, y), for any of the five indexed formats.
+
+    `tbp` is in 64-word units (the GS's pointer granularity) and `tbw` in units
+    of 64 texels, exactly as TEX0 carries them.
+    """
+    if psm == PSMT8:
+        a = addr8(tbp, tbw, x, y)
+        return vm[a]
+    if psm == PSMT4:
+        a = addr4(tbp, tbw, x, y)                 # in nibbles
+        return (vm[a >> 1] >> (4 * (a & 1))) & 0xF
+    if psm in H_SHIFT:
+        w = addr32(tbp, tbw, x, y) * 4
+        word = int.from_bytes(vm[w:w + 4], "little")
+        return (word >> H_SHIFT[psm]) & H_MASK[psm]
+    raise ValueError("psm 0x%02x is not an indexed format" % psm)
+
+
+# ---- the CLUT ---------------------------------------------------------------
+#
+# The palette for the five indexed formats. It is not a register file: it lives
+# in local memory like everything else, is copied into a 1 KB buffer on the chip
+# when TEX0 says so, and the rules for *when* that copy happens are a cache with
+# explicit invalidation. Getting the layout wrong gives wrong colours; getting
+# the reload rules wrong gives the *previous* primitive's colours, several
+# primitives later, which is much harder to recognise.
+#
+# ## CSM1, derived rather than tabulated
+#
+# CSM1 is the swizzled layout, and like the block and column tables it looked at
+# first like an arbitrary permutation. It is not. Two observations give the
+# whole thing:
+#
+#   1. A **16-entry** CLUT is exactly one PSMCT32 *column* -- 8 wide by 2 high --
+#      read in raster order. `column32(j >> 3, j & 7)` reproduces it entry for
+#      entry.
+#   2. A **256-entry** CLUT is that column pattern stepped over four consecutive
+#      blocks, and the step alternates between two blocks before advancing:
+#      column 0 of block 0, column 0 of block 1, column 1 of block 0, column 1
+#      of block 1, and so on, then the same again for blocks 2 and 3.
+#
+# So the whole of CSM1 for a 32-bit CLUT is one expression, and it reproduces
+# PCSX2's 128-entry clutTableT32I8 exactly and is a bijection over all 256
+# entries. `tools/gs/xcheck_clut.py` is what makes that a claim which can fail.
+#
+# Note what the CLUT is *not*: a 16 x 16 PSMCT32 image. A 16 x 16 region would
+# occupy blocks 0, 1, 4 and 5 of a page, because that is what block32 says; the
+# CLUT occupies four *consecutive* blocks. Assuming the image interpretation
+# gives a permutation -- so it passes a bijectivity check -- and the wrong one.
+
+def clut_csm1_32(c):
+    """Word offset, from the CLUT base, of 32-bit CLUT entry `c` in CSM1."""
+    j  = c & 15                       # position within one 8 x 2 column
+    k  = (c >> 4) & 7                 # which column, alternating between blocks
+    hi = c >> 7                       # the second pair of blocks
+    return 128 * hi + 64 * (k & 1) + 16 * (k >> 1) + column32(j >> 3, j & 7)
+
+
+# The 16-bit CSM1 layout is **not derived yet**, and is deliberately left
+# unimplemented rather than guessed.
+#
+# The evidence so far, for whoever picks it up: PCSX2's clutTableT16I8 is 32
+# entries, and its first eight -- 0, 2, 8, 10, 16, 18, 24, 26 -- are exactly a
+# half-word raster along y = 0 of a PSMCT16 column, which `addr16p` reproduces.
+# It then diverges: the remaining three groups of eight are the first group plus
+# a constant, the constants being 4, 1 and 5 in that order. So the structure is
+# "one row pattern, four offsets" and the open question is only what those four
+# offsets mean -- almost certainly which half of which word, in a packing whose
+# convention differs from addr16p's. Worth twenty minutes and a bijectivity
+# check; not worth a guess, because a wrong palette layout looks like a wrong
+# palette rather than like a wrong address.
+
+
+def clut_csm2(c, cbw, cou, cov):
+    """Word offset of entry `c` in CSM2, which is simply linear.
+
+    CSM2 reads the CLUT as a one-pixel-high strip out of an ordinary buffer, so
+    TEXCLUT gives it a width and an origin and there is no swizzle to undo --
+    the strip is addressed the way any other PSMCT32 read would be.
+    """
+    return addr32p(0, max(1, cbw), cou * 16 + c, cov)
+
+
+# CLD, the load control. The GS does not re-read the CLUT on every primitive --
+# it would have no bandwidth left -- so TEX0 carries three bits saying whether
+# this write should cause a reload, and two of the six settings compare against
+# a remembered pointer rather than reloading unconditionally.
+CLD_NONE, CLD_LOAD, CLD_LOAD_CBP0, CLD_LOAD_CBP1, CLD_IF_CBP0, CLD_IF_CBP1 = range(6)
+
+
+class Clut:
+    """The on-chip palette buffer, and the rules for when it is refilled."""
+
+    def __init__(self):
+        self.entries = [0] * 256
+        self.cbp0 = None            # the two remembered pointers CLD compares against
+        self.cbp1 = None
+        self.loads = 0              # counted, so a test can assert a reload did NOT happen
+
+    def should_load(self, cld, cbp):
+        if cld == CLD_NONE:
+            return False
+        if cld in (CLD_LOAD, CLD_LOAD_CBP0, CLD_LOAD_CBP1):
+            return True
+        if cld == CLD_IF_CBP0:
+            return self.cbp0 != cbp
+        if cld == CLD_IF_CBP1:
+            return self.cbp1 != cbp
+        return False                # 6 and 7 are reserved; do nothing rather than guess
+
+    def load(self, vm, tex0, texclut=0):
+        """Refill from local memory if TEX0's CLD says to. Returns whether it did."""
+        cbp  = bits(tex0, 50, 37)
+        cpsm = bits(tex0, 54, 51)
+        csm  = bits(tex0, 55, 55)
+        csa  = bits(tex0, 60, 56)
+        cld  = bits(tex0, 63, 61)
+        psm  = bits(tex0, 25, 20)
+
+        if not self.should_load(cld, cbp):
+            return False
+        # The remembered pointers are updated by the two settings that say so,
+        # and that happens whether or not the comparison forms would have
+        # reloaded -- they are a side effect of the write, not of the load.
+        if cld == CLD_LOAD_CBP0:
+            self.cbp0 = cbp
+        elif cld == CLD_LOAD_CBP1:
+            self.cbp1 = cbp
+
+        if cpsm != PSMCT32:
+            raise NotImplementedError(
+                "CLUT format 0x%02x: only PSMCT32 CLUTs are derived so far; "
+                "see the note above clut_csm1_32" % cpsm)
+
+        n = 16 if psm in (PSMT4, PSMT4HL, PSMT4HH) else 256
+        # CBP counts 256-byte blocks and a block is 64 words, so the base in
+        # words is cbp * 64. Writing it as (cbp << 5) * 4 -- reaching for the
+        # blocks-to-pages shift that addr32 uses and then scaling -- gives
+        # cbp * 128, which is out by exactly a factor of two and reads back a
+        # palette of zeros. Caught by the end-to-end indexed-texture test, not
+        # by anything that checked the layout alone: clut_csm1_32 was right the
+        # whole time and the base it was added to was not.
+        base = cbp << 6                             # 256-byte blocks -> words
+        # CSA offsets the destination within the buffer, in 16-entry steps. For
+        # a 4-bit texture that is how eight different palettes share one CLUT.
+        dst = (csa & 15) * 16 if n == 16 else 0
+        for c in range(n):
+            off = (clut_csm1_32(c + (0 if n == 256 else dst)) if csm == 0
+                   else clut_csm2(c, bits(texclut, 5, 0),
+                                  bits(texclut, 11, 6), bits(texclut, 21, 12)))
+            a = (base + off) * 4
+            self.entries[dst + c] = int.from_bytes(vm[a:a + 4], "little")
+        self.loads += 1
+        return True
+
+
+# ---- wrapping, sampling, and the texture function ---------------------------
+#
+# Step 4 of the texture plan: enough to draw a 2D textured primitive correctly.
+# UV coordinates, nearest sampling, the four wrap modes, and TFX.
+#
+# ## The wrap mode that is not a wrap mode
+#
+# Three of the four do what their names say. `REGION_REPEAT` does not: MINU and
+# MAXU stop being bounds and become a **mask and an or** --
+#
+#     u = (u & MINU) | MAXU
+#
+# -- which is a different operation wearing the same register fields. It is what
+# lets a game tile a sub-rectangle of a larger texture, and a model that treats
+# it as a clamp produces a picture that is *almost* right, which is the hardest
+# kind of wrong to notice.
+
+WM_REPEAT, WM_CLAMP, WM_REGION_CLAMP, WM_REGION_REPEAT = 0, 1, 2, 3
+
+
+def wrap(u, mode, lo, hi, size):
+    """One axis of texture coordinate wrapping. `size` is 2**TW or 2**TH."""
+    if mode == WM_REPEAT:
+        return u & (size - 1)
+    if mode == WM_CLAMP:
+        return 0 if u < 0 else (size - 1 if u > size - 1 else u)
+    if mode == WM_REGION_CLAMP:
+        return lo if u < lo else (hi if u > hi else u)
+    # REGION_REPEAT: a mask and an or, not a range.
+    return (u & lo) | hi
+
+
+def expand_texel(raw, psm):
+    """One stored texel -> (r, g, b, a), 8 bits each.
+
+    PSMCT24 has no alpha of its own: the top byte is not part of the pixel, so
+    it reads as zero and TEXA would normally supply a value. That register is
+    not modelled yet and this returns zero rather than guessing 0x80, because a
+    wrong constant alpha looks like a blending bug several stages later.
+    """
+    if psm in (PSMCT32, PSMT8H, PSMT4HL, PSMT4HH):
+        return (raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF, (raw >> 24) & 0xFF)
+    if psm == PSMCT24:
+        return (raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF, 0)
+    if psm in (PSMCT16, PSMCT16S):
+        # expand16 is the GS's own 5551 -> 8888 expansion, already written and
+        # already verified against the frame buffer path: five bits become eight
+        # by a shift, and the single alpha bit becomes 0x80 rather than 0xFF,
+        # because 0x80 is what 1.0 is in this fixed point.
+        w = expand16(raw)
+        return (w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF, (w >> 24) & 0xFF)
+    return (raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF, (raw >> 24) & 0xFF)
+
+
+def fetch_texel(vm, tex0, clut, u, v):
+    """The texel at (u, v), already through the palette if the format is indexed.
+
+    `u` and `v` are whole texels: the caller has done the 12.4 shift and the
+    wrapping. Returns (r, g, b, a).
+    """
+    tbp  = bits(tex0, 13, 0)
+    tbw  = bits(tex0, 19, 14)
+    psm  = bits(tex0, 25, 20)
+
+    if psm in INDEXED:
+        idx = texel_index(vm, psm, tbp, tbw, u, v)
+        return expand_texel(clut.entries[idx], PSMCT32)
+    if psm in (PSMCT32, PSMCT24):
+        a = addr32(tbp, tbw, u, v) * 4
+        return expand_texel(int.from_bytes(vm[a:a + 4], "little"), psm)
+    if psm in (PSMCT16, PSMCT16S):
+        w, half = addr16p(tbp >> 5, tbw, u, v, sform=(psm == PSMCT16S))
+        word = int.from_bytes(vm[w * 4:w * 4 + 4], "little")
+        return expand_texel((word >> (16 * half)) & 0xFFFF, psm)
+    raise ValueError("texture format 0x%02x is not supported" % psm)
+
+
+TFX_MODULATE, TFX_DECAL, TFX_HIGHLIGHT, TFX_HIGHLIGHT2 = 0, 1, 2, 3
+
+
+def _sat8(x):
+    return 0 if x < 0 else (255 if x > 255 else x)
+
+
+def texture_function(tfx, tcc, frag, texel):
+    """Combine the fragment colour with the texel. Both are (r, g, b, a).
+
+    The multiply is by the fragment colour **shifted right by seven**, not by
+    eight: the GS's fixed point puts 1.0 at 0x80 throughout, the same convention
+    the alpha blender uses. Shifting by eight is the obvious guess and darkens
+    every textured surface by a factor of two, which reads as a lighting bug.
+
+    TCC decides whether the texel's alpha is used at all. When it is not, the
+    fragment's alpha passes through untouched -- which is why an opaque texture
+    drawn with TCC=0 is correct even if its alpha channel is garbage.
+    """
+    fr, fg, fb, fa = frag
+    tr, tg, tb, ta = texel
+
+    if tfx == TFX_DECAL:
+        c = (tr, tg, tb)
+        a = ta if tcc else fa
+        return (c[0], c[1], c[2], a)
+
+    m = ((fr * tr) >> 7, (fg * tg) >> 7, (fb * tb) >> 7)
+    if tfx == TFX_MODULATE:
+        a = ((fa * ta) >> 7) if tcc else fa
+        return (_sat8(m[0]), _sat8(m[1]), _sat8(m[2]), _sat8(a))
+
+    # HIGHLIGHT and HIGHLIGHT2 add the fragment's alpha to the colour, which is
+    # what makes a specular pass possible in one primitive. They differ only in
+    # where the output alpha comes from.
+    c = (_sat8(m[0] + fa), _sat8(m[1] + fa), _sat8(m[2] + fa))
+    if tfx == TFX_HIGHLIGHT:
+        a = _sat8(ta + fa) if tcc else fa
+    else:
+        a = ta if tcc else fa
+    return (c[0], c[1], c[2], _sat8(a))
+
+
+def sample_uv(vm, tex0, clamp, clut, u_fixed, v_fixed):
+    """Nearest sampling from a UV coordinate in 12.4 fixed point.
+
+    Nearest, so the fractional bits are simply discarded -- the GS does not
+    round them, it truncates, and that half-texel difference is visible on any
+    texture with a hard edge.
+    """
+    tw, th = 1 << bits(tex0, 29, 26), 1 << bits(tex0, 33, 30)
+    wms, wmt = bits(clamp, 1, 0), bits(clamp, 3, 2)
+    minu, maxu = bits(clamp, 13, 4), bits(clamp, 23, 14)
+    minv, maxv = bits(clamp, 33, 24), bits(clamp, 43, 34)
+    u = wrap(u_fixed >> 4, wms, minu, maxu, tw)
+    v = wrap(v_fixed >> 4, wmt, minv, maxv, th)
+    return fetch_texel(vm, tex0, clut, u, v)
+
+
+# ---- step 5: bilinear, and the perspective divide ---------------------------
+#
+# ## Bilinear
+#
+# Four texels and three lerps, with one detail that decides whether the picture
+# lines up: the GS samples at **(u - 0.5, v - 0.5)**, not at (u, v).
+#
+# The reason is where a texel's colour lives. UV counts texel *edges*, so texel
+# n occupies [n, n+1) and its centre is at n + 0.5. Subtracting the half texel
+# before splitting into integer and fractional parts is what makes
+# **u = n + 0.5 return texel n unmixed**, and u = n an even blend of texels
+# n-1 and n. Leave the shift out and every filtered texture is displaced half a
+# texel, which reads as a sampling offset in the rasteriser rather than as a
+# filter bug -- and the nearest path, which has no such shift, then disagrees
+# with the bilinear path by half a texel as well.
+#
+# The weights come from the four fractional bits of the 12.4 coordinate, so
+# there are sixteen positions between texels and no more. That is not an
+# approximation of something finer: 12.4 is the coordinate format, and a model
+# that lerped with more precision than sixteenths would be smoother than the
+# console.
+
+def _lerp8(a, b, f):
+    """a + (b - a) * f / 16, truncated -- sixteenths, because UV is 12.4."""
+    return a + (((b - a) * f) >> 4)
+
+
+def sample_uv_linear(vm, tex0, clamp, clut, u_fixed, v_fixed):
+    """Bilinear sampling from a UV coordinate in 12.4 fixed point."""
+    tw, th = 1 << bits(tex0, 29, 26), 1 << bits(tex0, 33, 30)
+    wms, wmt = bits(clamp, 1, 0), bits(clamp, 3, 2)
+    minu, maxu = bits(clamp, 13, 4), bits(clamp, 23, 14)
+    minv, maxv = bits(clamp, 33, 24), bits(clamp, 43, 34)
+
+    # The half-texel shift, in 12.4: 0.5 of a texel is 8.
+    uu, vv = u_fixed - 8, v_fixed - 8
+    u0, v0 = uu >> 4, vv >> 4
+    fu, fv = uu & 15, vv & 15
+
+    def tex(ui, vi):
+        return fetch_texel(vm, tex0, clut,
+                           wrap(ui, wms, minu, maxu, tw),
+                           wrap(vi, wmt, minv, maxv, th))
+
+    c00, c10 = tex(u0, v0), tex(u0 + 1, v0)
+    c01, c11 = tex(u0, v0 + 1), tex(u0 + 1, v0 + 1)
+    top = [_lerp8(c00[k], c10[k], fu) for k in range(4)]
+    bot = [_lerp8(c01[k], c11[k], fu) for k in range(4)]
+    return tuple(_lerp8(top[k], bot[k], fv) for k in range(4))
+
+
+# ## STQ and the per-pixel divide
+#
+# `PRIM.FST` chooses between UV and STQ. UV is what 2D work uses and is already
+# above. STQ is what 3D work uses: S and T are interpolated linearly **in screen
+# space along with Q**, and the texture coordinate is recovered per pixel by
+# dividing. That division is the whole reason perspective-correct texturing is
+# expensive, and it is why the GS has a divider in the pixel path at all.
+#
+#     u = (S / Q) * 2**TW        v = (T / Q) * 2**TH
+#
+# The arithmetic is the PlayStation 2's float, not IEEE -- no denormals, no
+# infinities, round toward zero -- so `sim/ee/ps2_float.py` is imported rather
+# than reimplemented, exactly as the VU model does. The GS's float unit is a
+# different piece of silicon from the EE's COP1, but it is the same number
+# system, and two blocks that must agree should share one definition of what a
+# number is.
+#
+# **Q = 0 does not produce an infinity**, because the format has no encoding for
+# one: it saturates to the largest representable value. A model built on host
+# doubles would raise or produce `inf` there and then disagree with hardware
+# about every pixel of a degenerate polygon -- which games do emit, at the
+# horizon and at the exact moment a vertex crosses the eye plane.
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                  "..", "ee"))
+import ps2_float as _F
+
+
+def stq_to_uv(s_bits, t_bits, q_bits, tw_log2, th_log2):
+    """(u, v) in 12.4 fixed point from the interpolated S, T and Q.
+
+    Returns the same units the UV path uses, so everything downstream --
+    wrapping, nearest, bilinear -- is shared between the two coordinate modes
+    rather than duplicated.
+    """
+    u_f = _F.mul(_F.div(s_bits, q_bits)[0], _F.pack(1 << tw_log2)[0])[0]
+    v_f = _F.mul(_F.div(t_bits, q_bits)[0], _F.pack(1 << th_log2)[0])[0]
+    # 12.4: multiply by sixteen and truncate, which is what the coordinate
+    # format is. Rounding here would disagree with the nearest-sampling rule
+    # one line later.
+    #
+    # And then saturate, because the coordinate has a width. A Q near zero makes
+    # S/Q enormous -- the divide saturates at the float format's largest value
+    # rather than producing an infinity, and multiplying *that* by sixteen in
+    # unbounded integers gives a number with forty digits, which is not what any
+    # register holds. The UV path expresses 14 bits of texel plus 4 fractional,
+    # so the same range is used here.
+    #
+    # **The exact hardware behaviour past this point is unverified.** Saturating
+    # is the conservative choice and matches what the format does one step
+    # earlier; wrapping is the other possibility and would put a degenerate
+    # polygon's texels somewhere quite different. Only a console can settle it,
+    # and it is on the probe list rather than guessed at -- so this is marked
+    # rather than presented as known.
+    lim = (1 << 18) - 1                       # 14 integer bits, 4 fractional
+    def clip(x):
+        return -lim - 1 if x < -lim - 1 else (lim if x > lim else x)
+    return (clip(int(_F.value(u_f) * 16)), clip(int(_F.value(v_f) * 16)))
+
+
+def sample(vm, tex0, clamp, clut, u_fixed, v_fixed, linear):
+    """One texture read, nearest or bilinear, from a 12.4 coordinate."""
+    if linear:
+        return sample_uv_linear(vm, tex0, clamp, clut, u_fixed, v_fixed)
+    return sample_uv(vm, tex0, clamp, clut, u_fixed, v_fixed)
+
+
+# ---- mipmap: the level of detail, and choosing a filter ---------------------
+#
+# The last piece of the texture unit. Three registers decide it and they divide
+# the work cleanly:
+#
+#   TEX1.MXL   how many levels exist beyond the base, 0 to 6
+#   TEX1.LCM   where LOD comes from: 0 computes it from Q, 1 takes K directly
+#   TEX1.K, L  the bias and the scale in the computed form
+#   TEX1.MMAG  which filter to use when the texture is magnified (LOD < 0)
+#   TEX1.MMIN  which to use when it is minified, and whether to blend levels
+#
+# ## LOD is computed from Q, not from a derivative
+#
+# A modern GPU picks a mip level from the screen-space derivative of the texture
+# coordinate, which needs neighbouring pixels. The GS does not have them: it
+# rasterises one pixel at a time and has only that pixel's Q. So the formula is
+#
+#     LOD = (log2(1 / Q) << L) + K
+#
+# and since Q is what the perspective divide already needs, the level costs one
+# exponent extraction rather than a derivative. `log2(1/Q)` is **the negated
+# exponent of Q**, and nothing else -- the mantissa is discarded entirely, so
+# the result is an integer before K and L touch it, and a texture whose Q sits
+# anywhere inside a power-of-two band gets the same level across that whole
+# band.
+#
+# That is a real difference from a GPU and it is visible: the level changes in
+# steps as a surface recedes rather than continuously, which is what LCM=1 and
+# per-primitive K exist to work around -- a game that wants a smooth transition
+# computes K itself, on the VU, per primitive.
+#
+# ## MMAG and MMIN are not symmetric
+#
+# MMAG is one bit: nearest or linear. MMIN is three, because minification can
+# also blend *between* levels:
+#
+#     0 NEAREST                 3 LINEAR_MIPMAP_NEAREST
+#     1 LINEAR                  4 NEAREST_MIPMAP_LINEAR
+#     2 NEAREST_MIPMAP_NEAREST  5 LINEAR_MIPMAP_LINEAR
+#
+# The naming is the OpenGL convention and reads backwards until you see it: the
+# first word is the filter *within* a level, the second is the filter *between*
+# levels. So NEAREST_MIPMAP_LINEAR takes one texel from each of two levels and
+# blends the two, and LINEAR_MIPMAP_NEAREST takes four texels from one level.
+
+MMIN_NEAREST, MMIN_LINEAR = 0, 1
+MMIN_N_MIP_N, MMIN_L_MIP_N = 2, 3
+MMIN_N_MIP_L, MMIN_L_MIP_L = 4, 5
+
+
+def lod_from_q(q_bits, l_shift, k_bias):
+    """LOD in 4.4 fixed point, the way TEX1 specifies it when LCM = 0.
+
+    log2(1/Q) is the negated exponent of Q and nothing else. Taking the mantissa
+    into account would be smoother and would not be a PlayStation 2 -- the level
+    would then change continuously across a surface instead of in the visible
+    steps the console actually produces.
+    """
+    exp = (q_bits >> 23) & 0xFF
+    if exp == 0:                      # Q is zero; the format has no denormals
+        log2_inv_q = 127
+    else:
+        log2_inv_q = -(exp - 127)
+    lod = (log2_inv_q << l_shift) + k_bias
+    return lod
+
+
+def mip_level(lod, mxl):
+    """Which level LOD selects, and the fraction between it and the next.
+
+    Returns (level, frac) with frac in sixteenths, so a caller that blends
+    levels has the weight and one that does not can ignore it.
+    """
+    if lod < 0:
+        return 0, 0                   # magnified: the base level, no blend
+    level = lod
+    if level >= mxl:
+        return mxl, 0                 # clamped at the last level that exists
+    return level, 0
+
+
+def filter_for(lod, mmag, mmin):
+    """(within-level filter, blend-between-levels) for this LOD.
+
+    LOD < 0 is magnification and MMAG decides, with one bit and no mipmapping --
+    there is nothing above the base level to blend with. Otherwise MMIN decides,
+    and it can ask for both.
+    """
+    if lod < 0:
+        return (mmag == 1), False
+    linear = mmin in (MMIN_LINEAR, MMIN_L_MIP_N, MMIN_L_MIP_L)
+    blend  = mmin in (MMIN_N_MIP_L, MMIN_L_MIP_L)
+    return linear, blend
+
+
+def sample_mipmap(vm, tex0, tex1, clamp, clut, u_fixed, v_fixed, q_bits,
+                  mip_tbp=None, mip_tbw=None):
+    """One texture read with the level chosen from Q.
+
+    `mip_tbp` and `mip_tbw` are the per-level pointers -- MIPTBP1/2 on hardware,
+    or MTBA's auto-generated ones. A level's texture is half the size of the one
+    above it in each axis, so TW and TH come down by one per level and the
+    pointer has to come from somewhere: the GS will not compute it.
+    """
+    mxl = bits(tex1, 21, 20)
+    lcm = bits(tex1, 19, 19)
+    mmag = bits(tex1, 5, 5)
+    mmin = bits(tex1, 8, 6)
+    l_shift = bits(tex1, 1, 0)
+    k_raw = bits(tex1, 43, 32)
+    k_bias = k_raw - 4096 if k_raw & 0x800 else k_raw
+
+    lod = k_bias if lcm else lod_from_q(q_bits, l_shift, k_bias)
+    linear, blend = filter_for(lod, mmag, mmin)
+    level, _ = mip_level(lod, mxl)
+
+    if level == 0 or mip_tbp is None:
+        return sample(vm, tex0, clamp, clut, u_fixed, v_fixed, linear)
+
+    # A level halves in each axis, so both the coordinate and the size shift.
+    tw, th = bits(tex0, 29, 26), bits(tex0, 33, 30)
+    lv = min(level, len(mip_tbp))
+    t0 = ((mip_tbp[lv - 1] & 0x3FFF)
+          | ((mip_tbw[lv - 1] & 0x3F) << 14)
+          | (bits(tex0, 25, 20) << 20)
+          | (max(0, tw - lv) << 26)
+          | (max(0, th - lv) << 30)
+          | (tex0 & ~((1 << 34) - 1)))
+    return sample(vm, t0, clamp, clut, u_fixed >> lv, v_fixed >> lv, linear)
+
+
 # ---- RGBA16 -----------------------------------------------------------------
 #
 # The 16-bit pixel is A1 B5 G5 R5, alpha in bit 15 and red in bits 4:0, and the
