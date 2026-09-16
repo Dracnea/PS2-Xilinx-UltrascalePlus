@@ -31,13 +31,46 @@ module tb_gs_top;
    logic [15:0]  dbg_unknown;
    logic [31:0]  dbg_pixels;
 
+   // ---- the display, for the contention test ------------------------------
+   logic        pr_we = 0;
+   logic [7:0]  pr_addr = 0;
+   logic [63:0] pr_data = 0;
+   logic        disp_enable = 0;
+   logic [11:0] h_total = 12'd64, v_total = 12'd64;
+   logic        px_valid, px_sof;
+   logic [23:0] px_rgb;
+   logic [11:0] px_x, px_y;
+   logic [31:0] dbg_crtc_rd, dbg_crtc_stall;
+
    gs_top #(.ADDR_BITS(17)) dut (
       .clk(clk), .reset(reset),
       .gif_valid(gif_valid), .gif_data(gif_data), .gif_ready(gif_ready),
       .h_rd_en(h_rd_en), .h_rd_addr(h_rd_addr),
       .h_rd_data(h_rd_data), .h_rd_valid(h_rd_valid),
       .dbg_sel(dbg_sel), .dbg_reg(dbg_reg),
-      .dbg_unknown(dbg_unknown), .dbg_pixels(dbg_pixels));
+      .dbg_unknown(dbg_unknown), .dbg_pixels(dbg_pixels),
+      .pr_we(pr_we), .pr_addr(pr_addr), .pr_data(pr_data),
+      .h_total(h_total), .v_total(v_total), .disp_enable(disp_enable),
+      .px_valid(px_valid), .px_rgb(px_rgb),
+      .px_x(px_x), .px_y(px_y), .px_sof(px_sof),
+      .dbg_crtc_rd(dbg_crtc_rd), .dbg_crtc_stall(dbg_crtc_stall));
+
+   // The pixel stream, hashed the same way local memory is. Two runs of the
+   // same packets with the display on must agree here, and the framebuffer
+   // they draw must agree with a run that had the display off.
+   logic [31:0] pxsum;
+   integer      pxcount;
+   always_ff @(posedge clk) begin
+      if (reset) begin
+         pxsum   <= 32'h811C9DC5;
+         pxcount <= 0;
+      end else if (px_valid) begin
+         pxsum <= ((((((pxsum ^ px_rgb[7:0]) * 32'h01000193)
+                        ^ px_rgb[15:8]) * 32'h01000193)
+                        ^ px_rgb[23:16]) * 32'h01000193);
+         pxcount <= pxcount + 1;
+      end
+   end
 
    localparam MAXPKT = 16384;
    logic [127:0] pkts [0:MAXPKT-1];
@@ -45,6 +78,7 @@ module tb_gs_top;
    logic [7:0] vm [0:VMBYTES-1];
 
    integer sent, npkt, n, r, b, budget;
+   integer waited, got_word;
    logic [31:0] vmsum;
    integer dump_base, dump_len;
    string  pktfile;
@@ -88,6 +122,33 @@ module tb_gs_top;
       reset <= 0;
       @(posedge clk);
 
+      // ---- optionally run the display against the rasteriser --------------
+      //
+      // One circuit covering the whole of a 64x64 raster, reading PSMCT32 from
+      // the base of memory: every output pixel becomes a read, which is the
+      // worst case for the one read port rather than a typical one. The
+      // rasteriser is drawing into the same memory at the same time.
+      //
+      // The picture this makes is not checked here and is not the point --
+      // tb_pcrtc.sv checks pictures against pcrtc_ref.py. What is checked is
+      // that the rasteriser's framebuffer is bit-identical to the run where no
+      // display existed, which is what a misrouted read would destroy.
+      if ($value$plusargs("display=%d", n) && n != 0) begin
+         @(negedge clk);
+         pr_we <= 1;
+         pr_addr <= 8'h00; pr_data <= 64'h0000_0000_0000_0001;   // PMODE: EN1
+         @(negedge clk);
+         pr_addr <= 8'h70; pr_data <= 64'h0000_0000_0000_0200;   // DISPFB1
+         @(negedge clk);
+         pr_addr <= 8'h80; pr_data <= 64'h003F_003F_0000_0000;   // DISPLAY1
+         @(negedge clk);
+         pr_addr <= 8'hE0; pr_data <= 64'h0;                     // BGCOLOR
+         @(negedge clk);
+         pr_we <= 0;
+         @(posedge clk);
+         disp_enable <= 1;
+      end
+
       budget = npkt * 4096 + 65536;
       while (sent < npkt && budget > 0) begin
          @(posedge clk);
@@ -106,13 +167,54 @@ module tb_gs_top;
       // One request at a time rather than a pipeline: this runs once at the end
       // of a simulation and being obviously correct is worth more here than
       // being quick.
+      // **The display stops before the framebuffer is read back.**
+      //
+      // The contention worth testing is the rasteriser against PCRTC while
+      // drawing, and that has already happened by now -- dbg_crtc_rd and
+      // dbg_crtc_stall are cumulative and hold what it came to. The readback is
+      // only how the framebuffer is extracted, and leaving the display running
+      // through it turns 131072 host reads into 131072 contended reads, each
+      // retrying against a PCRTC that wants the port every few cycles. One seed
+      // took an hour and a half and had three more behind it.
+      //
+      // It also makes the two runs symmetric: both now read back with the
+      // display idle, so the checksums compare the framebuffers rather than the
+      // conditions they were read under.
+      disp_enable <= 0;
+      @(posedge clk);
+
+      // **The host request is retried, not held.**
+      //
+      // The host is the lowest priority of the read port's three customers and
+      // may be refused outright -- true before the display existed, and routine
+      // once it is running. Pulsing h_rd_en once and then waiting forever on
+      // h_rd_valid deadlocks on the first refusal.
+      //
+      // Holding h_rd_en instead is worse, and it is worse in a way that looks
+      // like an RTL bug: several reads go out, each answers with its own
+      // h_rd_valid, and a trailing valid from one address is still asserted
+      // when the next iteration starts. The wait then falls straight through
+      // and stores the previous word. That corrupts the memory dump with the
+      // display *off* as well, which is how it was caught -- the plain gs_top
+      // differential started failing.
+      //
+      // So: one read, a bounded wait for the answer, and ask again if none
+      // came. A refused read leaves nothing in flight, so a retry is clean.
       for (n = 0; n < (1 << 17); n = n + 1) begin
-         @(negedge clk);
-         h_rd_addr = n[16:0];
-         h_rd_en   = 1'b1;
-         @(negedge clk);
-         h_rd_en   = 1'b0;
-         while (!h_rd_valid) @(negedge clk);
+         got_word = 0;
+         while (!got_word) begin
+            @(negedge clk);
+            h_rd_addr = n[16:0];
+            h_rd_en   = 1'b1;
+            @(negedge clk);
+            h_rd_en   = 1'b0;
+            waited = 0;
+            while (!h_rd_valid && waited < 8) begin
+               @(negedge clk);
+               waited = waited + 1;
+            end
+            if (h_rd_valid) got_word = 1;
+         end
          for (b = 0; b < 32; b = b + 1)
             vm[n*32 + b] = h_rd_data[b*8 +: 8];
       end
@@ -128,6 +230,10 @@ module tb_gs_top;
       $write("VMSUM %08x\n", vmsum);
       if (dbg_unknown != 0) $display("# unknown register writes: %0d", dbg_unknown);
       $display("# pixels drawn: %0d", dbg_pixels);
+      $write("CRTCRD %0d\n", dbg_crtc_rd);
+      $write("CRTCSTALL %0d\n", dbg_crtc_stall);
+      $write("PXCOUNT %0d\n", pxcount);
+      $write("PXSUM %08x\n", pxsum);
       $finish;
    end
 endmodule

@@ -78,7 +78,15 @@ entity gs_pcrtc is
       -- which is what lets a testbench put the registers in place first.
       enable    : in  std_logic := '0';
 
-      -- local-memory read port, arbitrated outside this block
+      -- local-memory read port, arbitrated outside this block.
+      --
+      -- `rd_ready` is the arbiter's grant. This block used to assert rd_en and
+      -- walk on, which is correct only while it is the memory's one customer;
+      -- sharing the port with the rasteriser means a request can be refused,
+      -- and a refused request that is not retried strands the state machine in
+      -- S_WAIT for a return that will never come. It defaults to '1' so a
+      -- testbench that drives no arbiter still means what it meant.
+      rd_ready  : in  std_logic := '1';
       rd_en     : out std_logic := '0';
       rd_addr   : out std_logic_vector(ADDR_BITS-1 downto 0) := (others => '0');
       rd_data   : in  std_logic_vector(255 downto 0) := (others => '0');
@@ -233,10 +241,12 @@ begin
       variable mmod, slbg : std_logic;
       variable bg    : std_logic_vector(23 downto 0);
       variable eol, eof : boolean;
+      variable issued   : boolean;
    begin
       if rising_edge(clk) then
          rd_en    <= '0';
          px_valid <= '0';
+         issued   := false;
 
          if reset = '1' then
             hx    <= (others => '0');
@@ -286,17 +296,39 @@ begin
                            a := pix_addr_page(c.fbp, c.fbw, sx, sy);
                            hlf(i) <= '0';
                         end if;
-                        rd_en   <= '1';
+                        -- **The grant belongs to the request on the wire,
+                        -- not to the decision to make one.** rd_en is
+                        -- registered, so it goes high the cycle *after* this
+                        -- one; testing rd_ready here tests the arbiter against
+                        -- whatever was presented last cycle instead. Getting
+                        -- that wrong marks a read as issued that is then
+                        -- refused, sets `need` for a read nobody took, and
+                        -- strands the pixel in S_WAIT for a return that cannot
+                        -- come -- which is a hang, not a dropped pixel.
+                        --
+                        -- So present the request first and confirm it after:
+                        -- rd_en = '1' means it is on the wire this cycle, and
+                        -- rd_ready with it means the arbiter took it. The
+                        -- address is recomputed from the same hx/vy each cycle,
+                        -- so holding costs nothing but the cycle.
                         rd_addr <= std_logic_vector(a(ADDR_BITS + 2 downto 3));
-                        off(i)  <= a(2 downto 0);
-                        need(i) <= '1';
+                        if rd_en = '1' and rd_ready = '1' then
+                           off(i)  <= a(2 downto 0);
+                           need(i) <= '1';
+                           issued  := true;
+                        else
+                           rd_en   <= '1';
+                        end if;
                      else
                         need(i) <= '0';
+                        issued  := true;
                      end if;
-                     if state = S_ISS0 then
-                        state <= S_ISS1;
-                     else
-                        state <= S_WAIT;
+                     if issued then
+                        if state = S_ISS0 then
+                           state <= S_ISS1;
+                        else
+                           state <= S_WAIT;
+                        end if;
                      end if;
                   end if;
 

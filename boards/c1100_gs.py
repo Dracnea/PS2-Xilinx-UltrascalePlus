@@ -83,7 +83,7 @@ def add_gs_sources(platform, root=REPO_ROOT):
     """The Graphics Synthesizer's RTL, in dependency order."""
     rtl = join(root, "rtl", "gs")
     for f in ("gs_addr_pkg.vhd", "gs_edge_dda.vhd", "gs_chan_dda.vhd", "gs_gif.vhd",
-              "gs_lmem.vhd", "gs_top.vhd"):
+              "gs_lmem.vhd", "gs_pcrtc.vhd", "gs_top.vhd"):
         platform.add_source(join(rtl, f), language="vhdl")
 
 
