@@ -57,7 +57,7 @@ separate design and separate verification:
 | **rasteriser + 4 MB local memory** | *works on the card* — sprites, Gouraud triangles, the page/block/column swizzle cross-checked exhaustively against a second implementation, PSMCT32/24/16/16S, 14 differential streams byte-identical by full 4 MB checksum, running at **147.456 MHz, the console's own clock**, four pixels per clock on all three paths |
 | **texture unit** | **no RTL** — and nothing renders like a PlayStation 2 without it. But the reference model is **complete**: `gs-texture.md` runs from the PSMT8/PSMT4 address permutations through the H formats and the CLUT to UV sampling, STQ with the perspective divide, mipmap and bilinear. The RTL will have an exhaustively cross-checked oracle to diff against from its first line |
 | alpha / Z / dither back end | *partial* — alpha blending and the depth test work and are 4-wide; dither is not started, and alpha test and destination-alpha test are not started |
-| PCRTC video output | *partial* — the read circuit works and is verified against a model; no sync generator, and it is not yet wired into `gs_top` or out to the host |
+| PCRTC video output | *partial* — the read circuit works, is wired into `gs_top`, and **has composited a frame on the card** that matches both the host de-swizzle and the reference model on all 4096 pixels (2026-09-16). No sync generator, and nothing is out of a connector: the frame reaches the host through the grab buffer, which holds 64 x 64 |
 
 Also not started in the GS: lines and points, local-to-host and local-to-local
 transfers, host-to-local beyond PSMCT32, and the comparing depth tests 4-wide.
@@ -271,12 +271,35 @@ second implementation, never an authority, and never a source of code, since it
 is GPL-3 and this repository is GPL-2.
 
 *Milestone:* a picture, through the video path that already works.
+**Taken, 2026-09-16.**
 
-**That milestone is now the cheapest one left, and worth taking before the
-texture unit.** The rasteriser draws correctly on the card and the host video
-path is verified at 60 fps with a test pattern; what stands between those two
-is a sync generator and wiring PCRTC into `gs_top`. Everything else on this
-page is measured in checksums. This one ends in something you can look at.
+The card composited a frame through PCRTC and the host wrote it to a PNG:
+`tools/gs/gen_scene.py --size 64 64` for the scene, `tools/gs/gsrun.py` to draw
+it, `tools/gs/pcrtcgrab.py` to grab it. 4096 pixels, 297,159 display reads, and
+**zero refused by the arbiter** — the display and the rasteriser share one read
+port and the display never lost it.
+
+What makes it evidence rather than a screenshot is that the same frame was read
+back three ways and all three agree on **every one of the 4096 pixels**:
+
+| path | what it exercises |
+|---|---|
+| `pcrtcgrab.py` | the card's own read circuits, merge, blend and magnification |
+| `gsgrab.py` | the frame buffer over PCIe, de-swizzled on the host |
+| `gsgrab.py --model-only` | `sim/gs/gs_ref.py`, no card involved |
+
+The first two are different silicon paths to the same memory; the third is a
+different implementation entirely. The picture shows six flat sprites, a Gouraud
+triangle interpolating red-green-blue across its corners, two half-transparent
+sprites whose overlap is a third shade, and a depth-tested pair where the
+further triangle is correctly cut away by the nearer one.
+
+**What it does not show, and the honest limit on it:** there is still no sync
+generator, so this is a raster PCRTC walks on command rather than a video
+signal a display could lock to, and nothing is out of a connector. And the
+frame grab holds 4096 pixels, so a whole frame through this path is 64 x 64 and
+no larger — a bring-up window, not the picture path a game would use. Both are
+the next things on this track.
 
 ### 5. Integration, then a game
 

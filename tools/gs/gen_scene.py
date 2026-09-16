@@ -12,10 +12,25 @@ themselves.
 It uses only what is built: flat and Gouraud triangles, sprites, alpha blending
 and the depth test.  No texture, because there is no texture unit.
 """
+import argparse
 import sys
 
-W, H = 320, 224          # a quarter of a PS2 frame, and 280 KB of a page-aligned
-                         # buffer, so a grab is quick
+# The scene is composed once, in these coordinates, and scaled on the way out.
+# 320 x 224 is a quarter of a PS2 frame and the size this was drawn for.
+DW, DH = 320, 224
+W, H = DW, DH
+
+# PCRTC's frame grab holds 4096 pixels, so a whole frame through the video path
+# is 64 x 64 and no larger.  That is a different constraint from the one this
+# file was written under -- a frame buffer read back over PCIe has no such
+# limit -- so the scene is placed in DW x DH and mapped into whatever raster is
+# asked for, rather than being redrawn per size.
+def sx(v):
+    return v * W / DW
+
+
+def sy(v):
+    return v * H / DH
 
 
 def tag(nloop, eop, regs, nreg):
@@ -52,10 +67,13 @@ def ctx(prim, alpha=0, abe=0, ztst=1, zmsk=1, fbmsk=0):
     ]
 
 
-def sprite(out, x0, y0, x1, y1, colour, abe=0, alpha=0):
+def sprite(out, x0, y0, x1, y1, colour, abe=0, alpha=0, raw=False):
+    """Coordinates are in DW x DH unless raw, which passes them through."""
+    fx, fy = (int, int) if raw else (sx, sy)
     out += ad(ctx(6, alpha, abe) + [(0x01, colour)])
     out += [tag(1, 1, 0xEE, 2),
-            xyz(x0, y0) | (0x05 << 64), xyz(x1, y1) | (0x05 << 64)]
+            xyz(fx(x0), fy(y0)) | (0x05 << 64),
+            xyz(fx(x1), fy(y1)) | (0x05 << 64)]
 
 
 def tri(out, pts, colours, iip=1, z=None, ztst=1, zmsk=1, abe=0, alpha=0):
@@ -64,7 +82,7 @@ def tri(out, pts, colours, iip=1, z=None, ztst=1, zmsk=1, abe=0, alpha=0):
     items = []
     for (x, y), c in zip(pts, colours):
         items.append((0x01, c))
-        items.append((0x05, xyz(x, y, 0 if z is None else z)))
+        items.append((0x05, xyz(sx(x), sy(y), 0 if z is None else z)))
     regs = 0
     for i in range(len(items)):
         regs |= 0xE << (4 * i)
@@ -74,10 +92,25 @@ def tri(out, pts, colours, iip=1, z=None, ztst=1, zmsk=1, abe=0, alpha=0):
 
 
 def main():
+    global W, H
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--size", nargs=2, type=int, default=[DW, DH],
+                    metavar=("W", "H"),
+                    help="raster to compose for; W must be a multiple of 64 "
+                         "because FBW counts 64-pixel units (default 320 224)")
+    a = ap.parse_args()
+    W, H = a.size
+    if W % 64:
+        raise SystemExit(f"width {W} is not a multiple of 64, so FBW cannot "
+                         f"name it")
+
     out = []
 
-    # a dark background, so anything drawn over it is obvious
-    sprite(out, 0, 0, W, H, rgbaq(0x10, 0x10, 0x20))
+    # a dark background, so anything drawn over it is obvious.  This one is in
+    # raster coordinates, not scene ones: it has to cover the frame exactly.
+    sprite(out, 0, 0, W, H, rgbaq(0x10, 0x10, 0x20), raw=True)
 
     # a row of flat sprites: the primary colours, at known positions
     for i, c in enumerate([rgbaq(0xF0, 0, 0), rgbaq(0, 0xF0, 0), rgbaq(0, 0, 0xF0),

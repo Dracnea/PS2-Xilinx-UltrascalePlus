@@ -1562,3 +1562,51 @@ The rest of step 4 — lines and points, and texture. PCRTC's sync generator, an
 PCRTC wired into `gs_top` and out to the host.
 Local-to-host and local-to-local transfers; host-to-local is still PSMCT32 only.
 Dither, which needs a 16-bit format to act on and now has one.
+
+## A picture the card composited — 2026-09-16
+
+PCRTC has been wired out of `gs_top` since `13eaa6b`; this is the first time a
+frame went through it on hardware. `tools/gs/gen_scene.py` grew a `--size`
+option to compose for a raster other than the 320 x 224 it was written for,
+because the grab buffer holds 4096 pixels and a whole frame through this path is
+therefore 64 x 64. The default output is unchanged, byte for byte, which is the
+only thing that makes a change to a test-input generator safe to make.
+
+The run, in order:
+
+    tools/gs/gen_scene.py --size 64 64 > scene64.hex
+    tools/gs/gsrun.py     --csr build/c1100_gs_disp3/csr.csv --prog scene64.hex
+    tools/gs/pcrtcgrab.py --csr build/c1100_gs_disp3/csr.csv --raster 64 64 -o pcrtc.png
+
+`gsrun.py` reports 6908 pixels drawn against the model's 6908, and every one of
+the 128 general registers reads back what the model holds. `pcrtcgrab.py` then
+captured 4096 pixels of a 64 x 64 raster with **297,159 display reads and zero
+refused by the arbiter** — the number worth watching, because the display
+circuit and the rasteriser were put on one read port deliberately (`a3451fe`)
+and this is the first time the display has had to compete for it on silicon.
+
+**Three read paths, one answer.** The frame was taken three ways and compared
+pixel by pixel:
+
+* `pcrtcgrab.py` — the card's read circuits, merge, blend and magnification;
+* `gsgrab.py` — the same memory over PCIe, de-swizzled on the host;
+* `gsgrab.py --model-only` — `sim/gs/gs_ref.py`, with no card in the loop.
+
+All three are identical on all 4096 pixels. The first two are different paths
+through the same silicon to the same memory, so agreeing rules out the read
+circuit; the third is a separate implementation, so agreeing rules out both
+being wrong in the same way.
+
+The picture itself is the one `gen_scene.py` was built to produce and is meant
+to be *looked at* rather than checksummed: six flat sprites in the primaries,
+one large Gouraud triangle with red, green and blue at its corners, two
+half-transparent sprites whose overlap resolves to a third shade, and a
+depth-tested pair in which the further triangle is cut away exactly where the
+nearer one covers it. Nothing has a seam, the gradient runs the right way, and
+the blend has no hard edge where the two transparent sprites meet — the three
+faults this scene exists to make visible, none of them present.
+
+**What this is not.** There is still no sync generator, so PCRTC is walking a
+raster on command rather than producing a signal a display could lock to, and
+no pixel leaves the card by anything but the grab buffer. A first-light picture
+is proof the read circuits are right, not proof there is a video output.
