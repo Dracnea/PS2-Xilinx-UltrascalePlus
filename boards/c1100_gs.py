@@ -82,7 +82,12 @@ REPO_ROOT = join(dirname(abspath(__file__)), "..")
 def add_gs_sources(platform, root=REPO_ROOT):
     """The Graphics Synthesizer's RTL, in dependency order."""
     rtl = join(root, "rtl", "gs")
-    for f in ("gs_addr_pkg.vhd", "gs_edge_dda.vhd", "gs_chan_dda.vhd", "gs_gif.vhd",
+    for f in ("gs_addr_pkg.vhd", "gs_edge_dda.vhd", "gs_chan_dda.vhd",
+              # The texture unit, ahead of gs_gif because it instantiates all
+              # four: the palette, the sampler and the cache in front of it.
+              "gs_texaddr.vhd", "gs_clut.vhd", "gs_texsample.vhd",
+              "gs_texcache.vhd",
+              "gs_gif.vhd",
               "gs_lmem.vhd", "gs_pcrtc.vhd", "gs_pxcap.vhd", "gs_top.vhd"):
         platform.add_source(join(rtl, f), language="vhdl")
 
