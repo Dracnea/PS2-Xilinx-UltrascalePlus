@@ -235,3 +235,104 @@ scaled as pages rather than blocks.
 
 **Steps 1 to 5 are now done in the reference model.** What remains for the
 texture unit is RTL, and the pixel pipeline it has to join.
+
+## The RTL starts: addressing, 2026-09-17
+
+**Steps 1 to 5 were the reference model. This is the first of the unit to become
+hardware**, and it is the addressing rather than the sampler, for the reason
+this page gave when it was written: the sampler lives inside a pixel pipeline
+that is still being widened, and one written a pixel wide today would be
+rewritten. Addressing does not care. A texel is at the same address whether it
+is fetched one at a time or four at a time.
+
+`rtl/gs/gs_texaddr.vhd` takes a texel coordinate and the TEX0 and CLAMP state and
+says where that texel's bits are. It does not fetch, look up a CLUT, filter, or
+combine with a fragment colour — those are the sampler's, and they are what
+waits for the pipeline.
+
+### One interface decision
+
+Nine formats store texels at four granularities — a nibble, a byte, a half word
+and a word — and three hide an index in the spare bits of somebody else's word.
+Reported in their own units, every caller would carry the same four-way case. So
+all nine are normalised to the same three numbers: **which 256-bit local-memory
+word, which bit in it, and how wide the texel is.** That is the form a fetch
+from `gs_lmem` actually needs, and it makes the H formats stop being special:
+`PSMT8H` is a `PSMCT32` address with 24 added to the bit offset and a width of
+8. The awkward part of those formats becomes an adder that was there anyway.
+
+The colour formats call `gs_addr_pkg` unchanged rather than reimplementing it.
+A texture unit reading back a frame buffer has to agree with the rasteriser that
+wrote it, and calling the same function is the only way to guarantee that rather
+than hope for it.
+
+### What the test is, and what makes it a test
+
+`sim/gs/run_texaddr_diff.sh` drives the RTL with cases from `gs_ref.py` and
+compares. **29,140 cases, identical on five seeds.** The cases are structured
+before they are random:
+
+* every format at the origin and at fixed places in the first page — if a format
+  is wrong at all it is usually wrong here, and a failure at (0,0) says
+  something different from one at (17,9);
+* **one page of `PSMT8` and of `PSMT4`, exhaustively.** These are the maps this
+  unit adds; everything else it inherits. A page is small enough to sweep
+  completely, and a wire permutation that is right on 400 random texels and
+  wrong on one is exactly the fault a sweep catches and sampling does not;
+* multi-page cases crossing a boundary in both axes, because that is where
+  TBW's units bite;
+* all sixteen combinations of the two wrap modes, with negative coordinates.
+
+The conversion from the model's units into the RTL's three numbers is written in
+`gen_texaddr.py` from what each model function documents itself as returning,
+deliberately **not** from the RTL. Derived from the RTL it would agree by
+construction and the diff would prove nothing.
+
+Passing first time is a reason for suspicion rather than satisfaction, so
+**eleven mutations were injected and all eleven were caught**, including the
+five that look most like something a careful person would write:
+
+| mutation | cases it broke |
+|---|---|
+| TBW halving dropped for the indexed formats | 276 |
+| `block4`'s x and y not exchanged | 14,688 |
+| `column4`'s xor term dropped | 8,403 |
+| `PSMT4HH` reading the low nibble | 475 |
+| `REGION_REPEAT` written as a clamp | 1,765 |
+| the 16-bit half ignored | 455 |
+| CLAMP ignoring a negative coordinate | 957 |
+| `column8` with x0 and x3 transposed | 4,325 |
+| `PSMCT16S` treated as `PSMCT16` | 316 |
+| `PSMT8` block row off by one bit | 6,389 |
+| `PSMT4` page stride using y>>6 | 8,415 |
+
+The TBW one is worth its own line: it breaks only 276 of 29,140 cases, because
+it is *correct* for every texture one page wide or narrower. A test that did not
+deliberately cross a page boundary would have missed it, and the picture it
+produces is a shear that looks like a rasteriser fault rather than an addressing
+one.
+
+### The cost, measured
+
+Out-of-context synthesis for `xcu55n`: **349 LUTs, no flip-flops, no DSP, no
+block RAM.** The column maps really are wire permutations and one XOR3 gate
+each, as the derivation claimed — most of the 349 is the page arithmetic's
+multiply and the wrap's comparators, not the swizzle.
+
+Measured rather than asserted, and that phrasing is deliberate: `gs_pxcap`
+carried a comment claiming four block RAMs while costing 30,725 LUTs and 98,428
+flip-flops, and nothing caught it until the whole design lost its timing. Forty
+seconds of out-of-context synthesis is the cheapest check in this repository.
+
+### Unregistered, on purpose
+
+`gs_texaddr` is combinational. Where the pipeline registers go is the sampler's
+decision and putting them here would be guessing at a shape this page says is
+still open. A register stage added around a correct function is a much smaller
+change than one removed from inside it.
+
+**Next is the fetch and the CLUT** — the first piece that needs the read port,
+and therefore the first that has to face the question this page opened with: the
+real GS gives texture its own 512-bit path so a texel fetch does not contend
+with the frame buffer, and `gs_lmem` has one read port with two customers on it
+already.
