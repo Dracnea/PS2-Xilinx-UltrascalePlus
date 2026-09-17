@@ -945,3 +945,71 @@ rates and the compulsory-miss floors are unchanged.
 ### What this does not answer
 
 None of it has been on the card. That is the next step and it needs a bitstream.
+
+## On the card — 2026-09-17
+
+**The Graphics Synthesizer drew a textured picture on the C1100**, and the
+picture is byte-identical to `gs_ref.py` on every one of its 4096 pixels, read
+back three different ways.
+
+`tools/gs/gen_texscene.py` builds the scene: a 16 × 16 texture laid down by
+host-to-local transfer, then four 32 × 32 quadrants of textured triangles —
+nearest and bilinear, at 1:1 and at 2× magnification. Image `c1100_gs_tex`,
+built from `boards/c1100_gs.py`.
+
+```
+tools/gs/gen_texscene.py > texscene.hex
+tools/gs/gsrun.py     --csr build/c1100_gs_tex/csr.csv --prog texscene.hex
+tools/gs/pcrtcgrab.py --csr build/c1100_gs_tex/csr.csv --raster 64 64 -o pcrtc.png
+tools/gs/gsgrab.py    --csr build/c1100_gs_tex/csr.csv --prog texscene.hex --size 64 64 -o card.png
+tools/gs/gsgrab.py                                     --prog texscene.hex --size 64 64 --model-only -o model.png
+```
+
+### What makes it evidence rather than a screenshot
+
+The same frame read back three ways, agreeing on **all 4096 pixels**:
+
+| path | what it exercises |
+|---|---|
+| `pcrtcgrab.py` | the card's own read circuits, merge, blend and magnification |
+| `gsgrab.py` | the frame buffer over PCIe, de-swizzled on the host |
+| `gsgrab.py --model-only` | `gs_ref.py`, no card involved |
+
+The first two are different silicon paths to the same memory; the third is a
+different implementation entirely.
+
+And two properties of the picture itself, checked rather than looked at:
+
+* **nearest and bilinear+0.5 at 1:1 are pixel-identical — 0 of 1024 differ.**
+  That is the half-texel shift, measured on hardware.
+* **nearest and bilinear at 2× differ on 204 of 1024 pixels.** That is the
+  filter actually filtering. Either property alone is satisfied by a texture
+  unit with its filter select stuck; both together are not.
+
+### The arbiter held
+
+**297,276 display reads, 0 refused.** The texture unit is a fourth customer on
+the one read port and the display still never lost it — which is the ordering
+decision (PCRTC above texture) holding up on hardware rather than in argument.
+
+### The scene corrected a claim in its own header
+
+The first version asserted that nearest and bilinear must look the same at 1:1,
+and that a blurred bilinear quadrant would mean the half-texel shift was wrong.
+**That was backwards.** With UV running 0 to 32 across 32 pixels, pixel x sits
+at u = x, bilinear samples at x − 0.5, and every pixel is an even blend of two
+texels: a uniform half-texel blur on what looks like a one-to-one blit. It is
+what the hardware does, and it is why content wanting a sharp 1:1 blit either
+uses nearest or offsets its UV by half a texel.
+
+The scene now applies that offset, which turns the observation into the
+assertion above. Worth keeping as a picture as well as a number: had the shift
+been missing from the filter, the offset quadrants would be the blurred ones and
+the unoffset ones sharp — the same two images, swapped, which a checksum against
+a model that shared the mistake would not have caught.
+
+### What is still not on the card
+
+Textured sprites, `PRIM.FST = 0` and the per-pixel divide, mipmap levels, and
+the two vector units that would feed any of this from a game rather than from a
+host-built packet stream.
