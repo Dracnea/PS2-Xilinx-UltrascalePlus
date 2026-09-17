@@ -11,12 +11,10 @@ so the program goes in through the HBM probe on the card's second AXI port.
 Which one is present is decided by looking for the window rather than by a flag,
 because the csr.csv already says.
 
-**Note, 2026-09-17:** against c1100_ee_hbm the core does not execute what is
-loaded -- see "The EE-HBM image on the card" in docs/ee-core.md. The loading
-path below is believed correct (every beat is read back before the core is
-released, and the same probe passes tools/ps2iop/hbm_test.py), and the fault is
-somewhere between the core's AXI master and HBM. Until that is found, --compare
-against that image will fail for reasons that are not the R5900's.
+**Fixed 2026-09-17.** Loading against c1100_ee_hbm first produced a core that
+ran away into undefined instructions, which looked like an EE fault and was
+not: ee_ram places the EE's 32 MB at HBM_BASE, 6 GiB into HBM, and this tool was
+writing at 0. See "The EE-HBM image on the card" in docs/ee-core.md.
 
 `--clock` measures cd_ee and says whether it is the console's 294.912 MHz.
 `--prog` loads a program, releases reset, waits for it to retire `--steps`
@@ -33,6 +31,7 @@ programs do, by parking in a branch to themselves -- those are the same thing.
 import argparse
 import fcntl
 import os
+import re
 import struct
 import sys
 import time
@@ -141,9 +140,23 @@ class Card:
     # program is a few hundred instructions, and a loader that needed DMA to be
     # correct first could not be used to find out whether the core works.
     #
-    # There is no offset to apply.  EEWithMemory crosses the core's AXI into the
-    # HBM port with a clock-domain crossing and nothing else, so an address the
-    # core issues is the byte address the probe writes.
+    # **There is an offset, and missing it costs a night.**  EEWithMemory crosses
+    # the core's AXI into the HBM port with nothing but a clock-domain crossing,
+    # which is what made "no offset" look obviously true.  The offset is one
+    # level further down: ee_ram.vhd carries a generic
+    #
+    #     HBM_BASE : std_logic_vector(32 downto 0) := "1" & x"80000000"
+    #
+    # and adds it to every AXI address it issues, so the EE's 32 MB of main
+    # memory lives at **6 GiB** in HBM and the core's address 0 is HBM byte
+    # address 0x1_8000_0000.  A loader writing at 0 writes 6 GiB away from
+    # anything the core will ever fetch -- and every write succeeds, reads back
+    # correctly, and answers AXI resp=0, because they are perfectly good writes
+    # to a place nothing is looking at.
+    #
+    # This is read from the RTL rather than written as a constant twice.  Two
+    # copies of a base address is exactly the bug above, wearing a different
+    # hat.
     BEAT = 32                              # bytes in one 256-bit beat
 
     def hbm_beat(self, addr, words):
@@ -188,7 +201,27 @@ class Card:
     # the scratch with room to spare, and costs 512 beats.
     CLEAR_BYTES = 0x4000
 
-    def load_hbm(self, words, base=0, verify=True, clear=CLEAR_BYTES):
+    @staticmethod
+    def hbm_base(root=None):
+        """HBM_BASE, read out of rtl/ee/ee_ram.vhd."""
+        if root is None:
+            root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..")
+        src = os.path.join(root, "rtl", "ee", "ee_ram.vhd")
+        pat = re.compile(r'HBM_BASE\s*:\s*std_logic_vector\([^)]*\)\s*:=\s*'
+                         r'"([01]+)"\s*&\s*x"([0-9a-fA-F]+)"')
+        with open(src) as f:
+            m = pat.search(f.read())
+        if not m:
+            raise SystemExit(
+                f"could not find HBM_BASE in {src}.\n"
+                f"  It is the base of the EE's memory inside HBM and a loader "
+                f"that guesses it writes somewhere the core never reads.")
+        return (int(m.group(1), 2) << (4 * len(m.group(2)))) | int(m.group(2), 16)
+
+    def load_hbm(self, words, base=None, verify=True, clear=CLEAR_BYTES):
+        if base is None:
+            base = self.hbm_base()
         """Instruction words into HBM, eight to a beat, read back to check.
 
         The read-back is not ceremony.  Loading through a probe that has never
@@ -343,18 +376,55 @@ def main():
         cpu = r5900_ref.R5900(mem, 0)
         # Run until the PC stops moving, which is the park, then a little more
         # so a two-instruction loop cannot look stationary by accident.
-        last, still = None, 0
+        # **The park is a two-instruction cycle, not a stationary PC.**
+        # gen_card ends its programs with `BEQ r0, r0, -1` and a NOP in the
+        # delay slot, so a parked model runs branch, slot, branch, slot and its
+        # PC alternates between two addresses forever. A detector waiting for
+        # the PC to stop moving therefore never fires -- which is what the old
+        # one did, on every program, so it printed "the model never parked" and
+        # compared anyway every single time. The note was always there and
+        # always ignored, which is the worst state for a warning to be in.
+        #
+        # What parking actually looks like is a cycle, so that is what is
+        # detected: the PC equal to the one two steps back, sustained. Period 1
+        # and period 2 are both covered, and requiring several repetitions keeps
+        # an ordinary two-instruction loop in the middle of a program from
+        # ending the run early.
+        prev2, prev1, cyc, parked = None, None, 0, False
         for _ in range(20000):
             cpu.step()
-            if cpu.pc == last:
-                still += 1
-                if still > 4:
+            if prev2 is not None and cpu.pc == prev2:
+                cyc += 1
+                if cyc > 8:
+                    parked = True
                     break
             else:
-                still = 0
-            last = cpu.pc
-        else:
-            print("note: the model never parked; comparing anyway")
+                cyc = 0
+            prev2, prev1 = prev1, cpu.pc
+
+        # **A program that never parks cannot be compared, and saying so is not
+        # the same as passing it.**  This used to print a note and compare
+        # anyway, which is worse than either: the card is still running when its
+        # registers are read, so the comparison is against a moving target and
+        # reports a FAIL that has nothing to do with the core.  Seed 6 of
+        # gen_card showed it plainly -- one PASS and then three failures naming
+        # three different sets of registers, from the same program on the same
+        # silicon.
+        #
+        # The park is what makes the card's state a definite moment; without it
+        # there is no moment to compare.  So this is a distinct outcome, not a
+        # failure, and it points at the generator rather than at the hardware.
+        if not parked:
+            print("INCONCLUSIVE  the model never parked, so this program does "
+                  "not terminate.")
+            print("  The card is still running when its registers are read, so "
+                  "there is no")
+            print("  single moment to compare against. This says nothing about "
+                  "the core --")
+            print("  it says the generated program has a loop, and gen_card "
+                  "should not have")
+            print("  emitted it. Try another seed.")
+            return 2
         # r128, not r: r() is the low 64 bits. MMI writes the upper half,
         # and comparing with r() reports a correct core as broken for
         # every register whose result lives up there.

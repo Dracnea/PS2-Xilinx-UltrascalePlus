@@ -38,7 +38,7 @@ separate design and separate verification:
 |---|---|
 | **R5900 core** | **works on the card** — 64-bit MIPS III plus the 128-bit MMI SIMD set, 35 differential tests, mutation-checked, and running at **the console's 294.912 MHz** with +0.135 ns of margin. The ~204 MHz that was the open problem is closed: a sixth pipeline stage, the 0.85 V rail and its matching speed file between them bought the difference |
 | FPU (COP1) | *reference model done* — `sim/ee/ps2_float.py`, exact-rational, 33 checks. No RTL |
-| 32 MB main memory | not started. Needs HBM, and therefore `--vccmem default` |
+| 32 MB main memory | **works on the card, 2026-09-17** — the R5900 executes out of HBM at the console's 294.912 MHz, 11 of 12 differential seeds identical to the model with 0 unimplemented instructions. It is mapped at `HBM_BASE`, 6 GiB into HBM, which a host loader has to know |
 | 16 KB scratchpad | not started |
 | EE DMAC, 10 channels | not started |
 | EE INTC and timers | not started |
