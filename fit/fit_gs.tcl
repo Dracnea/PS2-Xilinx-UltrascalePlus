@@ -15,6 +15,8 @@ set rtl  [file normalize $here/../rtl]
 # Out of context means nothing is optimised across the chosen top's boundary
 # either way, so listing them all costs an unused block nothing.
 read_vhdl -vhdl2008 [list \
+   $rtl/ee/ee_fpu_pkg.vhd \
+   $rtl/gs/gs_stq.vhd \
    $rtl/gs/gs_addr_pkg.vhd \
    $rtl/gs/gs_texaddr.vhd \
    $rtl/gs/gs_clut.vhd \

@@ -1013,3 +1013,120 @@ a model that shared the mistake would not have caught.
 Textured sprites, `PRIM.FST = 0` and the per-pixel divide, mipmap levels, and
 the two vector units that would feed any of this from a game rather than from a
 host-built packet stream.
+
+## The perspective divide, in hardware — 2026-09-17
+
+`rtl/gs/gs_stq.vhd`: S, T and Q in, a 12.4 texture coordinate out. It is
+`stq_to_uv` from the reference model, and it is diffed against that model rather
+than against a description of it — **1986 coordinates identical on four seeds**.
+
+    u = (S / Q) * 2**TW        v = (T / Q) * 2**TH
+
+### The arithmetic is shared with the Emotion Engine, deliberately
+
+The operand conditioner comes from `rtl/ee/ee_fpu_pkg.vhd` rather than being
+written again. The GS's float unit is different silicon from the EE's COP1, but
+it is the same number system, and the model already takes that position —
+`gs_ref.py` imports `ps2_float` rather than reimplementing it. Two blocks that
+must agree bit for bit should share one definition of what a number is, and
+"denormals read as a signed zero" and "a full exponent field reads as the
+largest finite value" are already written down and already tested there.
+
+**Q = 0 does not produce an infinity**, because the format has no encoding for
+one: it saturates to the largest finite value with the signs exclusive-ored.
+Games emit that at the horizon and at the moment a vertex crosses the eye plane,
+so it is not a corner case to leave for later.
+
+### One floor, not two roundings
+
+The model computes the exact rational and truncates once. Doing that in hardware
+without carrying a rational is the one trick in the file. With A and B the
+24-bit mantissas including their implicit ones, the ratio is in (0.5, 2) and
+
+    m = floor(N * 2**23 / B),  N = A - B  when A >= B    (exponent ea - eb)
+                               N = 2A - B when A <  B    (exponent ea - eb - 1)
+
+with N < B in both cases, so `m < 2**23` and nothing needs normalising
+afterwards. A divider that computed a wider quotient and then rounded it to 23
+bits would round twice and differ in the last bit; the mutation that does it
+**differs on 610 of 1986 cases**.
+
+Multiplying by 2**TW costs an exponent and not a multiplier — TW and TH are
+already logarithms, so the mantissa cannot change and only `pack`'s saturation
+and flush remain.
+
+### Two dividers, not one reciprocal
+
+Two divisions, in parallel. Not one reciprocal and two multiplies: `1/Q` then
+`S * (1/Q)` rounds twice and the model divides exactly and truncates once. And
+not one divider used twice, because this sits in the pixel path and sharing
+would double a latency that is already the longest thing in a textured pixel.
+
+### The part that is not verified, stated as the model states it
+
+The coordinate is **saturated** into 14 integer bits plus 4 fractional. That is
+the conservative choice and matches what the format does one step earlier, and
+**it is not confirmed against silicon**. A Q near zero makes S/Q enormous, the
+divide saturates rather than producing an infinity, and multiplying that by
+sixteen gives a number no register holds. Wrapping is the other possibility and
+would put a degenerate polygon's texels somewhere quite different. Only a
+console can settle it. What matters here is that the RTL and the model make the
+same choice and that the choice is written down rather than discovered later.
+
+### The test, and a thing the campaign got wrong first
+
+`sim/gs/run_fdiv_diff.sh` checks the divider alone against `ps2_float.div` —
+2059 quotients on four seeds — and `sim/gs/run_stq_diff.sh` checks the whole
+block against `stq_to_uv`.
+
+`sim/gs/mutate_stq.py`: **seventeen mutations, seventeen caught**, plus one
+recorded as equivalent with its reason.
+
+Four of them survived on the first run and only one was really equivalent. The
+other three — a zero divisor that forgets its sign, an overflow that wraps by
+one exponent, an underflow that drops its sign — are **invisible at `gs_stq`'s
+output and obvious at `gs_fdiv`'s**, because the last step throws away exactly
+what they corrupt: in 12.4 any zero is 0 and anything past the limit saturates
+the same way. Running only the block-level test scored them as holes in the test
+suite when they were holes in one member of it. The campaign runs both now.
+
+Two of the seventeen are mistakes this file actually had: a zero dividend
+returning a signed zero (the model's `div` never passes `pack`'s sign-of-zero
+argument, so an exact zero result is positive whatever the operands were), and a
+restoring divider whose comparison was mis-aligned against a 48-bit register, so
+every quotient came out with a zero mantissa.
+
+### The cost, measured
+
+Out of context for `xcu55n-2LV` at the GS's 147.456 MHz:
+
+| | `gs_fdiv` | `gs_stq` (two of them plus the scaling) |
+|---|---|---|
+| CLB LUTs | 250 | **786** |
+| CLB registers | 188 | 425 |
+| DSP / BRAM / URAM | 0 | **0** |
+| WNS at 147.456 MHz | +4.856 ns | +2.883 ns |
+
+**Latency: 5 clocks minimum, 29 maximum.** Five is the short circuit — a zero
+divisor or a zero dividend needs no division at all — and 29 is the full
+23-bit restoring divide. A perspective-correct pixel therefore costs roughly
+29 clocks more than a UV one, on top of the 8 to 18 it already takes. That is a
+number to know before optimising it, not a reason to have built it differently:
+a radix-4 divider or a reciprocal table would each trade area or accuracy for
+it, and neither is worth choosing before something measures how many pixels of a
+real frame take the FST = 0 path.
+
+### What this does not answer
+
+**Nothing interpolates S, T and Q across a primitive yet**, so the block has no
+input in the rasteriser and `PRIM.FST = 0` is still refused. That is the next
+piece and it carries a question this one did not: the colour, depth and UV
+interpolators all ride the same measured 2**-10 grid, and S, T and Q are
+*floats* — so what a real GS interpolates them in is an open question rather
+than a reuse. It should be answered before RTL is written against a guess.
+
+One width follows from this block and has to be dealt with when it is wired: it
+produces a **19-bit** signed coordinate, because the saturation limit is 14
+integer bits plus 4 fractional, and `gs_texsample` takes 17. The UV path can
+never reach that range — its coordinate comes from a 14-bit register — so the
+port has only ever needed to carry what the UV path produces.
