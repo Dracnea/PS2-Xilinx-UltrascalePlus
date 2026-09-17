@@ -5,6 +5,19 @@
     tools/ee/eerun.py --csr build/c1100_ee/csr.csv --prog prog.hex --steps 200
     tools/ee/eerun.py --csr build/c1100_ee/csr.csv --prog prog.hex --compare
 
+It works against both EE images. c1100_ee keeps its memory on the chip and a
+CSR window writes it; c1100_ee_hbm has no such window because the memory is HBM,
+so the program goes in through the HBM probe on the card's second AXI port.
+Which one is present is decided by looking for the window rather than by a flag,
+because the csr.csv already says.
+
+**Note, 2026-09-17:** against c1100_ee_hbm the core does not execute what is
+loaded -- see "The EE-HBM image on the card" in docs/ee-core.md. The loading
+path below is believed correct (every beat is read back before the core is
+released, and the same probe passes tools/ps2iop/hbm_test.py), and the fault is
+somewhere between the core's AXI master and HBM. Until that is found, --compare
+against that image will fail for reasons that are not the R5900's.
+
 `--clock` measures cd_ee and says whether it is the console's 294.912 MHz.
 `--prog` loads a program, releases reset, waits for it to retire `--steps`
 instructions, and prints the general registers.
@@ -45,15 +58,38 @@ class Card:
         self.fd = os.open(dev, os.O_RDWR)
         self.regs = regs_from_csv(csr)
 
-    def rd(self, name):
-        addr, _ = self.regs[name]
+    # A CSR wider than 32 bits occupies several registers, and csr.csv has said
+    # so all along -- the word count is its fourth column, which these two read
+    # and then discarded.  That was harmless while every CSR here was one word
+    # wide and stopped being harmless the moment this tool met the HBM image,
+    # whose probe_addr is 33 bits and therefore two: the address went into the
+    # *high* word, every write landed somewhere far away, and the writes still
+    # answered AXI resp=0 because they were perfectly valid writes to the wrong
+    # place.
+    #
+    # LiteX lays a multi-word CSR out most-significant word first, and a
+    # CSRStorage latches when its last word is written, so the words go from low
+    # address to high.  tools/ps2iop/iop_post.py has done this correctly since
+    # the IOP work; this is the same rule and not a second version of it.
+    def readl(self, addr):
         return struct.unpack("IIB3x", fcntl.ioctl(
             self.fd, LITEPCIE_IOCTL_REG, struct.pack("IIB3x", addr, 0, 0)))[1]
 
-    def wr(self, name, val):
-        addr, _ = self.regs[name]
+    def writel(self, addr, val):
         fcntl.ioctl(self.fd, LITEPCIE_IOCTL_REG,
                     struct.pack("IIB3x", addr, val & 0xFFFFFFFF, 1))
+
+    def rd(self, name):
+        addr, n = self.regs[name]
+        v = 0
+        for i in range(n):
+            v = (v << 32) | self.readl(addr + 4 * i)
+        return v
+
+    def wr(self, name, val):
+        addr, n = self.regs[name]
+        for i in range(n):
+            self.writel(addr + 4 * i, (val >> (32 * (n - 1 - i))) & 0xFFFFFFFF)
 
     def check_link(self):
         """Refuse to report anything off a dead PCIe link.
@@ -92,8 +128,115 @@ class Card:
             v |= self.rd(f"ee_mem_r{i}") << (32 * i)
         return v
 
+    # ---- the same, for an image whose memory is HBM ----------------------
+    #
+    # c1100_ee_hbm.py keeps the CSR window the same shape as c1100_ee.py's
+    # *minus the memory port*, because the memory is no longer on the chip: the
+    # core's AXI master goes to HBM and the host reaches the same memory through
+    # the HBM probe on a second port.  Everything else here -- reset, pc_reset,
+    # retires, the register snapshot -- is identical, so only loading changes.
+    #
+    # The probe moves one 256-bit beat at a time and costs about ten CSR round
+    # trips per beat.  That is slow and is the right trade for this: a test
+    # program is a few hundred instructions, and a loader that needed DMA to be
+    # correct first could not be used to find out whether the core works.
+    #
+    # There is no offset to apply.  EEWithMemory crosses the core's AXI into the
+    # HBM port with a clock-domain crossing and nothing else, so an address the
+    # core issues is the byte address the probe writes.
+    BEAT = 32                              # bytes in one 256-bit beat
+
+    def hbm_beat(self, addr, words):
+        assert addr % self.BEAT == 0 and len(words) == 8
+        self.wr("probe_addr", addr)
+        self.wr("probe_ctrl", 0x4)                    # clear the lane pointer
+        for w in words:
+            self.wr("probe_wdata", w & 0xFFFFFFFF)
+        self.wr("probe_ctrl", 0x1)                    # write
+        return self.hbm_wait()
+
+    def hbm_read(self, addr):
+        assert addr % self.BEAT == 0
+        self.wr("probe_addr", addr)
+        self.wr("probe_ctrl", 0x2)
+        resp = self.hbm_wait()
+        out = []
+        for lane in range(8):
+            self.wr("probe_rlane", lane)
+            out.append(self.rd("probe_rdata"))
+        return out, resp
+
+    def hbm_wait(self, tries=10000):
+        for _ in range(tries):
+            s = self.rd("probe_stat")
+            if (s >> 1) & 1:                          # done
+                return (s >> 2) & 3                   # AXI response
+        raise SystemExit(
+            "FAIL  the HBM probe never reported done: the AXI clock or the "
+            "HBM IP is not running")
+
+    # sim/ee/gen_prog.py aims every load and store at a scratch area at 0x2000,
+    # 0x400 bytes of it, so that a random program cannot rewrite its own code.
+    # The reference model's memory is sparse and reads zero where nothing has
+    # been stored; HBM reads whatever was last in it, which after a power-on or
+    # a run of tools/ps2iop/hbm_test.py is neither zero nor the same twice.
+    #
+    # On the on-chip images this never came up -- that memory comes up zeroed --
+    # and it is not a fault in either model.  It is the card and the model
+    # starting from different memory, and the only honest fix is to make the
+    # card start from the model's.  Clearing through 0x4000 covers the code and
+    # the scratch with room to spare, and costs 512 beats.
+    CLEAR_BYTES = 0x4000
+
+    def load_hbm(self, words, base=0, verify=True, clear=CLEAR_BYTES):
+        """Instruction words into HBM, eight to a beat, read back to check.
+
+        The read-back is not ceremony.  Loading through a probe that has never
+        carried a program before is exactly the step where a silent failure
+        looks like a broken core: the registers would come back wrong and the
+        obvious conclusion -- that the R5900 is at fault -- would be the wrong
+        one.  Checking the memory first makes the next result mean something.
+        """
+        if self.rd("hbm_init_done") & 1 != 1:
+            raise SystemExit(
+                "FAIL  hbm_init_done is 0: the HBM controllers have not "
+                "finished bringing the stacks up, so nothing below would mean "
+                "anything.")
+        if clear:
+            zero = [0] * 8
+            for b in range((clear + self.BEAT - 1) // self.BEAT):
+                resp = self.hbm_beat(base + b * self.BEAT, zero)
+                if resp != 0:
+                    raise SystemExit(f"FAIL  clearing HBM: beat {b} answered "
+                                     f"AXI resp={resp}")
+        beats = (len(words) + 7) // 8
+        for b in range(beats):
+            lane = [words[b * 8 + j] & 0xFFFFFFFF if b * 8 + j < len(words)
+                    else 0 for j in range(8)]
+            resp = self.hbm_beat(base + b * self.BEAT, lane)
+            if resp != 0:
+                raise SystemExit(f"FAIL  HBM write beat {b} answered AXI "
+                                 f"resp={resp}")
+        if not verify:
+            return
+        for b in range(beats):
+            got, resp = self.hbm_read(base + b * self.BEAT)
+            want = [words[b * 8 + j] & 0xFFFFFFFF if b * 8 + j < len(words)
+                    else 0 for j in range(8)]
+            if resp != 0 or got != want:
+                raise SystemExit(
+                    f"FAIL  HBM did not hold the program: beat {b} at "
+                    f"0x{base + b * self.BEAT:x} resp={resp}\n"
+                    f"  wrote {[f'{w:08x}' for w in want]}\n"
+                    f"  read  {[f'{w:08x}' for w in got]}")
+
+    def has_onchip_mem(self):
+        return "ee_mem_addr" in self.regs
+
     def load(self, words):
         """A list of 32-bit instruction words, packed four to a 128-bit line."""
+        if not self.has_onchip_mem():
+            return self.load_hbm(words)
         for i in range(0, len(words), 4):
             q = 0
             for j in range(4):

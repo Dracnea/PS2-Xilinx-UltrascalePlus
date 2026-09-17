@@ -3042,3 +3042,85 @@ better than the +0.070 of the build before it, and the honest reading is not
 that the fix bought margin: adding a latch bit moves placement, and this build
 routed better. What can be claimed is that the change is timing-neutral once
 the test is off the wide latch's enable.
+
+## The EE-HBM image on the card: the core does not fetch what the host writes — 2026-09-17
+
+`c1100_ee_hbm` was built on 2026-09-16 and closed at the console's clock with
++0.088 ns, and the session that built it said plainly that it had never been
+loaded. It has now been loaded, and the first thing a bring-up is for has
+happened: something is wrong that no build report could show.
+
+**What works.** The image is healthy everywhere except the one path:
+
+| check | result |
+|---|---|
+| PS2 clock tree | locked, **294.9101 MHz**, −6 ppm from the console's 294.912 |
+| `hbm_init_done` | 1, both stacks up |
+| HBM through the probe | `tools/ps2iop/hbm_test.py` **PASS** — both stacks, the far end of each, 33-bit addressing, no aliasing |
+| the core's reset | works: `retires` returns to 0, every GPR reads 0 while held |
+| the register snapshot | works: GPRs read 0 in reset and non-zero after a run |
+| `pc_reset` | honoured — starting at 0x1000 produces completely different behaviour from starting at 0 |
+
+**What fails.** The core does not execute the memory the host writes.
+
+The decisive run: 64 KB of HBM filled entirely with `1000ffff`, which is
+`BEQ r0, r0, -1` — a branch to itself. Every word. Read back through the probe
+immediately before releasing reset to confirm it was there. `pc_reset` = 0. If
+the core fetched that memory, the first instruction at PC 0 would park it, and
+the run would show `last_pc` = 0, `traps` = 0, and one instruction retiring
+forever.
+
+What actually happened in 2 ms:
+
+    retires=96668  traps=15489  hits=151257  misses=56  last_pc=0x12e50
+
+`traps` counts *unimplemented instructions*, so the core is executing something
+that is not a branch-to-self, at a PC outside the region that was filled. The
+memory was re-read afterwards and was unchanged, so the core is not overwriting
+it either.
+
+Three further observations, each of which rules something out:
+
+* **Two entirely different programs produce byte-identical register state and
+  retire counts.** Whatever the core runs does not depend on what is in HBM.
+* **`misses` freezes at 56** and `hits` climbs into the millions. The cache
+  fills a handful of lines once and then loops inside them forever. 512 lines of
+  64 bytes is 32 KB, and a PC wandering as far as `last_pc` suggests would miss
+  constantly against a working tag.
+* **`misses` is *not* always small.** From `pc_reset` = 0x1000 the same image
+  reported 154,202 misses. So the cache can miss, does issue AXI reads, and the
+  fetch path is not simply dead.
+
+**What this is not.** It is not the loader. `tools/ee/eerun.py` now writes the
+program through the HBM probe and reads every beat back before releasing reset,
+and those read-backs pass; the same probe passes `hbm_test.py` against both
+stacks. It is not `pc_reset`, which demonstrably changes behaviour. It is not
+the debug port, which reads zero in reset and real values out of it.
+
+**Root cause is not yet established**, and this page is not going to guess at
+one. The two candidates worth testing first, in order:
+
+1. **The two AXI ports do not address the same memory.** The EE is on
+   `hbm.axi[0]` and the probe on `hbm.axi[1]`. `ip/hbm/gen_hbm.tcl` sets
+   `USER_SWITCH_ENABLE_00/01` to TRUE and `USER_AXI_ADDR_SIZE` to 33 precisely
+   so that any master reaches all of it, so this *should* be fine — which is
+   exactly why it is worth checking rather than assuming. A second probe
+   instantiated on port 0 would settle it in one build: write through port 1,
+   read through port 0.
+2. **The cache's tag or its fill address is wrong**, so lines are filled from,
+   or matched against, an address other than the one requested. The frozen miss
+   count is the symptom that points here. `sim/mem/tb_mem.sv` exercises
+   `ee_ram` against a model; what it cannot exercise is the real HBM IP's
+   address map, which is the part that is new in this image.
+
+Note which way the evidence leans: (1) explains the independence from HBM
+content completely, and (2) explains the frozen miss count. They are not
+exclusive.
+
+**The bring-up lesson, again.** `ee_core` and `ee_ram` were each verified
+against a model before they were connected, and `ee_top` exists because of what
+connecting them found. This is the next joint out: `ee_ram` verified against a
+model of memory, and HBM verified through a different port, with nothing having
+tested the two together. A differential test proves a block against its model.
+It cannot prove that the thing on the other side of the wire is the memory you
+think it is.
