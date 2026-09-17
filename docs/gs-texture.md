@@ -416,3 +416,76 @@ is what keeps the cost from mattering meanwhile.
 shareable by politeness and becomes the architectural question this page opened
 with: the real GS gives texture its own 512-bit path precisely so a texel fetch
 does not contend with the frame buffer.
+
+## The fetch: step 4 complete — 2026-09-17
+
+`rtl/gs/gs_texsample.vhd` is the piece that makes the other two useful.
+`gs_texaddr` says where a texel is and `gs_clut` holds the palette; this asks
+local memory for the bits, turns them into a colour, and combines that colour
+with the fragment's. **Step 4 of the plan at the top of this page is done**, so
+a 2D textured primitive can now be drawn.
+
+Nearest only. Bilinear needs four of these and a weighted sum, and the model has
+it — but four fetches is a decision about the read port, and building the filter
+before that is settled would be building it twice.
+
+### Three things that would each be invisible for a while
+
+* **Nearest truncates, it does not round.** The fractional bits of the 12.4
+  coordinate are discarded. That is half a texel on every hard edge, and it is
+  also why nearest and bilinear disagree by half a texel unless bilinear applies
+  its own (u − 0.5) shift.
+* **The modulate multiply shifts by seven, not eight.** 1.0 is 0x80 throughout
+  the GS's fixed point. Shifting by eight is the obvious guess and darkens every
+  textured surface by exactly a factor of two, which reads as a lighting bug
+  rather than an arithmetic one. The mutation that does it breaks **355 of 498**
+  cases here.
+* **PSMCT24 gets an alpha of zero, not a plausible 0x80.** The top byte is not
+  part of the pixel and TEXA would normally supply a value; that register is not
+  modelled, so this returns zero rather than a constant that would look like a
+  blending bug several stages later.
+
+### The test
+
+`sim/gs/run_texsample_diff.sh`: **498 samples identical on four seeds**, against
+`sample_uv` followed by `texture_function`. `gs_clut` and `gs_texsample` are
+instantiated **together** rather than the palette being poked in directly —
+the path from a UV coordinate to a colour is what is under test, and a test that
+wrote the CLUT's contents would skip the one interface between the two blocks
+and pass whether or not it was wired.
+
+Eleven mutations, all caught, including every one above and the three that a
+careful person could plausibly write: DECAL keeping the fragment colour, TCC
+ignored, and HIGHLIGHT2 taking HIGHLIGHT's alpha rule.
+
+The fragments in the cases are deliberately **not** 0x80808080. That value is
+1.0, and with it DECAL and MODULATE produce the same answer — a test that used
+it would exercise both and distinguish neither.
+
+### The cost, measured, and where it went
+
+Out of context for `xcu55n`: **1327 LUTs, 202 flip-flops, no DSP and no RAM.**
+
+That is four times `gs_texaddr` and it is worth saying where it goes, because
+the number is not in the arithmetic. The texture function's four multiplies are
+8 × 8 and the expansions are wiring; **the bulk is the 256-bit variable shift**
+that extracts a texel which may begin at any of 64 bit positions in the line. A
+per-format extraction — each format can only start at a few offsets — would
+replace most of that barrel with a handful of muxes. It is left alone for now
+because it is an optimisation of a block whose surrounding shape is still open,
+and because the number is now measured rather than guessed.
+
+### What this does not answer
+
+`gs_lmem` has one read port. The rasteriser and the display already share it,
+the CLUT's loader is a third customer, and this is a fourth — and unlike the
+others it wants a texel **for every pixel drawn**. The real GS does not do this:
+it gives texture its own 512-bit path with its own page buffer, which is why a
+textured pixel there costs roughly twice an untextured one rather than four
+times.
+
+So this block takes a read port as an ordinary port and does not arbitrate.
+Whether the answer is a second port, a wider one time-sliced, or a texture cache
+is a throughput question that wants measuring, and an arbiter written in here
+now would have to be taken out later. What is here is correct at one fetch at a
+time, and what it costs is now a number the integrator can measure.
