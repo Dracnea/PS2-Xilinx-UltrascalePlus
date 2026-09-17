@@ -13,9 +13,12 @@ module tb_fpu_pkg;
    wire [31:0] ca, cb, mx, mn, ab, ng;
    reg  [31:0] ia, ib;
    wire        eq, lt, le;
+   wire [31:0] mul;
+   wire        mul_o, mul_u;
 
    fpu_wrap w (.a(ia), .b(ib), .ca(ca), .cb(cb),
-               .eq(eq), .lt(lt), .le(le), .mx(mx), .mn(mn), .ab(ab), .ng(ng));
+               .eq(eq), .lt(lt), .le(le), .mx(mx), .mn(mn), .ab(ab), .ng(ng),
+               .mul(mul), .mul_o(mul_o), .mul_u(mul_u));
 
    initial begin
       if (!$value$plusargs("vec=%s", path)) path = "vectors.hex";
@@ -30,8 +33,8 @@ module tb_fpu_pkg;
          ia = a[i];
          ib = b[i];
          #1;
-         $display("V %08h %08h COND %08h %08h CMP %0d %0d %0d MAXMIN %08h %08h ABSNEG %08h %08h",
-                  ia, ib, ca, cb, eq, lt, le, mx, mn, ab, ng);
+         $display("V %08h %08h COND %08h %08h CMP %0d %0d %0d MAXMIN %08h %08h ABSNEG %08h %08h MUL %08h %0d %0d",
+                  ia, ib, ca, cb, eq, lt, le, mx, mn, ab, ng, mul, mul_o, mul_u);
       end
       $finish;
    end

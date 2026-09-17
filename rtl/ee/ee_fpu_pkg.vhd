@@ -84,6 +84,25 @@ package ee_fpu_pkg is
    function f_max(a, b : f32_t) return f32_t;
    function f_min(a, b : f32_t) return f32_t;
 
+   -- ---- arithmetic --------------------------------------------------------
+   --
+   -- A result and the cause bits it raises, because on this machine an
+   -- out-of-range result is not an exception -- it is a saturation plus a flag,
+   -- and a function that returned only the value would lose the half that says
+   -- why.
+   type fres_t is record
+      v : f32_t;
+      o : std_logic;                     -- overflow: saturated to Fmax
+      u : std_logic;                     -- underflow: flushed to zero
+   end record;
+
+   -- MUL.S. The product of two 24-bit mantissas is 48 bits and therefore
+   -- *exact*; there is nothing to round, only a place to truncate. That is what
+   -- makes the multiply the right arithmetic instruction to build first, and it
+   -- is why this is combinational: one DSP-sized multiply, a normalising shift
+   -- of at most one place, and a cut.
+   function f_mul(a, b : f32_t) return fres_t;
+
 end package;
 
 package body ee_fpu_pkg is
@@ -178,6 +197,65 @@ package body ee_fpu_pkg is
    function f_le(a, b : f32_t) return boolean is
    begin
       return f_lt(a, b) or f_eq(a, b);
+   end function;
+
+   -- Every result of every arithmetic instruction leaves through here.
+   -- docs/ee-fpu.md: the format is closed by saturation at both ends rather
+   -- than by escape into Inf and NaN, so the conditioner on the way in and this
+   -- on the way out are between them the whole of it.
+   --
+   -- `e` is the unbiased exponent the result wants. Note the asymmetry, which
+   -- is the model's and not an accident: an underflowed result keeps its sign,
+   -- so it flushes to a *signed* zero, while a result that is exactly zero is
+   -- positive zero whatever the operands were.
+   function saturate(s : std_logic;
+                     e : signed(10 downto 0);
+                     m : unsigned(22 downto 0)) return fres_t is
+   begin
+      if e > 127 then
+         return (v => s & POS_MAX(30 downto 0), o => '1', u => '0');
+      elsif e < -126 then
+         return (v => s & (30 downto 0 => '0'), o => '0', u => '1');
+      end if;
+      return (v => s & std_logic_vector(resize(unsigned(e + 127), 8))
+                    & std_logic_vector(m),
+              o => '0', u => '0');
+   end function;
+
+   function f_mul(a, b : f32_t) return fres_t is
+      variable ca, cb : f32_t;
+      variable s      : std_logic;
+      variable ma, mb : unsigned(23 downto 0);
+      variable prod   : unsigned(47 downto 0);
+      variable e      : signed(10 downto 0);
+      variable m      : unsigned(22 downto 0);
+   begin
+      ca := cond(a);
+      cb := cond(b);
+      -- A zero operand gives an exact zero, and an exact zero is **positive**
+      -- whatever the signs were -- the model packs it with sign_of_zero = 0.
+      -- That differs from an underflowed result, which keeps its sign, and the
+      -- two are easy to write as one rule and wrong to.
+      if is_zero(ca) or is_zero(cb) then
+         return (v => (others => '0'), o => '0', u => '0');
+      end if;
+
+      s  := fsign(ca) xor fsign(cb);
+      ma := '1' & fman(ca);
+      mb := '1' & fman(cb);
+      prod := ma * mb;                   -- 48 bits, exact, in [2**46, 2**48)
+
+      -- The product needs at most one place of normalisation, because both
+      -- operands are in [1, 2) and so the product is in [1, 4).
+      e := signed(resize(fexp(ca), 11)) + signed(resize(fexp(cb), 11)) - 254;
+      if prod(47) = '1' then
+         e := e + 1;
+         m := prod(46 downto 24);
+      else
+         m := prod(45 downto 23);
+      end if;
+
+      return saturate(s, e, m);
    end function;
 
    function f_max(a, b : f32_t) return f32_t is

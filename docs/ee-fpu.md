@@ -151,3 +151,59 @@ clearing, and `MIN`/`MAX` exchanged.
 `MUL`, `DIV` and `SQRT`. Those are implemented to the specification — round
 toward zero, in one place so a measurement can change it — and remain unverified
 until the console sweep in `hw/ps2probe/README.md` runs.
+
+## The structural half is built, and MUL.S with it — 2026-09-17
+
+**The roadmap said "reference model done. No RTL" and was out of date.**
+`rtl/ee/ee_fpu_pkg.vhd` already held the conditioner, the compares, MAX/MIN and
+ABS/NEG, diffed against `ps2_float.py` and passing. That is the half this page
+called checkable, and it was checked. Only the arithmetic was missing.
+
+This adds the first arithmetic instruction, and it is deliberately **MUL.S**
+rather than ADD.S — which is also what this page asked for, in different words.
+The product of two 24-bit mantissas is 48 bits and therefore *exact*: there is
+nothing to round, only a place to cut. So the multiply isolates the two things
+that are genuinely new — the saturator and the exponent arithmetic — without
+also requiring an aligner, a sticky bit and a cancellation path, which is where
+an adder's difficulty actually lives.
+
+`saturate` is shared and will be reused by every arithmetic instruction after
+this one. It carries the asymmetry this page describes, which is easy to write
+as one rule and wrong to:
+
+* a result that **underflows** keeps its sign and flushes to a *signed* zero;
+* a result that is **exactly zero** is positive zero whatever the operands were.
+
+A multiplier that gave an exact zero the exclusive-ored sign is a mutation that
+the test catches; it is also exactly what someone would write who had only read
+the first of those two sentences.
+
+### The vectors had to be extended, not reused
+
+The existing 924 vectors were chosen for the conditioner, and they say almost
+nothing about a multiply: its interesting behaviour is at the exponent ends,
+where the product saturates or flushes, and at the truncation boundary, where
+the exact 48-bit product has bits below the cut. This page asked for that sweep
+in advance — *"pairs whose exact product needs bit 24"* — and it is now in
+`gen_fpu_vectors.py`: saturation in both directions on all four sign
+combinations, exponent sums landing exactly on 127 and −126, and mantissa pairs
+whose product is non-zero below the cut.
+
+**1034 vectors identical**, and seven mutations all caught, including the two
+that only the new vectors can see: rounding to nearest instead of truncating,
+and each saturation boundary off by one.
+
+### What this still does not prove
+
+The same thing this page has said from the start. The model and the RTL now
+agree, and the model is exact-rational with round-toward-zero, which is what the
+PS2 is *documented* to do. Neither is silicon. The last bit of `MUL.S` remains
+unverified until the probe in `hw/ps2probe/README.md` runs on a console, and
+that is a measurement rather than an argument — nothing in this repository can
+settle it.
+
+**Next: ADD.S and SUB.S**, which need the aligner, a sticky bit and a
+cancellation path, and where the argument that makes those safe is worth writing
+down before the code: a large alignment shift and a massive cancellation cannot
+happen in the same operation, because cancellation needs exponents within one of
+each other. Then DIV.S and SQRT.S, which are iterative and are their own piece.

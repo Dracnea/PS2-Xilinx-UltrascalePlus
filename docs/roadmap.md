@@ -37,7 +37,7 @@ separate design and separate verification:
 | block | state |
 |---|---|
 | **R5900 core** | **works on the card** — 64-bit MIPS III plus the 128-bit MMI SIMD set, 35 differential tests, mutation-checked, and running at **the console's 294.912 MHz** with +0.135 ns of margin. The ~204 MHz that was the open problem is closed: a sixth pipeline stage, the 0.85 V rail and its matching speed file between them bought the difference |
-| FPU (COP1) | *reference model done* — `sim/ee/ps2_float.py`, exact-rational, 33 checks. No RTL |
+| FPU (COP1) | *partial, and the roadmap had this wrong until 2026-09-17* — the **structural half is RTL and passing**: `rtl/ee/ee_fpu_pkg.vhd` has the conditioner, compares, MAX/MIN and ABS/NEG, plus **MUL.S**, at 1034 vectors identical to `ps2_float.py` with seven mutations caught. ADD/SUB/DIV/SQRT are not built. The last bit of the arithmetic stays unverified against silicon until a console runs the probe |
 | 32 MB main memory | **works on the card, 2026-09-17** — the R5900 executes out of HBM at the console's 294.912 MHz, 11 of 12 differential seeds identical to the model with 0 unimplemented instructions. It is mapped at `HBM_BASE`, 6 GiB into HBM, which a host loader has to know |
 | 16 KB scratchpad | not started |
 | EE DMAC, 10 channels | not started |

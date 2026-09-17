@@ -49,9 +49,11 @@ def main():
         mn = cb if f_lt(b, a) else ca
         ab = a & 0x7FFFFFFF
         ng = a ^ 0x80000000
+        mul, cause = F.mul(a, b)
         print("V %08x %08x COND %08x %08x CMP %d %d %d MAXMIN %08x %08x "
-              "ABSNEG %08x %08x"
-              % (a, b, ca, cb, int(eq), int(lt), int(le), mx, mn, ab, ng))
+              "ABSNEG %08x %08x MUL %08x %d %d"
+              % (a, b, ca, cb, int(eq), int(lt), int(le), mx, mn, ab, ng,
+                 mul, int(bool(cause & F.CAUSE_O)), int(bool(cause & F.CAUSE_U))))
     return 0
 
 
