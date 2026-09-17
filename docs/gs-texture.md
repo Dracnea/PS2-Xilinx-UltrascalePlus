@@ -336,3 +336,83 @@ and therefore the first that has to face the question this page opened with: the
 real GS gives texture its own 512-bit path so a texel fetch does not contend
 with the frame buffer, and `gs_lmem` has one read port with two customers on it
 already.
+
+## The CLUT in hardware — 2026-09-17
+
+`rtl/gs/gs_clut.vhd` is the second piece of the texture unit to become RTL,
+chosen for the same reason the addressing was first: it is almost entirely
+structure, it is exhaustively checkable against `gs_ref.py`, and it does not
+depend on the shape of the pixel pipeline the sampler is still waiting for.
+
+It is two things that are easy to think of as one and must not be: **a buffer**
+of 256 entries the sampler reads, and **a cache with explicit invalidation**
+whose CLD rules decide when that buffer is refilled. Getting the first wrong
+gives wrong colours, which anyone notices. Getting the second wrong gives *the
+previous primitive's* colours several primitives later, which is the failure
+this block exists to model rather than avoid.
+
+`CSM1` is written as a concatenation rather than a sum, because the four terms
+of `clut_csm1_32` — `128*hi`, `64*k0`, `16*(k >> 1)`, and the column — occupy
+disjoint bits. A sum of disjoint terms is a wire permutation, the same as every
+other swizzle here. `CSM2` calls `pix_addr_page`: it is a one-pixel-high strip
+out of an ordinary PSMCT32 buffer with no swizzle to undo, so it is addressed
+exactly as any other PSMCT32 read, and sharing the function is what guarantees
+that rather than hoping for it.
+
+**16-bit CLUTs are refused, not guessed.** `CPSM` can name PSMCT16 or PSMCT16S
+and that layout is still not derived, so the block raises `unsupported` and
+leaves the buffer holding what it held. A block that says "I do not know" is
+worth more than one that is quietly wrong for a whole class of textures.
+
+### The test, and the two holes mutation testing found in it
+
+`sim/gs/run_clut_diff.sh`: **78 cases identical on six seeds**, comparing the
+whole 256-entry buffer *and the load counter* after every TEX0 write. The
+counter is not decoration — half of CLD's job is deciding not to reload, and a
+buffer correctly left alone looks exactly like one reloaded with the same bytes.
+
+The cases are a sequence and not a set, because CLD makes this a cache: what a
+write does depends on every write before it.
+
+Fourteen mutations were injected. Twelve were caught immediately; **two were
+missed, and both were faults in the test rather than in the RTL** — which is
+the whole reason for doing it:
+
+* **"never set" treated as a match against zero.** `CLD_IF_CBP0` compares
+  against a remembered pointer, and "no pointer has ever been remembered" is a
+  distinct state from "the remembered pointer is 0". They are only
+  distinguishable when the incoming CBP is *itself* zero: with any other value
+  an implementation that initialises its stored pointer to zero still reloads,
+  for the wrong reason, and looks correct. No case used CBP 0 against a virgin
+  register. Two now do, and they come first.
+
+* **CBW of 0 not clamped to 1.** No case used a zero width. Adding one did not
+  help either, which is the more interesting half: CBW multiplies `COV >> 5`, so
+  with the strip on the first page row the term is zero whatever CBW is, and 0
+  and 1 address identically for the wrong reason. The cases now carry
+  `COV = 63` and `COV = 40`. **A case that exercises a parameter is not the same
+  as a case where the parameter can change the answer.**
+
+Both holes were invisible to a passing test and to a reading of the code. The
+mutation is what made them visible.
+
+### The cost, measured
+
+Out of context for `xcu55n`: **170 LUTs, 106 flip-flops, and 1 RAMB18** — the
+1 KB palette inferred into block RAM, which is the specific thing worth checking
+rather than asserting after `gs_pxcap` claimed four block RAMs in a comment
+while costing 30,725 LUTs.
+
+### The cost that is not in that table
+
+A load reads **one entry per local-memory access**, so a 256-entry palette is
+256 reads on a port the rasteriser and the display already share. That is the
+honest first version. Consecutive CSM1 entries do often land in the same 256-bit
+line and a later version can coalesce them — but coalescing a swizzle is exactly
+the kind of optimisation that is wrong in a way no colour test notices, and CLD
+is what keeps the cost from mattering meanwhile.
+
+**Next is the fetch itself**, which is where the read port stops being
+shareable by politeness and becomes the architectural question this page opened
+with: the real GS gives texture its own 512-bit path precisely so a texel fetch
+does not contend with the frame buffer.
