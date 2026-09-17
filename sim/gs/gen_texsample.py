@@ -7,7 +7,7 @@ Writes:
 
     mem.hex     local memory, one 256-bit word per line
     clut.txt    the one TEX0/TEXCLUT write that fills the palette, applied first
-    cases.txt   u v frag tex0 clamp, one sample per line
+    cases.txt   u v frag tex0 clamp linear, one sample per line
     ref.txt     the colour the model says each sample produces
 
 The palette is loaded once and then left alone: every sampling case carries
@@ -30,6 +30,25 @@ failure here names the fetch.
 * **The wrap modes**, because the sampler drives gs_texaddr rather than
   containing its own copy, and a miswired CLAMP field would show here and
   nowhere else.
+* **Both filters, from one file.** The bilinear cases are in this generator and
+  not in one of their own, so the nearest and bilinear paths are diffed against
+  the same model, by the same testbench, in the same run. A filter with its own
+  generator drifts from the one it is supposed to be a refinement of.
+
+## What the bilinear cases are chosen to catch
+
+* **The half texel.** The GS filters at (u - 0.5, v - 0.5), and nearest does not
+  shift at all. Two properties pin it: u = n + 0.5 must return texel n unmixed,
+  and u = n must be an even blend of n-1 and n. A missing shift passes neither;
+  a shift wrongly added to the *nearest* path fails the nearest cases.
+* **Every weight.** All 16 x 16 fractional positions at one place in one
+  texture, so no sixteenth is untested and an off-by-one in the weight shows.
+* **Descending gradients.** The lerp floors rather than truncating toward zero,
+  so it rounds the other way when b < a. Cases are kept where the four corners
+  are known to be decreasing.
+* **Corners that step off the texture**, under all four wrap modes in both axes.
+  Each of the four corners is wrapped on its own; a filter that wrapped the
+  base coordinate and then added one would smear across the edge.
 
 SPDX-License-Identifier: BSD-2-Clause
 """
@@ -128,6 +147,82 @@ def cases(rng):
             clamp=clamp(rng.randint(0, 3), rng.randint(0, 3),
                         rng.randint(0, 255), rng.randint(0, 255),
                         rng.randint(0, 255), rng.randint(0, 255))))
+
+    for c in out:
+        c.setdefault("lin", 0)
+    out += linear_cases(rng)
+    return out
+
+
+def linear_cases(rng):
+    """The bilinear half. Every case here carries lin=1."""
+    out = []
+    base = dict(frag=rgba(0x40, 0x60, 0xC0, 0x50), lin=1,
+                clamp=clamp())
+
+    # The half texel, stated as the two properties that pin it. At u = n + 0.5
+    # the weight is zero and texel n is returned unmixed; at u = n the weight is
+    # eight and n-1 and n are mixed evenly. A sampler with no shift gets the
+    # first of these right by accident at a different coordinate and the second
+    # wrong everywhere, so both are needed.
+    for psm in (gs_ref.PSMCT32, gs_ref.PSMCT16, gs_ref.PSMT8):
+        for n in (1, 2, 5, 9, 16, 31):
+            for (du, dv) in ((8, 8), (0, 0), (8, 0), (0, 8)):
+                out.append(dict(base, u=(n << 4) | du, v=(n << 4) | dv,
+                                tex0=tex0(tbp=0, tbw=2, psm=psm, tcc=1)))
+
+    # Every one of the sixteen positions in each axis, at one place in one
+    # texture, so no weight is untested.
+    for fu in range(16):
+        for fv in range(16):
+            out.append(dict(base, u=(11 << 4) | fu, v=(6 << 4) | fv,
+                            tex0=tex0(tbp=0, tbw=2, psm=gs_ref.PSMCT32, tcc=1)))
+
+    # Every format, at a weight that mixes all four corners unevenly -- 3/16 and
+    # 13/16, which are coprime with the shift and with each other.
+    for psm in PSMS:
+        for (u, v) in [(4, 4), (17, 9), (30, 30)]:
+            out.append(dict(base, u=(u << 4) | 3, v=(v << 4) | 13,
+                            tex0=tex0(tbp=0, tbw=2, psm=psm, tcc=1)))
+
+    # All four texture functions and both TCC settings, filtered. TFX runs after
+    # the filter, and doing it the other way round saturates four times instead
+    # of once.
+    for tfx in range(4):
+        for tcc in (0, 1):
+            for frag in (rgba(0x40, 0x60, 0xC0, 0x50),
+                         rgba(0xFF, 0xE0, 0x90, 0xF0),
+                         rgba(0x00, 0x80, 0xFF, 0x00)):
+                out.append(dict(base, u=(7 << 4) | 5, v=(11 << 4) | 9,
+                                frag=frag,
+                                tex0=tex0(tbp=0, tbw=2, psm=gs_ref.PSMCT32,
+                                          tfx=tfx, tcc=tcc)))
+
+    # Corners that step off the texture, under every wrap mode in both axes.
+    # Each corner is wrapped on its own; wrapping the base and then adding one
+    # smears across the edge, and only a coordinate *on* an edge shows it.
+    for wms in range(4):
+        for wmt in range(4):
+            for (u, v) in [(0, 0), (-1, -1), (31, 15), (32, 16), (300, -300)]:
+                out.append(dict(base, u=(u << 4) | 7, v=(v << 4) | 11,
+                                tex0=tex0(tbp=0, tbw=2, psm=gs_ref.PSMCT32,
+                                          tw=5, th=4, tcc=1),
+                                clamp=clamp(wms, wmt, 0x1F, 0x08, 0x0F, 0x03)))
+
+    # Random, filtered.
+    for _ in range(300):
+        out.append(dict(
+            lin=1,
+            u=rng.randint(-2048, 2047) << 4 | rng.randint(0, 15),
+            v=rng.randint(-2048, 2047) << 4 | rng.randint(0, 15),
+            frag=rng.getrandbits(32),
+            tex0=tex0(tbp=rng.randrange(0, 64), tbw=rng.choice([1, 2, 4]),
+                      psm=rng.choice(PSMS), tw=rng.randint(2, 8),
+                      th=rng.randint(2, 8), tcc=rng.randint(0, 1),
+                      tfx=rng.randint(0, 3)),
+            clamp=clamp(rng.randint(0, 3), rng.randint(0, 3),
+                        rng.randint(0, 255), rng.randint(0, 255),
+                        rng.randint(0, 255), rng.randint(0, 255))))
     return out
 
 
@@ -162,18 +257,25 @@ def main():
             # nine-bit page wraps. That disagreement is inherited from the frame
             # buffer addressing and is not this block's question -- the same
             # exclusion gen_texaddr.py makes, for the same reason.
-            texel = gs_ref.sample_uv(vm, c["tex0"], c["clamp"], clut,
-                                     c["u"], c["v"])
+            if c["lin"]:
+                texel = gs_ref.sample_uv_linear(vm, c["tex0"], c["clamp"], clut,
+                                                c["u"], c["v"])
+            else:
+                texel = gs_ref.sample_uv(vm, c["tex0"], c["clamp"], clut,
+                                         c["u"], c["v"])
             tfx = gs_ref.bits(c["tex0"], 36, 35)
             tcc = gs_ref.bits(c["tex0"], 34, 34)
             frag = (c["frag"] & 0xFF, (c["frag"] >> 8) & 0xFF,
                     (c["frag"] >> 16) & 0xFF, (c["frag"] >> 24) & 0xFF)
             r, g, b, al = gs_ref.texture_function(tfx, tcc, frag, texel)
-            fc.write("%d %d %08x %016x %016x\n"
-                     % (c["u"], c["v"], c["frag"], c["tex0"], c["clamp"]))
+            fc.write("%d %d %08x %016x %016x %d\n"
+                     % (c["u"], c["v"], c["frag"], c["tex0"], c["clamp"],
+                        c["lin"]))
             fr.write("%d %08x\n" % (n, rgba(r, g, b, al)))
 
-    print("%d cases, %d skipped" % (len(cs) - skipped, skipped), file=sys.stderr)
+    nlin = sum(1 for c in cs if c["lin"])
+    print("%d cases, %d nearest and %d bilinear"
+          % (len(cs) - skipped, len(cs) - nlin, nlin), file=sys.stderr)
 
 
 if __name__ == "__main__":

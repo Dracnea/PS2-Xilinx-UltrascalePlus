@@ -52,8 +52,8 @@ if ! grep -q '^COHERENT' xsim.log; then
     echo "FAIL  seed $SEED: the coherence phase did not finish clean"
     fail=1
 fi
-if [[ $(grep -c '^WALK ' xsim.log) -ne 2 ]]; then
-    echo "FAIL  seed $SEED: the raster walk did not run both formats"
+if [[ $(grep -c '^WALK ' xsim.log) -ne 4 ]]; then
+    echo "FAIL  seed $SEED: the raster walk did not run both formats and both filters"
     fail=1
 fi
 

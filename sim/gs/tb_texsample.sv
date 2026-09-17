@@ -74,13 +74,14 @@ module tb_texsample;
    logic signed [16:0] u_fixed = 0, v_fixed = 0;
    logic [31:0]        frag = 0;
    logic [63:0]        s_tex0 = 0, s_clamp = 0;
+   logic               s_linear = 0;
    logic               done, s_busy;
    logic [31:0]        colour;
 
    gs_texsample dut
      (.clk(clk), .reset(reset),
       .req(req), .u_fixed(u_fixed), .v_fixed(v_fixed), .frag(frag),
-      .tex0(s_tex0), .clamp(s_clamp),
+      .tex0(s_tex0), .clamp(s_clamp), .linear(s_linear),
       .rd_en(s_rd_en), .rd_addr(s_rd_addr), .rd_data(s_rd_data),
       .rd_valid(s_rd_valid),
       .clut_idx(clut_idx), .clut_data(clut_data),
@@ -91,6 +92,7 @@ module tb_texsample;
    longint c_u, c_v;
    logic [31:0] c_frag;
    logic [63:0] c_tex0, c_clamp;
+   int          c_lin;
 
    initial begin
       if (!$value$plusargs("dir=%s", dir)) begin
@@ -123,9 +125,9 @@ module tb_texsample;
 
       n = 0;
       forever begin
-         code = $fscanf(fh, "%d %d %h %h %h\n",
-                        c_u, c_v, c_frag, c_tex0, c_clamp);
-         if (code != 5) break;
+         code = $fscanf(fh, "%d %d %h %h %h %d\n",
+                        c_u, c_v, c_frag, c_tex0, c_clamp, c_lin);
+         if (code != 6) break;
 
          @(posedge clk);
          u_fixed <= c_u[16:0];
@@ -133,6 +135,7 @@ module tb_texsample;
          frag    <= c_frag;
          s_tex0  <= c_tex0;
          s_clamp <= c_clamp;
+         s_linear <= c_lin[0];
          req     <= 1;
          @(posedge clk);
          req <= 0;

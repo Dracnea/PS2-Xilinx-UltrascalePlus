@@ -668,3 +668,156 @@ fall out of it when it happens:
 it wait on this decision; with the cache the three neighbours of a texel are
 overwhelmingly in lines already held, so the cost is four lookups rather than
 four memory reads. Step 5's reference model has been complete since 2026-09-14.
+
+## Bilinear in hardware — 2026-09-17
+
+Step 5's other half. The reference model has had bilinear since 2026-09-14; what
+it waited on was the read port, because four fetches per pixel is a throughput
+decision and building the filter before that was settled would have been
+building it twice. `gs_texcache` settled it, so this is the filter.
+
+It is inside `gs_texsample` rather than beside it. The four corners need the
+same addressing, the same wrap, the same palette lookup and the same format
+expansion that one corner needs, and a separate block would have had a second
+copy of each — which is exactly the kind of duplication that drifts. What was
+added is a `linear` input, a corner counter, four texel registers and three
+lerps; the fetch loop runs four times instead of once.
+
+`linear` is one bit and not TEX1, deliberately. What TEX1 actually says is MMAG
+and MMIN, and reducing those to a filter needs the LOD, which needs Q, which
+needs the perspective divide that does not exist yet. Taking TEX1 here would be
+pretending mipmapping is wired.
+
+### The half texel, and why nearest must not have it
+
+The GS filters at **(u − 0.5, v − 0.5)**. UV counts texel *edges*, so texel *n*
+occupies [n, n+1) and its centre is at n + 0.5; subtracting the half texel first
+is what makes `u = n + 0.5` return texel *n* unmixed and `u = n` an even blend
+of *n−1* and *n*.
+
+The nearest path keeps **no** shift and its truncation. The two are not the same
+operation, and making them the same is the plausible wrong answer in both
+directions at once — a filter missing the shift displaces every textured surface
+by half a texel, and a nearest path that gained one would disagree with every
+existing vector. Both directions are mutated below and both are caught.
+
+The test states it as the two properties rather than as a table of expected
+colours: at `u = (n<<4) | 8` the weight must be zero and texel *n* must come back
+unmixed, and at `u = n<<4` the weight must be eight. A sampler with no shift gets
+the first right by accident at a different coordinate and the second wrong
+everywhere.
+
+### The bug this actually had, which is a VHDL trap worth writing down
+
+`resize` on a **signed** does not truncate. It keeps the sign bit and the low
+bits beneath it, so `resize(uu, 4)` is `uu(17) & uu(2 downto 0)` — three of the
+four fractional bits with the sign pasted on top. The four weight bits need a
+**slice**, `uu(3 downto 0)`.
+
+What makes it worth recording is how it failed. The wrong expression is zero at
+exactly the half-texel positions, which are the coordinates where a filter looks
+most obviously correct: **327 of 759 bilinear cases passed with it in place**,
+including every "texel returned unmixed" case. A test built only from the
+properties that read like the definition of bilinear filtering would have gone
+green. It was the every-weight sweep and the random cases that found it.
+
+`sim/gs/mutate_texsample.py` reproduces it as a mutation, so it stays found.
+
+### The arithmetic: sixteenths, and a shift that floors
+
+The weights are the four fractional bits of the 12.4 coordinate, so there are
+sixteen positions between texels and no more. That is not an approximation of
+something finer — 12.4 *is* the coordinate format, and a filter that lerped with
+more precision than sixteenths would be smoother than the console.
+
+The lerp is `a + ((b − a) * f >> 4)` with an **arithmetic** shift, which floors
+rather than truncating toward zero. When b < a the difference is negative and
+the two round in opposite directions by one bit, on exactly the pixels where a
+texture gets darker from left to right; the model uses Python's `>>`, which
+floors. The mutation that divides by sixteen instead **differs on 454 of 1257
+cases**.
+
+Two orderings also matter, and both are only visible because each lerp
+truncates:
+
+* **the horizontal pair first, the vertical between them.** Doing the vertical
+  pair first is algebraically identical in exact arithmetic and different here —
+  180 of 1257 cases.
+* **expand, then filter.** Two PSMCT16 texels averaged as 5551 and then expanded
+  is not the same number as two expanded and averaged — 92 cases. Likewise TFX
+  runs *after* the filter, because saturating four texels and averaging them is
+  not averaging four and saturating once.
+
+No saturation is applied to the lerp and none is needed: with a and b in 0..255
+and f in 0..15 the result is in 15..239. A clamp there would be dead logic that
+looked like a safety net.
+
+### The test
+
+`sim/gs/run_texsample_diff.sh`: **1257 samples identical on four seeds**, 498
+nearest and 759 bilinear, against `sample_uv` / `sample_uv_linear` followed by
+`texture_function`.
+
+Both filters come out of **one generator and one testbench**, in one run. A
+filter with its own generator drifts from the one it is supposed to be a
+refinement of, and the half-texel relationship between them is precisely what a
+split would stop testing.
+
+The bilinear cases are aimed at: the two half-texel properties; all 16 × 16
+weight positions at one place; every format at a weight coprime with the shift;
+all four texture functions after the filter; and corners stepping off the texture
+under all four wrap modes in both axes — each corner is wrapped on its own, and a
+filter that wrapped the base coordinate and then added one would smear across the
+edge (572 of 1257 cases).
+
+`sim/gs/mutate_texsample.py`: **sixteen mutations, sixteen caught.**
+
+### What it costs, in logic and in time
+
+Out of context for `xcu55n-2LV` at the GS's 147.456 MHz, the same block before
+and after — the earlier figure re-measured under the same constraint rather than
+quoted from a differently-constrained run:
+
+| `gs_texsample` | nearest only | with bilinear |
+|---|---|---|
+| CLB LUTs | 1327 | **1589** (+262) |
+| CLB registers | 202 | **295** (+93) |
+| Block RAM / UltraRAM / DSP | 0 | **0** |
+| WNS at 147.456 MHz | +3.634 ns | **+2.693 ns** (≈ 245 MHz) |
+
+The 262 LUTs are twelve `lerp8`s — three lerps by four channels — each an 8 × 4
+multiply and an add. The filter is cheap; it was never the cost that made this
+wait.
+
+The cost that did is the fetches, and with the cache in front it is **not four
+times**. Measured on the 64 × 48 raster walk in `tb_texcache.sv`:
+
+| walk | hit rate | misses | cycles/pixel |
+|---|---|---|---|
+| PSMCT32 nearest | 87 % | 384 | 6.37 |
+| PSMT8 nearest | 96 % | 96 | 8.09 |
+| **PSMCT32 bilinear** | **96 %** | **400** | **12.39** — 1.95× nearest |
+| **PSMT8 bilinear** | **99 %** | **104** | **20.10** — 2.48× nearest |
+
+Every one of those four miss counts is exactly the walk's compulsory floor — the
+count of distinct 256-bit memory words it touches, computed from `gs_ref`'s own
+address functions rather than read off a run of this design. **Zero conflict
+misses on any of them**, and bilinear reaches 96 % and 99 % because three of its
+four corners are already held.
+
+A textured pixel costing about twice an untextured one is, as it happens, the
+ratio the real GS has — for the same reason, arrived at from the other side: it
+buys it with a dedicated port and a page buffer, and this buys it with the page
+buffer alone.
+
+The cycle figures are **per-sample latency, not pipelined throughput**: the walk
+drives one sample at a time through `req`/`done`, so each includes a handshake
+the rasteriser will not pay. They are the right numbers for comparing the two
+filters against each other and the wrong ones for predicting a fill rate.
+
+### What is still not here
+
+MMAG/MMIN and therefore the choice between the filters at run time; mipmapping,
+which needs Q; and the perspective divide that produces Q. The model has all
+three. `gs_top` still does not instantiate the texture unit, so none of this has
+been on the card.

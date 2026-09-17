@@ -173,6 +173,7 @@ module tb_texcache;
    logic signed [16:0] u_fixed = 0, v_fixed = 0;
    logic [31:0]        frag = 0;
    logic [63:0]        s_tex0 = 0, s_clamp = 0;
+   logic               s_linear = 0;
    logic               done, s_busy;
    logic [31:0]        colour;
 
@@ -182,7 +183,7 @@ module tb_texcache;
    gs_texsample dut
      (.clk(clk), .reset(reset),
       .req(req), .u_fixed(u_fixed), .v_fixed(v_fixed), .frag(frag),
-      .tex0(s_tex0), .clamp(s_clamp),
+      .tex0(s_tex0), .clamp(s_clamp), .linear(s_linear),
       .rd_en(s_rd_en), .rd_addr(s_rd_addr),
       .rd_data(k_c_rd_data), .rd_valid(k_c_rd_valid),
       .clut_idx(dut_clut_idx), .clut_data(clut_data),
@@ -208,7 +209,7 @@ module tb_texcache;
    gs_texsample bare
      (.clk(clk), .reset(reset),
       .req(b_req), .u_fixed(u_fixed), .v_fixed(v_fixed), .frag(frag),
-      .tex0(s_tex0), .clamp(s_clamp),
+      .tex0(s_tex0), .clamp(s_clamp), .linear(s_linear),
       .rd_en(b_rd_en), .rd_addr(b_rd_addr),
       .rd_data(b_rd_data), .rd_valid(b_rd_valid),
       .clut_idx(bare_clut_idx), .clut_data(clut_data),
@@ -271,14 +272,32 @@ module tb_texcache;
    endtask
 
    localparam WALK_W = 64, WALK_H = 48;
+   // The compulsory-miss floor of each walk: the number of distinct 256-bit
+   // memory words it touches, and therefore the fewest misses any cache can
+   // take. These are **not** read off a run of this design -- they are computed
+   // from gs_ref's own address functions, walking the same coordinates through
+   // the same REPEAT wrap and counting the set:
+   //
+   //     for y in 0..47, x in 0..63:  uf,vf = x<<4, y<<4
+   //       nearest : one corner  at (uf>>4, vf>>4)
+   //       bilinear: four corners at ((uf-8)>>4 + {0,1}, (vf-8)>>4 + {0,1})
+   //       words.add(addr(wrap(u,64), wrap(v,64)) // 32)
+   //
+   // A number taken from the design it is meant to check is not a check.
+   //   0 PSMCT32 nearest   1 PSMT8 nearest   2 PSMCT32 bilinear   3 PSMT8 bilinear
+   localparam int WALK_FLOOR [0:3] = '{384, 96, 400, 104};
    logic [31:0] walk [0:WALK_W*WALK_H-1];
    int wx, wy, wi, wh, wm;
+   longint wc0, wcyc;
+   longint cycles = 0;
+   always @(posedge clk) cycles <= cycles + 1;
 
    string dir;
    int    fh, code, n;
    longint c_u, c_v;
    logic [31:0] c_frag;
    logic [63:0] c_tex0, c_clamp;
+   int          c_lin;
    logic [255:0] d, e;
    logic [16:0]  A, B, C, D;
 
@@ -318,9 +337,9 @@ module tb_texcache;
 
       n = 0;
       forever begin
-         code = $fscanf(fh, "%d %d %h %h %h\n",
-                        c_u, c_v, c_frag, c_tex0, c_clamp);
-         if (code != 5) break;
+         code = $fscanf(fh, "%d %d %h %h %h %d\n",
+                        c_u, c_v, c_frag, c_tex0, c_clamp, c_lin);
+         if (code != 6) break;
 
          @(posedge clk);
          u_fixed <= c_u[16:0];
@@ -328,6 +347,7 @@ module tb_texcache;
          frag    <= c_frag;
          s_tex0  <= c_tex0;
          s_clamp <= c_clamp;
+         s_linear <= c_lin[0];
          req     <= 1;
          @(posedge clk);
          req <= 0;
@@ -357,15 +377,20 @@ module tb_texcache;
       // the sampler. Two formats: PSMCT32 puts 8 texels in a memory word and
       // PSMT8 puts 32, so the second should hit harder -- and if it does not,
       // the swizzle argument this block rests on is wrong.
-      for (int fmt = 0; fmt < 2; fmt++) begin
-         s_tex0  <= fmt == 0 ? {{27{1'b0}}, 2'd0, 1'b1, 4'd6, 4'd6, 6'h00, 6'd2, 14'd0}
-                             : {{27{1'b0}}, 2'd0, 1'b1, 4'd6, 4'd6, 6'h13, 6'd2, 14'd0};
+      // fmt 0,1 are nearest PSMCT32 and PSMT8; 2,3 are the same two filtered.
+      // Bilinear is the traffic this cache was sized for -- four fetches per
+      // pixel, three of which should already be held -- so leaving it out of
+      // the walk would measure the cache on the cheaper case only.
+      for (int fmt = 0; fmt < 4; fmt++) begin
+         s_tex0  <= (fmt & 1) == 0 ? {{27{1'b0}}, 2'd0, 1'b1, 4'd6, 4'd6, 6'h00, 6'd2, 14'd0}
+                                   : {{27{1'b0}}, 2'd0, 1'b1, 4'd6, 4'd6, 6'h13, 6'd2, 14'd0};
+         s_linear <= fmt >= 2;
          s_clamp <= 0;
          frag    <= 32'h50C06040;
          @(posedge clk);
 
          flush <= 1; @(posedge clk); flush <= 0; @(posedge clk);
-         wh = dbg_hits; wm = dbg_misses;
+         wh = dbg_hits; wm = dbg_misses; wc0 = cycles;
 
          use_bare <= 0;
          for (wy = 0; wy < WALK_H; wy++)
@@ -380,9 +405,14 @@ module tb_texcache;
               walk[wy*WALK_W + wx] = colour;
            end
 
-         $display("WALK fmt=%0d hits=%0d misses=%0d rate=%0d%%",
-                  fmt, dbg_hits - wh, dbg_misses - wm,
-                  (100 * (dbg_hits - wh)) / ((dbg_hits - wh) + (dbg_misses - wm)));
+         wcyc = cycles - wc0;
+         $display("WALK %s %s hits=%0d misses=%0d rate=%0d%% cyc/px=%0d.%02d",
+                  (fmt & 1) == 0 ? "PSMCT32" : "PSMT8  ",
+                  fmt >= 2 ? "bilinear" : "nearest ",
+                  dbg_hits - wh, dbg_misses - wm,
+                  (100 * (dbg_hits - wh)) / ((dbg_hits - wh) + (dbg_misses - wm)),
+                  wcyc / (WALK_W * WALK_H),
+                  (100 * wcyc / (WALK_W * WALK_H)) % 100);
          // The floor is not a preference, it is arithmetic: this walk touches
          // 384 distinct memory words in PSMCT32 and 96 in PSMT8, so those are
          // the compulsory misses and no cache can do better. Checking the
@@ -390,9 +420,15 @@ module tb_texcache;
          // failure instead of a quieter printout -- the plain low-bit index
          // this block started with gives 768 here and still hits more often
          // than it misses.
-         if (dbg_misses - wm != (fmt == 0 ? 384 : 96)) begin
+         // The nearest walks touch 384 distinct memory words in PSMCT32 and 96
+         // in PSMT8, so those are their compulsory misses and no cache can do
+         // better. The bilinear walks reach one texel further in each axis, so
+         // their floors are larger -- and they are *floors*, not predictions:
+         // a filter that fetched four corners from one line would come in
+         // under them and be wrong.
+         if (dbg_misses - wm != WALK_FLOOR[fmt]) begin
             $display("FAIL  fmt=%0d took %0d misses, the compulsory floor is %0d",
-                     fmt, dbg_misses - wm, fmt == 0 ? 384 : 96);
+                     fmt, dbg_misses - wm, WALK_FLOOR[fmt]);
             errors++;
          end
 
