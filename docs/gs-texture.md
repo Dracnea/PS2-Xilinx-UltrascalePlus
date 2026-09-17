@@ -489,3 +489,182 @@ Whether the answer is a second port, a wider one time-sliced, or a texture cache
 is a throughput question that wants measuring, and an arbiter written in here
 now would have to be taken out later. What is here is correct at one fetch at a
 time, and what it costs is now a number the integrator can measure.
+
+## The texel cache: the read port, answered — 2026-09-17
+
+The previous section ended on an open question: `gs_lmem` has one read port and
+four customers, and the fourth wants a texel for every pixel drawn. The answer
+taken is a **texel cache**, `rtl/gs/gs_texcache.vhd`, and the reason is what the
+project can afford. The real GS gives texture its own 512-bit path *and* its own
+page buffer; a second port on 4 MB of UltraRAM is the faithful half and the one
+that is out of reach, because UltraRAM is the scarce resource here — 224 of the
+C1100's 640 are spent before the GS's local memory exists at all, and 70 % of an
+FK33's 320 ([cards.md](cards.md)). The page buffer is the affordable half, and
+it goes in LUTs, where there is room.
+
+The block drops in between `gs_texsample` and the memory and presents exactly
+`gs_lmem`'s shape on both sides, so nothing above it changed.
+
+### The shape was measured, and the obvious one was wrong
+
+The first version was direct-mapped with the low address bits as the index,
+which is what anyone writes first. On a 64 × 48 raster walk of a PSMCT32
+texture it hit **75 %** — and it hit exactly 75 % at 16 lines, at 32, at 64 and
+at 128.
+
+A number that does not move with capacity is not a capacity problem. The reuse
+histogram said what it was: two distances, **1 and 61**.
+
+61 is the tell. The GS's column order for PSMCT32 interleaves two pixel rows
+inside one column, so a 256-bit word holds a **4 × 2 patch** — four texels of
+row *v* and four of row *v+1*. A raster walk therefore touches every word twice,
+once per row, about a row apart, and it is the second visit that has to hit. It
+was missing because the words touched in between mapped on top of it: the
+address functions put them at multiples of a block, so the *low* bits of their
+addresses — the index — are far from uniform even though the addresses
+themselves are well spread.
+
+That a fully-associative cache of the same 32 lines reached the floor, while a
+direct-mapped one needed **256**, is what named it as a conflict problem rather
+than a capacity one.
+
+Two changes fix it, and both were chosen by simulating the real address streams
+— all four addressing formats × four TBWs × four texture bases × seven walk
+shapes, **336 configurations** — against each stream's own compulsory-miss floor:
+
+| configuration | above the floor, mean | worst | storage |
+|---|---|---|---|
+| 64 lines, direct-mapped, plain index | 5.36 % of accesses | 15.6 % | 2 KB |
+| 64 lines, direct-mapped, folded index | 2.77 % | 12.5 % | 2 KB |
+| 64 lines, 2-way, folded | 2.64 % | 12.5 % | 2 KB |
+| **128 lines, 2-way, folded** | **0.53 %** | **7.5 %** | **4 KB** |
+| 256 lines, 2-way, folded | 0.46 % | 10.0 % | 8 KB |
+
+* **Fold the index**: `index = addr[S-1:0] xor addr[2S-1:S]`. The bits it drops
+  are still in the tag, so a (tag, index) pair names a line exactly as before —
+  `addr[S-1:0]` is recoverable from the two — and it costs S XOR gates.
+* **Two ways.** Doubling again to 256 lines buys 0.07 %, so 128 lines is the
+  knee and that is what the default is.
+
+Replacement is **round-robin, not LRU**, and that is a measurement too: across
+those 336 configurations the two are not merely close, they produce the
+*identical* miss count everywhere. For two ways they differ only in whether a
+hit reorders the pair, and these streams never make that matter. A victim
+pointer is one bit per set; LRU is the same bit plus an update on every hit, for
+nothing.
+
+With that shape, both formats land exactly on their compulsory-miss floor —
+384 misses for PSMCT32 and 96 for PSMT8 on the walk, which are precisely the
+counts of distinct memory words each touches. **Zero conflict misses.**
+
+| | before | after |
+|---|---|---|
+| PSMCT32, 64 × 48 walk | 75 % | **87 %** (8 texels per line: the ceiling is 87.5 %) |
+| PSMT8, 64 × 48 walk | 87 % | **96 %** (32 texels per line: the ceiling is 96.9 %) |
+
+### The test, and what makes it one
+
+`sim/gs/run_texcache_diff.sh`, three phases, because they answer three different
+questions and one phase would let two of them hide.
+
+**A — the cache must be invisible.** The whole `gs_texsample` vector set runs
+again with the cache spliced into the sampler's read path, and the colours are
+diffed against the *same* `ref.txt` the uncached block is checked against:
+**498 samples identical on four seeds**. A separate vector set for the cached
+path could drift from the uncached one and hide the disagreement being looked
+for. The arbiter's grant is withheld at random here, so the request has to be
+*held* until the memory takes it.
+
+**B — the hit rate that matters, and a second opinion on it.** Those 498 vectors
+are random UV over the whole coordinate range with a random texture base each
+time, which is the worst input a cache can be given; their hit rate is a floor,
+not a measurement. Phase B walks a textured quad in raster order instead, and
+runs the same walk through a **second `gs_texsample` wired straight to the
+memory**, comparing pixel for pixel. The same block, the same inputs, one with
+the cache and one without, and the answers have to match.
+
+The miss *count* is asserted against the compulsory floor rather than a rate
+being printed. That is what makes an index regression a failure: the plain
+low-bit index this block started with still hits more often than it misses, so
+any threshold looser than the floor would have let it through.
+
+**C — coherence, directed.** Local memory is one address space. The framebuffer
+the rasteriser writes and the texture this reads are the same 4 MB, and
+rendering to a texture is an ordinary PS2 idiom — it is how reflections, shadow
+maps and most full-screen effects are done. A cache that does not watch the
+write port serves the texture as it was before the render, and the failure looks
+like a one-frame-late reflection rather than like a cache bug.
+
+Ten directed cases, and two of them exist for the plausible *wrong*
+implementations rather than for the right one:
+
+* **a snoop of a different tag in the same set must NOT invalidate.** A cache
+  that invalidates on the index alone is perfectly coherent, passes every
+  staleness test, and throws away lines it still holds.
+* **a write to the line a miss is fetching must leave that line invalid.**
+  `gs_lmem` returns the value the array held *before* the write, so the word in
+  flight is already stale. It is still handed to the client — the uncached path
+  would have returned the same word — but keeping it would let the stale line
+  outlive the write that should have killed it.
+
+There is also a case for a write landing in the *same cycle* as the lookup of
+that line. The tag comparison and the invalidation happen on one clock edge, so
+a hit taken from the old valid bit returns the word the write has just replaced.
+The block forces a miss there, which means the cached path can return a **newer**
+word than the uncached path would. That asymmetry is deliberate: the rasteriser
+and the texture unit have no defined order between them, so no client can depend
+on seeing the older word, while every client depends on not seeing a stale one.
+
+### Mutation testing found two holes in the test again
+
+`sim/gs/mutate_texcache.py` — **twelve mutations, twelve caught**, plus one
+mutant recorded as *equivalent* with its reason, because "the test did not catch
+it" and "there was nothing to catch" look identical in a results table.
+
+Two of the twelve were not caught on the first run, and neither was an RTL
+problem:
+
+* **the modelled memory answered every read**, granted or not, so a cache that
+  ignored `m_ready` was indistinguishable from one that honoured it. In `gs_top`
+  the ungranted read simply never happens, and the testbench has to model that
+  or the backpressure is untested.
+* **every address in the coherence cases lived in the bottom of local memory**,
+  where the top bit of the tag is zero — so a tag comparison that dropped that
+  bit aliased two lines and nothing noticed.
+
+That is the third and fourth time in this repository that mutation testing has
+found a hole in a test rather than in the design.
+
+### The cost, measured
+
+Out of context for `xcu55n-2LV`, with the GS's own 147.456 MHz constrained:
+
+| | |
+|---|---|
+| CLB LUTs | **1570** (850 logic, 720 distributed RAM) |
+| CLB registers | 600 |
+| Block RAM | **0** |
+| UltraRAM | **0** |
+| WNS at 147.456 MHz | **+4.159 ns**, so about 380 MHz |
+
+The zeroes are the point. The block exists to protect UltraRAM and it spends
+none of it; the 4 KB of lines are LUT memory, which this design is nowhere near
+running out of.
+
+### What this does not answer
+
+`gs_top` does not instantiate the texture unit yet, so the cache is verified
+against a modelled memory and a modelled arbiter rather than against `gs_lmem`
+behind `gs_top`'s real one. Wiring it in means wiring the whole texture path in,
+which is the rasteriser driving UV — the next step, not this one. Two things
+fall out of it when it happens:
+
+* the snoop port wants the rasteriser's write port, which `gs_top` already has
+  in one place;
+* `flush` wants TEXFLUSH, and until the GIF decodes that register a CLUT reload
+  or a TEX0 base change has to pulse it from wherever the change is seen.
+
+**Bilinear is now unblocked.** It is four fetches per pixel, which is what made
+it wait on this decision; with the cache the three neighbours of a texel are
+overwhelmingly in lines already held, so the cost is four lookups rather than
+four memory reads. Step 5's reference model has been complete since 2026-09-14.

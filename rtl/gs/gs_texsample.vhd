@@ -7,9 +7,10 @@
 -- primitive can be drawn.
 --
 -- Nearest sampling only. Bilinear needs four of these and a weighted sum, and
--- the reference model has it (step 5) -- but four fetches is a throughput
--- decision about the read port, which is the open question below, and building
--- the filter before that is settled would be building it twice.
+-- the reference model has had it since step 5 -- it waited on the read port,
+-- because four fetches per pixel is a throughput decision and building the
+-- filter before that was settled would have been building it twice. It is
+-- settled now (`gs_texcache`), so bilinear is the next thing here.
 --
 -- ## Nearest truncates, it does not round
 --
@@ -27,7 +28,7 @@
 -- guess and darkens every textured surface by exactly a factor of two, which
 -- reads as a lighting bug rather than as an arithmetic one.
 --
--- ## The read port, stated plainly rather than solved here
+-- ## The read port -- answered elsewhere, on purpose
 --
 -- `gs_lmem` has one read port. The rasteriser and the display already share it
 -- (`a3451fe`), the CLUT's loader is a third customer, and this is a fourth --
@@ -36,12 +37,12 @@
 -- buffer, which is why a textured pixel there costs roughly twice an untextured
 -- one rather than four times.
 --
--- So this block takes a read port as an ordinary port and does not arbitrate.
--- Whether the answer is a second port on gs_lmem, a wider one time-sliced, or a
--- texture cache in front of it is a throughput decision that wants measuring,
--- and an arbiter written into this block now would have to be taken out of it
--- later. What is here is correct and one fetch at a time; what it costs is a
--- number the integrator can now measure rather than estimate.
+-- The answer taken is `gs_texcache`, which presents exactly this port's shape on
+-- both of its sides and sits between this block and the memory. That is why
+-- nothing here changed when it landed, and why nothing here arbitrates: an
+-- arbiter written into this block would have had to be taken out again. What is
+-- here is correct at one fetch at a time, and the throughput question is
+-- measured next door rather than guessed at here.
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
