@@ -136,8 +136,19 @@ entity gs_clut is
       texclut    : in  std_logic_vector(63 downto 0);
 
       -- local memory, the same port shape gs_lmem presents: a read is accepted
-      -- when rd_en is high and answered later with rd_valid.
+      -- when rd_en is high **and rd_ready is high**, and answered later with
+      -- rd_valid.
+      --
+      -- `rd_ready` exists because this block shares one read port with the
+      -- rasteriser, the display and the texture cache once it is inside gs_top,
+      -- and an arbiter that cannot refuse is not an arbiter. Without it a
+      -- refused read is simply lost: this loader would sit in WAIT_D for a
+      -- rd_valid that is never coming and `busy` would stay high forever,
+      -- which stops the draw that was waiting for the palette and hangs the
+      -- whole rasteriser. That is exactly what happened the first time it was
+      -- wired in. gs_pcrtc gained the same input for the same reason.
       rd_en      : out std_logic;
+      rd_ready   : in  std_logic := '1';
       rd_addr    : out std_logic_vector(16 downto 0);
       rd_data    : in  std_logic_vector(255 downto 0);
       rd_valid   : in  std_logic;
@@ -325,9 +336,14 @@ begin
 
                when ISSUE =>
                   -- One entry per access. rd_en is combinational on this state,
-                  -- so the address presented is word_adr for the current c.
-                  lane  <= word_adr(2 downto 0);
-                  state <= WAIT_D;
+                  -- so the address presented is word_adr for the current c --
+                  -- and the state is *held* until the arbiter takes it, which
+                  -- keeps rd_en and rd_addr asserted across a refusal instead
+                  -- of issuing an address nobody read.
+                  if rd_ready = '1' then
+                     lane  <= word_adr(2 downto 0);
+                     state <= WAIT_D;
+                  end if;
 
                when WAIT_D =>
                   if rd_valid = '1' then

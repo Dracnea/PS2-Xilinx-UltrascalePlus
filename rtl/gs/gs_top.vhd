@@ -77,7 +77,14 @@ entity gs_top is
       -- read port. A contention test that does not check these can pass
       -- because nothing contended, which proves nothing at all.
       dbg_crtc_rd    : out unsigned(31 downto 0) := (others => '0');
-      dbg_crtc_stall : out unsigned(31 downto 0) := (others => '0')
+      dbg_crtc_stall : out unsigned(31 downto 0) := (others => '0');
+      -- the texture unit, straight through from gs_gif
+      dbg_tex_hits   : out unsigned(31 downto 0);
+      dbg_tex_misses : out unsigned(31 downto 0);
+      dbg_clut_loads : out unsigned(15 downto 0);
+      dbg_tex_unsup  : out std_logic;
+      dbg_tex_skip   : out unsigned(15 downto 0);
+      dbg_tex_stall  : out unsigned(31 downto 0) := (others => '0')
    );
 end entity;
 
@@ -98,6 +105,12 @@ architecture arch of gs_top is
    signal m_rd_data : std_logic_vector(255 downto 0);
    signal m_rd_valid: std_logic;
 
+   -- texture side
+   signal t_rd_en    : std_logic;
+   signal t_rd_addr  : std_logic_vector(16 downto 0);
+   signal t_rd_valid : std_logic;
+   signal t_grant    : std_logic;
+
    -- PCRTC side
    signal p_rd_en   : std_logic;
    signal p_rd_addr : std_logic_vector(ADDR_BITS-1 downto 0);
@@ -110,6 +123,7 @@ architecture arch of gs_top is
    constant OWN_HOST  : std_logic_vector(1 downto 0) := "00";
    constant OWN_RAST  : std_logic_vector(1 downto 0) := "01";
    constant OWN_PCRTC : std_logic_vector(1 downto 0) := "10";
+   constant OWN_TEX   : std_logic_vector(1 downto 0) := "11";
    signal own0, own1 : std_logic_vector(1 downto 0) := OWN_HOST;
    signal own_nxt    : std_logic_vector(1 downto 0) := OWN_HOST;
    signal own_v      : std_logic_vector(1 downto 0) := "00";
@@ -123,8 +137,14 @@ begin
          wr_data => r_wr_data, wr_be => r_wr_be,
          rd_en => r_rd_en, rd_addr => r_rd_addr,
          rd_data => r_rd_data, rd_valid => r_rd_valid,
+         t_rd_en => t_rd_en, t_rd_addr => t_rd_addr,
+         t_rd_data => m_rd_data, t_rd_valid => t_rd_valid,
+         t_rd_ready => t_grant,
          dbg_sel => dbg_sel, dbg_reg => dbg_reg,
-         dbg_unknown => dbg_unknown, dbg_pixels => dbg_pixels);
+         dbg_unknown => dbg_unknown, dbg_pixels => dbg_pixels,
+         dbg_tex_hits => dbg_tex_hits, dbg_tex_misses => dbg_tex_misses,
+         dbg_clut_loads => dbg_clut_loads, dbg_tex_unsup => dbg_tex_unsup,
+         dbg_tex_skip => dbg_tex_skip);
 
    mem : entity work.gs_lmem
       generic map (ADDR_BITS => ADDR_BITS, DATA_WIDTH => 256)
@@ -150,15 +170,29 @@ begin
    -- The host is last and may still be refused outright, which is what it was
    -- before this block gained a third customer: it reads a buffer that is
    -- finished, and the tools that drive it retry.
+   -- **The texture unit is third, below the display.** It is the newest
+   -- customer and the hungriest -- a texel per pixel drawn, four per pixel
+   -- filtered -- and it is the one that can afford to lose. PCRTC has a
+   -- real-time deadline: a read it does not get in time is a pixel that is not
+   -- on the screen when the raster reaches it. The texture unit has no
+   -- deadline at all; a grant deferred slows drawing and changes no picture.
+   --
+   -- Putting texture above the display would be the natural-looking choice --
+   -- it is inside a pixel, the display is between them -- and it would tear the
+   -- picture during any large textured fill. gs_texcache holds its request
+   -- until the grant comes, so losing costs it nothing but a cycle.
    p_grant   <= not r_rd_en;
+   t_grant   <= not r_rd_en and not p_rd_en;
 
-   m_rd_en   <= r_rd_en or p_rd_en or h_rd_en;
+   m_rd_en   <= r_rd_en or p_rd_en or (t_rd_en and t_grant) or h_rd_en;
    m_rd_addr <= r_rd_addr(ADDR_BITS-1 downto 0) when r_rd_en = '1'
                 else p_rd_addr when p_rd_en = '1'
+                else t_rd_addr(ADDR_BITS-1 downto 0) when t_rd_en = '1'
                 else h_rd_addr;
 
    own_nxt   <= OWN_RAST  when r_rd_en = '1'
                 else OWN_PCRTC when p_rd_en = '1'
+                else OWN_TEX   when t_rd_en = '1'
                 else OWN_HOST;
 
    count : process (clk)
@@ -167,12 +201,19 @@ begin
          if reset = '1' then
             dbg_crtc_rd    <= (others => '0');
             dbg_crtc_stall <= (others => '0');
+            dbg_tex_stall  <= (others => '0');
          else
             if p_rd_en = '1' and p_grant = '1' then
                dbg_crtc_rd <= dbg_crtc_rd + 1;
             end if;
             if p_rd_en = '1' and p_grant = '0' then
                dbg_crtc_stall <= dbg_crtc_stall + 1;
+            end if;
+            -- How often the texture unit was made to wait. A contention test
+            -- that leaves this at zero has not contended, whatever else it
+            -- proves.
+            if t_rd_en = '1' and t_grant = '0' then
+               dbg_tex_stall <= dbg_tex_stall + 1;
             end if;
          end if;
       end if;
@@ -199,6 +240,7 @@ begin
    h_rd_data  <= m_rd_data;
    h_rd_valid <= m_rd_valid and own_v(1) when own1 = OWN_HOST else '0';
    p_rd_valid <= m_rd_valid and own_v(1) when own1 = OWN_PCRTC else '0';
+   t_rd_valid <= m_rd_valid and own_v(1) when own1 = OWN_TEX else '0';
 
    crtc : entity work.gs_pcrtc
       generic map (ADDR_BITS => ADDR_BITS)

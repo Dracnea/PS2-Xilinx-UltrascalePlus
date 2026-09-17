@@ -344,7 +344,20 @@ architecture rtl of gs_texsample is
    signal a_off      : unsigned(7 downto 0);
    signal a_width    : unsigned(5 downto 0);
 
-   type t_state is (IDLE, FETCH, WAIT_D, CLUT1, CLUT2, EMIT);
+   -- FILT1 and FILT2 are register stages, not work. The filter and the texture
+   -- function chained combinationally were the Graphics Synthesizer's longest
+   -- path once this block was wired into gs_top: t00 -> three lerps -> TFX's
+   -- multiply and saturate -> the consumer's register, 35 logic levels and
+   -- 10.3 ns against the console's 6.782. Split three ways it is one lerp, one
+   -- lerp, and TFX. The cost is one extra clock for nearest and two for
+   -- bilinear, against a textured pixel that already takes a dozen.
+   -- CALC is a register stage too. gs_texaddr is combinational and was feeding
+   -- gs_texcache's tag compare in the same clock: coordinate -> page, block and
+   -- column arithmetic -> the cache's set, tag and hit decision, 25 logic levels
+   -- and the longest path in the GS once the filter above had been split. One
+   -- clock per texel buys it back, and a corner that hits the cache still costs
+   -- three.
+   type t_state is (IDLE, CALC, FETCH, WAIT_D, CLUT1, CLUT2, FILT1, FILT2, EMIT);
    signal state : t_state := IDLE;
 
    -- The expanded texel for the corner that has just come back, stored into one
@@ -362,7 +375,14 @@ architecture rtl of gs_texsample is
    end procedure;
 
    signal raw        : std_logic_vector(31 downto 0) := (others => '0');
-   signal filtered   : t_rgba;
+   -- The address, held across the fetch so the arithmetic above and the lookup
+   -- below are in different clocks.
+   signal r_lm  : unsigned(16 downto 0) := (others => '0');
+   signal r_off : unsigned(7 downto 0)  := (others => '0');
+   signal r_w   : unsigned(5 downto 0)  := (others => '0');
+
+   signal r_top, r_bot : t_rgba := (others => '0');
+   signal r_filtered   : t_rgba := (others => '0');
 
    function is_indexed(psm : std_logic_vector(5 downto 0)) return boolean is
    begin
@@ -406,7 +426,7 @@ begin
          u_out   => open,
          v_out   => open);
 
-   rd_addr  <= std_logic_vector(a_lm);
+   rd_addr  <= std_logic_vector(r_lm);
    rd_en    <= '1' when state = FETCH else '0';
    busy     <= '0' when state = IDLE else '1';
    clut_idx <= unsigned(raw(7 downto 0));
@@ -456,8 +476,14 @@ begin
                      r_tex0   <= tex0;
                      r_clamp  <= clamp;
                      corner   <= (others => '0');
-                     state    <= FETCH;
+                     state    <= CALC;
                   end if;
+
+               when CALC =>
+                  r_lm  <= a_lm;
+                  r_off <= a_off;
+                  r_w   <= a_width;
+                  state <= FETCH;
 
                when FETCH =>
                   state <= WAIT_D;
@@ -468,9 +494,9 @@ begin
                      -- can start at any of 64 bit positions and VHDL will not
                      -- index a slice with a signal.
                      shifted := shift_right(unsigned(rd_data),
-                                            to_integer(a_off));
+                                            to_integer(r_off));
                      w32 := std_logic_vector(shifted(31 downto 0));
-                     case to_integer(a_width) is
+                     case to_integer(r_w) is
                         when 4      => word := x"0000000" & w32(3 downto 0);
                         when 8      => word := x"000000"  & w32(7 downto 0);
                         when 16     => word := x"0000"    & w32(15 downto 0);
@@ -490,9 +516,11 @@ begin
                              expand_texel(word, unsigned(r_psm)));
                         if r_linear = '1' and corner /= "11" then
                            corner <= corner + 1;
-                           state  <= FETCH;
+                           state  <= CALC;
+                        elsif r_linear = '1' then
+                           state <= FILT1;
                         else
-                           state <= EMIT;
+                           state <= FILT2;
                         end if;
                      end if;
                   end if;
@@ -510,10 +538,28 @@ begin
                        expand_texel(clut_data, PSMCT32));
                   if r_linear = '1' and corner /= "11" then
                      corner <= corner + 1;
-                     state  <= FETCH;
+                     state  <= CALC;
+                  elsif r_linear = '1' then
+                     state <= FILT1;
                   else
-                     state <= EMIT;
+                     state <= FILT2;
                   end if;
+
+               when FILT1 =>
+                  -- The two horizontal lerps, which are independent of each
+                  -- other and so cost one lerp of depth, not two.
+                  r_top <= lerp_rgba(t00, t10, r_fu);
+                  r_bot <= lerp_rgba(t01, t11, r_fu);
+                  state <= FILT2;
+
+               when FILT2 =>
+                  -- The vertical one, or the nearest texel straight through.
+                  if r_linear = '1' then
+                     r_filtered <= lerp_rgba(r_top, r_bot, r_fv);
+                  else
+                     r_filtered <= t00;
+                  end if;
+                  state <= EMIT;
 
                when EMIT =>
                   -- `colour` is combinational on the stored texels, so it is
@@ -530,11 +576,12 @@ begin
    -- The filter runs first and TFX second, which is the model's order and not an
    -- arbitrary one: TFX multiplies by the fragment colour and saturates, and
    -- saturating four texels and then averaging them is not the same as averaging
-   -- four and saturating once.
-   filtered <= bilerp(t00, t10, t01, t11, r_fu, r_fv) when r_linear = '1'
-               else t00;
-
-   -- Combinational on the stored texels, so `colour` is valid with `done`.
-   colour <= texture_function(unsigned(r_tfx), r_tcc, r_frag, filtered);
+   -- four and saturating once. `bilerp` in the package states that composition
+   -- in one expression and is what the model is read against; the FSM above
+   -- evaluates the same thing one lerp per clock.
+   --
+   -- Combinational on the *registered* filtered texel, so the path that leaves
+   -- this block is TFX alone and `colour` is still valid with `done`.
+   colour <= texture_function(unsigned(r_tfx), r_tcc, r_frag, r_filtered);
 
 end architecture;

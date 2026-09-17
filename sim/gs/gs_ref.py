@@ -126,6 +126,28 @@ class _Walk:
         return self.seed + self.step * b + self.lane[j]
 
 
+def _uvclamp(q):
+    """An interpolated texture coordinate, saturated into the UV register's 14 bits.
+
+    **Saturated, not wrapped**, because UV rides the same interpolator the
+    colour channels do and that interpolator saturates: `gs_chan_dda` clamps its
+    output into CWIDTH bits, which for a colour is 0..255 and for UV is
+    0..16383. Wrapping was the first guess here and it disagrees with the RTL on
+    exactly the pixels where a span's interpolated coordinate dips below zero --
+    a handful per primitive, scattered along the edges, where wrapping produces
+    a coordinate near 1023.9 and saturation produces 0. Both are plausible
+    pictures; only one of them is what the hardware this model describes does.
+
+    Whether the *console* saturates here is **unverified**: it follows from UV
+    sharing the interpolator, which is itself an assumption (see
+    `draw_triangle`). A probe drawing a triangle whose UV gradient carries the
+    coordinate off the bottom of the range would settle it, and would settle the
+    shared-interpolator question at the same time.
+    """
+    v = _floor(q)
+    return 0 if v < 0 else (0x3FFF if v > 0x3FFF else v)
+
+
 def _plane(P, vals):
     """dv/dx and dv/dy for the plane through three (x, y) points carrying vals.
 
@@ -1013,6 +1035,13 @@ class GS:
         self.xfer = None          # a host-to-local transfer in progress
         self.vq = []              # vertices queued for the current primitive
         self.pixels = 0           # drawn, so a silently-empty test is visible
+        # The on-chip palette. One buffer for both contexts, as on hardware --
+        # TEX0_1 and TEX0_2 do not each get their own, which is why a CLD
+        # reload for one context is visible to the other and why content that
+        # alternates contexts with different palettes reloads constantly.
+        self.clut = Clut()
+        self.clut_unsup = 0       # CLUT formats refused, not guessed at
+        self.tex_skip = 0         # textured primitives refused, not drawn wrong
 
     # -- register writes ----------------------------------------------------
     def write(self, addr, data):
@@ -1030,6 +1059,22 @@ class GS:
             self.vertex(data, kick=True)
         elif addr in (0x0C, 0x0D):            # XYZF3 / XYZ3: queue only
             self.vertex(data, kick=False)
+        elif addr in (0x06, 0x07):            # TEX0_1 / TEX0_2: CLD may reload
+            # The reload happens on the *write*, not on the draw. A palette
+            # refilled at draw time would read local memory as it stands then,
+            # and a primitive that renders into the page the palette came from
+            # would see its own output. gs_clut.vhd loads on `we` for the same
+            # reason.
+            # A CLUT format this model does not derive leaves the buffer
+            # holding what it held and is counted -- which is exactly what
+            # gs_clut.vhd's `unsupported` output does. Raising here instead
+            # would make a stream containing one random TEX0 write unrunnable,
+            # while the hardware carries on; the two have to disagree about
+            # nothing, including about what they refuse.
+            try:
+                self.clut.load(self.vm, data, self.reg[0x1C])
+            except NotImplementedError:
+                self.clut_unsup += 1
 
     # -- the pixel back end --------------------------------------------------
     def blend(self, src, dst, ctx):
@@ -1244,8 +1289,13 @@ class GS:
     def vertex(self, data, kick):
         # X and Y are 12.4 fixed point; the fraction is dropped here because
         # a sprite has no interpolation to need it.  A triangle will.
+        # UV rides along beside RGBAQ for the same reason: it is written before
+        # the vertex it belongs to, so the value current at the vertex write is
+        # that vertex's own. A texture coordinate read at draw time instead
+        # would be the *last* vertex's for all three corners, which looks like a
+        # broken interpolator rather than like a latching bug.
         self.vq.append((bits(data, 15, 0), bits(data, 31, 16), bits(data, 63, 32),
-                        self.reg[0x01]))
+                        self.reg[0x01], self.reg[0x03]))
         if not kick:
             return
         prim = bits(self.reg[0x00], 2, 0)
@@ -1262,6 +1312,60 @@ class GS:
                 self.vq = [self.vq[0], self.vq[-1]]   # a fan keeps the first
         elif len(self.vq) > 8:
             self.vq = self.vq[-2:]
+
+    # ---- texturing a fragment ---------------------------------------------
+    #
+    # PRIM.TME turns it on and PRIM.FST chooses the coordinate. **Only FST = 1
+    # (UV) is implemented.** FST = 0 interpolates S, T and Q as floats and
+    # divides per pixel; `stq_to_uv` above is that arithmetic and is tested, but
+    # nothing interpolates STQ across a primitive yet, and a texture unit fed a
+    # coordinate nothing produced would be agreeing with itself. A primitive
+    # that asks for it is refused rather than drawn with a guessed coordinate --
+    # the same rule the 16-bit CLUT layout is under.
+    #
+    # ## The filter, and what decides it
+    #
+    # TEX1's MMAG and MMIN decide, through the LOD, and the LOD comes from Q's
+    # exponent. LCM = 1 takes K directly and needs no Q at all; otherwise a
+    # primitive drawn through the UV path still has a Q, from RGBAQ, and it is
+    # that Q the level comes from. Both routes are in `lod_from_q` and
+    # `filter_for` already, so this calls them rather than reducing TEX1 to a
+    # filter bit of its own.
+
+    def texture_frag(self, frag, u_fixed, v_fixed, q_bits):
+        """The fragment colour after the texture, or None if TME is off."""
+        if bits(self.reg[0x00], 4, 4) == 0:              # PRIM.TME
+            return None
+        c = self.ctx()
+        tex0  = self.reg[0x06 + c]
+        tex1  = self.reg[0x14 + c]
+        clamp = self.reg[0x08 + c]
+
+        lcm     = bits(tex1, 19, 19)
+        mmag    = bits(tex1, 5, 5)
+        mmin    = bits(tex1, 8, 6)
+        l_shift = bits(tex1, 1, 0)
+        k_raw   = bits(tex1, 43, 32)
+        k_bias  = k_raw - 4096 if k_raw & 0x800 else k_raw
+        lod     = k_bias if lcm else lod_from_q(q_bits, l_shift, k_bias)
+        linear, _ = filter_for(lod, mmag, mmin)
+
+        texel = sample(self.vm, tex0, clamp, self.clut, u_fixed, v_fixed, linear)
+        tfx = bits(tex0, 36, 35)
+        tcc = bits(tex0, 34, 34)
+        f = (frag & 0xFF, (frag >> 8) & 0xFF, (frag >> 16) & 0xFF,
+             (frag >> 24) & 0xFF)
+        r, g, b, a = texture_function(tfx, tcc, f, texel)
+        return r | g << 8 | b << 16 | a << 24
+
+    def textured(self):
+        """True if this primitive is textured and can be drawn."""
+        if bits(self.reg[0x00], 4, 4) == 0:
+            return False
+        if bits(self.reg[0x00], 8, 8) == 0:              # PRIM.FST = 0: STQ
+            raise NotImplementedError(
+                "PRIM.FST = 0 (STQ) needs the per-pixel divide; not built")
+        return True
 
     def draw_triangle(self, v0, v1, v2):
         """A flat-shaded triangle in PSMCT32.
@@ -1292,7 +1396,18 @@ class GS:
         described above -- not by evaluating the plane per pixel, which is both
         what hardware does not do and what an obvious implementation would.
 
-        Z, texture and dither are still later blocks.
+        **Texture, when PRIM.TME is set.** U and V are interpolated across the
+        triangle by the *same* blocked, grid-snapped DDA the colour channels
+        use. That the GS shares one interpolator design between colour, depth
+        and texture coordinates is an **assumption, not a measurement** -- the
+        probes that established the 2**-10 grid and the eight-pixel block used
+        flat and Gouraud triangles, and say nothing about UV. It is the
+        assumption that costs least if wrong (one generic on one block) and the
+        one that makes the RTL and this model agree by construction; a probe
+        that drew a textured triangle with a UV gradient chosen to land just
+        either side of a grid step would settle it.
+
+        Dither is still a later block.
 
         """
         c = self.ctx()
@@ -1333,6 +1448,11 @@ class GS:
                 return
 
         iip = bits(self.reg[0x00], 3, 3)
+        try:
+            tme = self.textured()
+        except NotImplementedError:
+            self.tex_skip += 1
+            return
         grad = None
         if iip:
             chan = [[(v[3] >> (8 * n)) & 0xFF for v in (v0, v1, v2)]
@@ -1340,6 +1460,20 @@ class GS:
             grad = [_plane(P, [Fraction(c) for c in ch]) for ch in chan]
             if any(g is None for g in grad):
                 return                  # degenerate: no plane, and no coverage
+
+        # U and V are 14 bits each in the UV register, 12.4 like everything
+        # else, and they interpolate on the same plane and the same grid as a
+        # colour channel. Q comes from RGBAQ and is *not* interpolated here --
+        # on the UV path it only selects the mipmap level, and the level is
+        # taken from the primitive's Q rather than per pixel.
+        tgrad = None
+        if tme:
+            tch = [[bits(v[4], 13, 0) for v in (v0, v1, v2)],
+                   [bits(v[4], 29, 16) for v in (v0, v1, v2)]]
+            tgrad = [_plane(P, [Fraction(c) for c in ch]) for ch in tch]
+            if any(g is None for g in tgrad):
+                return
+            q_bits = bits(v2[3], 63, 32)
 
         for yy in range(ytop, ybot + 1):
             y = Fraction(yy)
@@ -1374,6 +1508,16 @@ class GS:
                                  + dvdy * (y - P[0][1]))
                     walk.append(_Walk(seed, dvdx))
 
+            twalk = None
+            if tme:
+                twalk = []
+                for n in range(2):
+                    dvdx, dvdy = tgrad[n]
+                    seed = (Fraction(tch[n][0])
+                            + dvdx * (Fraction(left) - P[0][0])
+                            + dvdy * (y - P[0][1]))
+                    twalk.append(_Walk(seed, dvdx))
+
             for xx in range(left, right + 1):
                 loc = self.fbaddr(fb, xx, yy)
                 if loc is None:
@@ -1390,6 +1534,11 @@ class GS:
                         src |= (0 if q < 0 else (255 if q > 255 else q)) << (8 * n)
                 else:
                     src = rgba
+                if tme:
+                    src = self.texture_frag(src,
+                                            _uvclamp(twalk[0].at(xx - left)),
+                                            _uvclamp(twalk[1].at(xx - left)),
+                                            q_bits)
                 self.putpixel(fb, loc, src, c)
 
     def draw_sprite(self, v0, v1):
@@ -1401,7 +1550,31 @@ class GS:
         what the console probes found: sprites are the one primitive where
         depth has no DDA behind it at all.
 
-        No texture and no dither: those are later blocks.
+        **Texture, when PRIM.TME is set.** A sprite's UV comes from its two
+        vertices and ramps linearly across the rectangle -- u from v0's U at the
+        left edge to v1's U at the right, and the same in V. It does *not* go
+        through the triangle's plane DDA, because a sprite has no plane: it has
+        two corners and a rectangle between them.
+
+        The ramp is expressed as a **plane** through three synthesised corners
+        -- (x0,y0,u0), (x1,y0,u1), (x0,y1,u0) -- rather than as a pair of
+        divisions of its own. That is not a flourish: it is the same `_plane`
+        and the same `_Walk` the triangle uses, so the RTL can drive the same
+        two interpolators for both primitives and the two cannot drift apart. A
+        sprite's UV ramp genuinely is a plane; it just happens to be one with
+        du/dy and dv/dx of zero.
+
+        Two things here are **not measured against silicon** and are worth
+        naming rather than burying. The ramp is evaluated on the same 2**-10
+        grid the triangle DDA uses, which is a guess that the same hardware does
+        the stepping; and the endpoints are treated as the coordinate *at* the
+        first and last covered pixel, which is the reading that makes a sprite
+        drawn with u0=0, u1=W<<4 over W pixels step by exactly one texel per
+        pixel. The other reading -- edges rather than centres -- differs by
+        half a texel over the width. A probe drawing a wide sprite across a
+        texture with a hard vertical edge would settle both at once.
+
+        Dither is still a later block.
         """
         c = self.ctx()
         xyoff  = self.reg[0x18 + c]
@@ -1427,14 +1600,70 @@ class GS:
         rgba = v1[3] & 0xFFFFFFFF
         z    = v1[2] & 0xFFFFFFFF
         zs   = self.zsetup(c)
+
+        # A textured sprite is refused in the RTL for now -- its UV ramp is a
+        # plane and the interpolators would take it, but the sprite path has no
+        # per-scanline seed state to pulse them with. The ramp below is built
+        # and tested; what is not built is the hardware to drive it, so this
+        # refuses in step rather than drawing a picture the RTL will not.
+        if bits(self.reg[0x00], 4, 4) == 1:
+            self.tex_skip += 1
+            return
+        try:
+            tme = self.textured()
+        except NotImplementedError:
+            return
+        twalk = None
+        if tme:
+            # The unclipped rectangle sets the ramp; the scissor then removes
+            # pixels from it. Seeding from the *clipped* left edge instead would
+            # slide the texture across the primitive whenever it was scissored,
+            # which looks like a scissor bug on the texture and not on the shape.
+            ux0, uy0 = bits(v0[4], 13, 0), bits(v0[4], 29, 16)
+            ux1, uy1 = bits(v1[4], 13, 0), bits(v1[4], 29, 16)
+            rx0 = (v0[0] - ofx) >> 4
+            ry0 = (v0[1] - ofy) >> 4
+            rx1 = (v1[0] - ofx) >> 4
+            ry1 = (v1[1] - ofy) >> 4
+            if rx0 > rx1:
+                rx0, rx1 = rx1, rx0
+                ux0, ux1 = ux1, ux0
+            if ry0 > ry1:
+                ry0, ry1 = ry1, ry0
+                uy0, uy1 = uy1, uy0
+            # Three corners that describe the ramp, in the same 12.4 window
+            # coordinates the triangle path uses. A zero-area rectangle has no
+            # plane and also covers no pixels, so the None never reaches a draw.
+            SP = [(Fraction(rx0), Fraction(ry0)),
+                  (Fraction(rx1), Fraction(ry0)),
+                  (Fraction(rx0), Fraction(ry1))]
+            tgrad = [_plane(SP, [Fraction(ux0), Fraction(ux1), Fraction(ux0)]),
+                     _plane(SP, [Fraction(uy0), Fraction(uy0), Fraction(uy1)])]
+            if any(gr is None for gr in tgrad):
+                return
+            q_bits = bits(v1[3], 63, 32)
+
         for y in range(y0, y1 + 1):
+            if tme:
+                twalk = []
+                for n, (base, gr) in enumerate(((ux0, tgrad[0]), (uy0, tgrad[1]))):
+                    dvdx, dvdy = gr
+                    seed = (Fraction(base) + dvdx * (Fraction(x0) - SP[0][0])
+                                           + dvdy * (Fraction(y) - SP[0][1]))
+                    twalk.append(_Walk(seed, dvdx))
             for x in range(x0, x1 + 1):
                 loc = self.fbaddr(fb, x, y)
                 if loc is None:
                     continue
                 if not self.zcheck(zs, x, y, z):
                     continue
-                self.putpixel(fb, loc, rgba, c)
+                src = rgba
+                if tme:
+                    src = self.texture_frag(src,
+                                            _uvclamp(twalk[0].at(x - x0)),
+                                            _uvclamp(twalk[1].at(x - x0)),
+                                            q_bits)
+                self.putpixel(fb, loc, src, c)
 
     # -- host-to-local ------------------------------------------------------
     def start_transfer(self):

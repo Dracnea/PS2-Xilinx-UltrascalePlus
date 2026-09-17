@@ -20,6 +20,12 @@ module tb_gs;
    logic [16:0]  rd_addr;
    logic [255:0] rd_data;
    logic         rd_valid;
+   logic         t_rd_en;
+   logic [16:0]  t_rd_addr;
+   logic [255:0] t_rd_data;
+   logic         t_rd_valid;
+   logic [255:0] t_s1;
+   logic         t_v1;
    logic [6:0]   dbg_sel = 0;
    logic [63:0]  dbg_reg;
    logic [15:0]  dbg_unknown;
@@ -30,6 +36,12 @@ module tb_gs;
       .gif_valid(gif_valid), .gif_data(gif_data), .gif_ready(gif_ready),
       .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data), .wr_be(wr_be),
       .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data), .rd_valid(rd_valid),
+      // The texture unit's port, modelled the same way and always granted.
+      // Without it the palette loader and the texel cache wait for a rd_valid
+      // that never comes, and the rasteriser waits for them -- which is a
+      // testbench that stalls rather than a design that does.
+      .t_rd_en(t_rd_en), .t_rd_addr(t_rd_addr),
+      .t_rd_data(t_rd_data), .t_rd_valid(t_rd_valid), .t_rd_ready(1'b1),
       .dbg_sel(dbg_sel), .dbg_reg(dbg_reg), .dbg_unknown(dbg_unknown), .dbg_pixels(dbg_pixels));
 
    integer sent, npkt;
@@ -75,6 +87,13 @@ module tb_gs;
                                : vm[{rd_addr, 5'd0} + c];
       rd_data  <= rd_s1;
       rd_valid <= rd_v1;
+
+      t_v1 <= t_rd_en;
+      if (t_rd_en)
+        for (int c = 0; c < 32; c = c + 1)
+          t_s1[8*c +: 8] <= vm[{t_rd_addr, 5'd0} + c];
+      t_rd_data  <= t_s1;
+      t_rd_valid <= t_v1;
    end
 
    // ---- feed the packets --------------------------------------------------

@@ -821,3 +821,127 @@ MMAG/MMIN and therefore the choice between the filters at run time; mipmapping,
 which needs Q; and the perspective divide that produces Q. The model has all
 three. `gs_top` still does not instantiate the texture unit, so none of this has
 been on the card.
+
+## Wired into the rasteriser — 2026-09-17
+
+The texture unit now draws. `gs_gif` interpolates UV across a triangle, fetches
+a texel per pixel through `gs_texcache`, and combines it with the fragment by
+TFX; `gs_top`'s arbiter has a fourth customer. **A textured triangle is drawn by
+the Graphics Synthesizer, and it is byte-identical to `gs_ref.py` on every
+pixel** — 147 lines of register and memory state identical on four random
+streams plus four directed ones.
+
+### What was added
+
+* **Two more `gs_chan_dda`**, at `CWIDTH = 14` instead of 8. The texture
+  coordinate rides the colour interpolator, which is an assumption and not a
+  measurement — see the note in `draw_triangle`.
+* **UV in the vertex queue**, shifting down beside RGBAQ. The UV register is
+  written *before* the vertex it belongs to, so reading it at draw time would
+  give all three corners the last vertex's coordinate.
+* **`gs_clut`, `gs_texsample` and `gs_texcache` inside `gs_gif`**, with the
+  palette loader and the cache **muxed onto one memory port**. That keeps
+  `gs_top`'s arbiter at four customers, and what makes it safe is an invariant
+  rather than an arbiter: a CLUT load starts on a TEX0 register write, a texel
+  fetch starts in `S_DRAW`, and the machine is in exactly one of those at a time.
+* **The LOD**, which decides between MMAG and MMIN. Not the mipmap — there are
+  no levels yet — but the filter selection is real, and `lcm`, `K` and `L` are
+  all wired.
+* **TEXFLUSH**, and the rasteriser's write port on the cache's snoop.
+
+### The arbiter: texture is third, below the display
+
+`p_grant` is unchanged and `t_grant` is `not r_rd_en and not p_rd_en`. The
+rasteriser cannot be refused — its port has no ready and a refusal it cannot see
+is a dropped read. **PCRTC is above texture and that is the decision worth
+recording.** Texture is the hungriest customer and the natural-looking order
+would put it second, since it is inside a pixel and the display is between them.
+But PCRTC has a real-time deadline: a read it does not get in time is a pixel
+missing from the screen. The texture unit has none — `gs_texcache` holds its
+request until the grant comes, so losing costs it a cycle and changes no picture.
+Putting texture above the display would tear the picture during any large
+textured fill.
+
+### What is refused rather than drawn wrong
+
+**`PRIM.FST = 0`** asks for STQ and the per-pixel divide, which is not built.
+**A textured sprite** is refused too: its UV ramp is a plane and the
+interpolators would take it, but the sprite path has no per-scanline seed state
+to pulse them with. Both are counted on `dbg_tex_skip` and **not drawn**.
+
+Not drawn, rather than drawn untextured — a flat triangle where a textured one
+belongs is a wrong picture, and a wrong picture is much harder to notice than a
+missing one. The model refuses identically, which is the only way the difference
+test can be run against a stream that contains them.
+
+### Five bugs, and four of them were invisible
+
+Worth recording because the shapes recur.
+
+1. **`gif_ready` is a deny-list.** It is `'1'` in any state not named, so
+   `S_TEX` — added to fetch a texel — advertised the GIF as ready while it was
+   busy. A quadword handed to it was not back-pressured, it was **dropped**:
+   one per textured pixel. Everything after parsed against the wrong tag and the
+   rasteriser ended up idle waiting for a tag the testbench believed it had sent.
+   Nothing reported an error, because nothing had noticed.
+2. **The scanline seed was guarded by `if dr_iip = '1' or dr_zon = '1'`.** A
+   flat, depth-less, textured triangle sets neither, so the entire seeding step
+   was skipped and the UV interpolators sat at zero for the whole primitive. The
+   symptom is a triangle painted in one texel, which reads as a texture
+   *addressing* fault rather than as a missing state transition.
+3. **`kc_busy` was a term in the fetch condition instead of a branch of its
+   own.** As an `elsif` term it did not make the pixel wait for the palette, it
+   made the pixel *fall through to the colour write* — drawing it with whatever
+   texel the previous pixel had left in `tex_colour`. A textured primitive
+   painted in one stale colour, which looks exactly like a cache fault.
+4. **`signed('0' & '0' & uv_val & '0')`** — a concatenation that is the right
+   width, analyses perfectly, and doubles every texture coordinate. Both sides
+   are 12.4; it needed a zero-extension, not a shift.
+5. **The interpolated UV saturates, it does not wrap.** `gs_chan_dda` clamps its
+   output into `CWIDTH` bits, so a coordinate that dips below zero mid-span
+   becomes 0 and not 1023.9. The model wrapped, and disagreed on a handful of
+   pixels per primitive, scattered along the edges. Both are plausible pictures.
+
+Only the fourth would have been caught by reading the code. The other four
+needed the differential test, and three of them needed it on a *stream* rather
+than on a block.
+
+### The cost, measured
+
+The whole Graphics Synthesizer, out of context for `xcu55n-2LV` at the console's
+147.456 MHz, before and after:
+
+| `gs_top` | without texture | with texture |
+|---|---|---|
+| CLB LUTs | 22,464 | **29,007** (+6,543) |
+| CLB registers | 20,175 | **24,388** (+4,213) |
+| UltraRAM | 128 | **128** (unchanged) |
+| DSPs | 96 | 128 |
+| Block RAM | 0 | 0.5 |
+| WNS at 147.456 MHz | −1.149 ns | **−0.508 ns** |
+
+**The UltraRAM figure not moving is the point of the whole cache decision**, and
+the timing figure needs its caveat stated plainly: both are *synthesis*
+estimates, and the pre-texture design is the one that already runs on the card at
+147.456 MHz — so this flow is pessimistic here and the negative slack closes in
+place and route. What the comparison establishes is the direction: adding the
+texture unit did not make the critical path worse.
+
+It did at first. Two register stages were needed, and both were found by
+measuring rather than by judgement:
+
+* the three lerps and TFX chained combinationally were 35 logic levels and
+  10.3 ns, the longest path in the GS. Split three ways — one lerp, one lerp,
+  TFX — it went from −3.547 ns to −0.962 ns;
+* `gs_texaddr` feeding `gs_texcache`'s tag compare in the same clock was 25
+  levels. One register between them took it to −0.508 ns, and moved the critical
+  path **off the texture unit entirely** onto the rasteriser's own pixel-write
+  path, where it was before.
+
+Those cost one clock per texel, so a textured pixel is now 8.4 cycles nearest and
+18.4 bilinear on the 64 × 48 walk, against 6.4 and 12.4 unpipelined. The hit
+rates and the compulsory-miss floors are unchanged.
+
+### What this does not answer
+
+None of it has been on the card. That is the next step and it needs a bitstream.

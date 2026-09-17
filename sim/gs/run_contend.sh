@@ -35,7 +35,7 @@ W="$HERE/work/contend$$"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
 python3 "$HERE/gen_gif.py" --seed "$SEED" --tags "$TAGS" > packets.hex
 
 xvhdl -2008 "$ROOT/rtl/gs/gs_addr_pkg.vhd" "$ROOT/rtl/gs/gs_edge_dda.vhd" \
-      "$ROOT/rtl/gs/gs_chan_dda.vhd" "$ROOT/rtl/gs/gs_gif.vhd" \
+      "$ROOT/rtl/gs/gs_chan_dda.vhd" "$ROOT/rtl/gs/gs_texaddr.vhd" "$ROOT/rtl/gs/gs_clut.vhd" "$ROOT/rtl/gs/gs_texsample.vhd" "$ROOT/rtl/gs/gs_texcache.vhd" "$ROOT/rtl/gs/gs_gif.vhd" \
       "$ROOT/rtl/gs/gs_lmem.vhd" "$ROOT/rtl/gs/gs_pcrtc.vhd" \
       "$ROOT/rtl/gs/gs_top.vhd" > xvhdl.log 2>&1 || { tail -20 xvhdl.log; exit 1; }
 xvlog -sv "$HERE/tb_gs_top.sv" > xvlog.log 2>&1 || { tail -20 xvlog.log; exit 1; }

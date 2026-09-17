@@ -59,6 +59,21 @@ entity gs_gif is
       rd_data   : in  std_logic_vector(255 downto 0) := (others => '0');
       rd_valid  : in  std_logic := '0';
 
+      -- The texture unit's own read port. It is separate from the one above
+      -- because the two are wanted in the same pixel: the read-modify-write
+      -- reads the frame buffer and this reads the texture, and muxing them
+      -- here would serialise every textured pixel behind its own destination
+      -- read. The palette loader shares this one -- see the note by the
+      -- instantiation -- which is why there are two ports and not three.
+      --
+      -- Unlike the port above, this one has a ready: gs_texcache holds its
+      -- request until the arbiter takes it, so the display never has to lose.
+      t_rd_en    : out std_logic := '0';
+      t_rd_addr  : out std_logic_vector(16 downto 0) := (others => '0');
+      t_rd_data  : in  std_logic_vector(255 downto 0) := (others => '0');
+      t_rd_valid : in  std_logic := '0';
+      t_rd_ready : in  std_logic := '1';
+
       -- for the testbench: read any general register, and count writes to
       -- addresses the manual does not define rather than inventing behaviour
       dbg_sel     : in  unsigned(6 downto 0) := (others => '0');
@@ -67,7 +82,15 @@ entity gs_gif is
       -- pixels drawn, because a primitive that quietly draws nothing -- clipped
       -- away, wrong pixel format, empty rectangle -- otherwise looks exactly
       -- like a framebuffer that was never meant to change
-      dbg_pixels  : out unsigned(31 downto 0) := (others => '0')
+      dbg_pixels  : out unsigned(31 downto 0) := (others => '0');
+      -- The texture unit, observable for the same reason the rest is: a cache
+      -- that never hits and a palette that never loaded both draw a picture.
+      dbg_tex_hits   : out unsigned(31 downto 0);
+      dbg_tex_misses : out unsigned(31 downto 0);
+      dbg_clut_loads : out unsigned(15 downto 0);
+      dbg_tex_unsup  : out std_logic;
+      -- Textured primitives this rasteriser refused rather than drew wrong.
+      dbg_tex_skip   : out unsigned(15 downto 0)
    );
 end entity;
 
@@ -78,7 +101,7 @@ architecture arch of gs_gif is
    signal unknown : unsigned(15 downto 0) := (others => '0');
    signal pixels  : unsigned(31 downto 0) := (others => '0');
 
-   type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS,
+   type state_t is (S_TAG, S_PACKED, S_REGLIST, S_IMAGE, S_PIXELS, S_TEX,
                     S_SPR_CLAMP, S_SPR_TEST,
                     S_DRAW, S_DRAWRD,
                     S_DRAWWR,
@@ -124,6 +147,13 @@ architecture arch of gs_gif is
    -- shading takes the last vertex's colour, which is simply the current one.
    signal v0_c, v1_c, v2_c : std_logic_vector(31 downto 0) := (others => '0');
    signal vf_c             : std_logic_vector(31 downto 0) := (others => '0');
+   -- UV shifts down beside RGBAQ and for the same reason: the UV register is
+   -- written *before* the vertex it belongs to, so the value current at the
+   -- vertex write is that vertex's own. Reading UV at draw time instead would
+   -- give all three corners the last vertex's coordinate, which looks like a
+   -- broken interpolator and not like a latching bug.
+   signal v0_uv, v1_uv, v2_uv : std_logic_vector(31 downto 0) := (others => '0');
+   signal vf_uv               : std_logic_vector(31 downto 0) := (others => '0');
    signal v0_z, v1_z, v2_z : std_logic_vector(31 downto 0) := (others => '0');
    signal vf_z             : std_logic_vector(31 downto 0) := (others => '0');
    -- '1' while a triangle is being walked; sprites leave it clear
@@ -149,6 +179,10 @@ architecture arch of gs_gif is
    type sv32_a is array (0 to 2) of std_logic_vector(31 downto 0);
    signal t_c : sv32_a := (others => (others => '0'));
    signal t_z : sv32_a := (others => (others => '0'));
+   -- The three corners' texture coordinates, in the same order and latched on
+   -- the same edge. A sprite fills these in too, with the three synthesised
+   -- corners of its ramp -- see the note above the UV interpolators.
+   signal t_uv : sv32_a := (others => (others => '0'));
    signal dr_x, dr_y : unsigned(10 downto 0) := (others => '0');
    signal dr_x0      : unsigned(10 downto 0) := (others => '0');
 
@@ -236,6 +270,56 @@ architecture arch of gs_gif is
    signal dr_zhalf   : integer range 0 to 1 := 0;
    signal dr_z       : std_logic_vector(31 downto 0) := (others => '0');
    signal dr_zdone   : std_logic := '0';    -- this pixel has passed its test
+
+   -- ---- texture -----------------------------------------------------------
+   -- Latched with the rest of the draw context at the kick, for the same reason
+   -- everything else here is: a register written part-way through a primitive
+   -- must not change the primitive already being drawn.
+   signal dr_tme     : std_logic := '0';
+   signal dr_tex0    : std_logic_vector(63 downto 0) := (others => '0');
+   signal dr_tex1    : std_logic_vector(63 downto 0) := (others => '0');
+   signal dr_tclamp  : std_logic_vector(63 downto 0) := (others => '0');
+   -- RGBAQ's Q, as it stood at the kick -- which is the last vertex's, because
+   -- RGBAQ is rewritten before each one. On the UV path Q does not produce the
+   -- coordinate; it only says how far away the surface is, and that is what
+   -- picks the filter.
+   signal dr_q       : std_logic_vector(31 downto 0) := (others => '0');
+   signal q_exp      : unsigned(7 downto 0);
+   signal log2_invq  : signed(8 downto 0);
+   signal tex_lod    : signed(15 downto 0);
+   signal dr_texdone : std_logic := '0';    -- this pixel's texel has arrived
+   signal tex_ref    : std_logic := '0';    -- this primitive was refused
+   signal tex_colour : std_logic_vector(31 downto 0) := (others => '0');
+   signal frag_rgba  : std_logic_vector(31 downto 0);
+
+   signal tx_req, tx_done, tx_busy : std_logic := '0';
+   signal tx_colour  : std_logic_vector(31 downto 0);
+   signal tx_linear  : std_logic;
+   signal tx_rd_en   : std_logic;
+   signal tx_rd_addr : std_logic_vector(16 downto 0);
+   signal tx_rd_data : std_logic_vector(255 downto 0);
+   signal tx_rd_valid: std_logic;
+
+   signal kc_we      : std_logic := '0';
+   signal kc_idx     : unsigned(7 downto 0);
+   signal kc_entry   : std_logic_vector(31 downto 0);
+   signal kc_busy    : std_logic;
+   signal kc_loads   : unsigned(15 downto 0);
+   signal kc_unsup   : std_logic;
+   signal kc_rd_en   : std_logic;
+   signal kc_rd_addr : std_logic_vector(16 downto 0);
+
+   -- A textured primitive this rasteriser will not draw is counted and skipped
+   -- rather than drawn wrong: a sprite, whose UV ramp has no per-scanline seed
+   -- in this path yet, or PRIM.FST = 0, which needs the per-pixel divide.
+   signal dbg_tex_skip_i : unsigned(15 downto 0) := (others => '0');
+   -- Driven from inside the process: the register write that starts a palette
+   -- load, and the one that empties the texel cache. `w_addr` and `w_data` are
+   -- process variables, so neither can be decoded concurrently.
+   signal kc_tex0    : std_logic_vector(63 downto 0) := (others => '0');
+   signal tex_flush  : std_logic := '0';
+   signal tc_rd_en   : std_logic;
+   signal tc_rd_addr : std_logic_vector(16 downto 0);
    signal dr_zaddr   : unsigned(19 downto 0) := (others => '0');
    signal dr_ytop    : unsigned(10 downto 0) := (others => '0');
    signal dr_ret     : state_t := S_TAG;
@@ -254,6 +338,17 @@ architecture arch of gs_gif is
    signal c_dx10, c_dx20, c_dy10, c_dy20 : signed(19 downto 0) := (others => '0');
    signal c_sx, c_sy : signed(12 downto 0) := (others => '0');
    signal c_val   : u8_a;
+   -- The interpolated texture coordinate, U then V, 14 bits each in 12.4.
+   type u14_a is array (0 to 1) of unsigned(13 downto 0);
+   signal uv_val   : u14_a;
+   signal uv_busy  : std_logic_vector(1 downto 0);
+   signal uv_sbusy : std_logic_vector(1 downto 0);
+   -- Their own start pulses, not the colour channels'. c_start is raised only
+   -- when PRIM.IIP is set, because a flat triangle has no colour to
+   -- interpolate -- so a *textured* flat triangle sharing that pulse would
+   -- never seed its UV walk and would sample one texel for the whole
+   -- primitive. Depth already has its own pair for the same reason.
+   signal uv_start, uv_sstart : std_logic := '0';
    -- Depth rides the same unit, one instance wide, with ZMODE on.
    signal z_start, z_sstart : std_logic := '0';
    signal z_busy, z_sbusy   : std_logic;
@@ -453,6 +548,38 @@ begin
                    adv => c_adv, val => c_val(n));
    end generate;
 
+   -- **The texture coordinate rides the colour interpolator**, at 14 bits
+   -- instead of 8. That the GS shares one interpolator design between colour,
+   -- depth and UV is an assumption and not a measurement: the probes that
+   -- established the 2**-10 grid and the eight-pixel block used flat and
+   -- Gouraud triangles and say nothing about UV. It is the assumption that
+   -- costs least if it is wrong -- one generic on one block -- and it is what
+   -- makes this and sim/gs/gs_ref.py agree by construction rather than by
+   -- coincidence. A probe drawing a textured triangle whose UV gradient lands
+   -- just either side of a grid step would settle it.
+   --
+   -- **A sprite drives these too.** Its UV ramp is a plane: du/dx is
+   -- (u1-u0)/(x1-x0), du/dy is zero, and the other axis is the mirror of that.
+   -- Feeding the three synthesised corners (x0,y0,u0), (x1,y0,u1), (x0,y1,u0)
+   -- through the same plane arithmetic gives exactly that, so the sprite path
+   -- needs no divider of its own and the two primitives cannot drift apart.
+   uvdda : for n in 0 to 1 generate
+      u : entity work.gs_chan_dda
+         generic map (CWIDTH => 14)
+         port map (clk => clk, reset => reset,
+                   start => uv_start, det => c_det, sgn => c_sgn,
+                   dx10 => c_dx10, dx20 => c_dx20,
+                   dy10 => c_dy10, dy20 => c_dy20,
+                   x0 => t_x(0), y0 => t_y(0),
+                   c0 => unsigned(t_uv(0)(16 * n + 13 downto 16 * n)),
+                   c1 => unsigned(t_uv(1)(16 * n + 13 downto 16 * n)),
+                   c2 => unsigned(t_uv(2)(16 * n + 13 downto 16 * n)),
+                   busy => uv_busy(n),
+                   sstart => uv_sstart, sx => c_sx, sy => c_sy,
+                   sbusy => uv_sbusy(n),
+                   adv => c_adv, val => uv_val(n));
+   end generate;
+
    zdda : entity work.gs_chan_dda
       generic map (CWIDTH => 32, ZMODE => true)
       port map (clk => clk, reset => reset,
@@ -467,9 +594,118 @@ begin
                 sk => dr_y - dr_ytop, sbusy => z_sbusy,
                 adv => c_adv, val => z_val);
 
-   src_rgba <= (std_logic_vector(c_val(3)) & std_logic_vector(c_val(2))
-                & std_logic_vector(c_val(1)) & std_logic_vector(c_val(0)))
-               when dr_iip = '1' and tri_mode = '1' else dr_rgba;
+   -- The fragment colour *before* the texture: interpolated for a Gouraud
+   -- triangle, flat otherwise. This is what TFX combines with a texel.
+   frag_rgba <= (std_logic_vector(c_val(3)) & std_logic_vector(c_val(2))
+                 & std_logic_vector(c_val(1)) & std_logic_vector(c_val(0)))
+                when dr_iip = '1' and tri_mode = '1' else dr_rgba;
+
+   -- and what the back end writes. The texture, when there is one, has already
+   -- been combined with the fragment by gs_texsample's TFX.
+   src_rgba <= tex_colour when dr_tme = '1' else frag_rgba;
+
+   -- ---- the texture unit ---------------------------------------------------
+   --
+   -- gs_texsample reads through gs_texcache, which is why this block has one
+   -- memory port for texturing and not one per texel: the cache turns a raster
+   -- walk's four bilinear corners into roughly one memory read per four pixels
+   -- (docs/gs-texture.md).
+   --
+   -- **The palette loader and the cache share that one port**, and they are
+   -- muxed here rather than in gs_top so the arbiter above stays at four
+   -- customers. What makes that safe is an invariant rather than an arbiter:
+   -- a CLUT load starts on a TEX0 *register write*, a texel fetch starts in
+   -- S_DRAW, and the state machine is in exactly one of those at a time. The
+   -- draw side also waits for `kc_busy` before asking for a texel -- which it
+   -- has to anyway, because an indexed texture read against a half-loaded
+   -- palette is wrong, not merely early.
+   palette : entity work.gs_clut
+      port map (clk => clk, reset => reset,
+                we => kc_we, tex0 => kc_tex0, texclut => reg(16#1C#),
+                rd_en => kc_rd_en, rd_ready => t_rd_ready,
+                rd_addr => kc_rd_addr,
+                rd_data => t_rd_data, rd_valid => t_rd_valid,
+                idx => kc_idx, entry => kc_entry,
+                busy => kc_busy, loads => kc_loads, unsupported => kc_unsup);
+
+   -- **The filter comes from the LOD, not from MMAG alone.**
+   --
+   -- TEX1's MMAG and MMIN both exist because magnification and minification are
+   -- different situations, and which one a pixel is in is what the LOD says.
+   -- MMAG is one bit, because there is nothing above the base level to blend
+   -- with; MMIN is three, because minification can also blend between levels.
+   -- Wiring MMAG unconditionally would be right only for magnified surfaces and
+   -- would quietly pick the wrong filter for every minified one -- and with a Q
+   -- of zero, which is what a primitive that never wrote RGBAQ's upper half
+   -- has, *every* surface is minified.
+   --
+   -- The arithmetic is small enough that there is no reason not to do it:
+   -- log2(1/Q) is the negated exponent of Q and nothing else, the mantissa
+   -- being discarded entirely, so the level is an integer before K and L touch
+   -- it. LCM = 1 skips Q and takes K directly.
+   --
+   -- What is *not* here is the mipmap itself: MXL levels, MIPTBP and the
+   -- between-level blend. The LOD selects a filter and not yet a level, and the
+   -- model does the same, so the two agree -- but a texture with MXL > 0 is
+   -- drawn from its base level by both, which is a limitation and not a
+   -- behaviour. It stays that way until there is somewhere for the levels to
+   -- come from.
+   q_exp     <= unsigned(dr_q(30 downto 23));
+   log2_invq <= to_signed(127, 9) when q_exp = 0
+                else resize(to_signed(127, 9) - signed('0' & q_exp), 9);
+   tex_lod   <= resize(signed(dr_tex1(43 downto 32)), 16) when dr_tex1(19) = '1'
+                else resize(shift_left(log2_invq,
+                                       to_integer(unsigned(dr_tex1(1 downto 0)))), 16)
+                     + resize(signed(dr_tex1(43 downto 32)), 16);
+   tx_linear <= dr_tex1(5) when tex_lod < 0
+                else '1' when dr_tex1(8 downto 6) = "001"
+                          or dr_tex1(8 downto 6) = "011"
+                          or dr_tex1(8 downto 6) = "101"
+                else '0';
+
+   sampler : entity work.gs_texsample
+      port map (clk => clk, reset => reset,
+                req => tx_req,
+                -- Both sides are 12.4; the interpolator carries the 14 bits the
+                -- UV register has and the sampler takes 17 signed, so this is a
+                -- zero-extension and nothing else. Concatenating a low '0' here
+                -- instead would analyse perfectly and double every texture
+                -- coordinate.
+                u_fixed => signed(std_logic_vector(resize(uv_val(0), 17))),
+                v_fixed => signed(std_logic_vector(resize(uv_val(1), 17))),
+                frag => frag_rgba,
+                tex0 => dr_tex0, clamp => dr_tclamp, linear => tx_linear,
+                rd_en => tx_rd_en, rd_addr => tx_rd_addr,
+                rd_data => tx_rd_data, rd_valid => tx_rd_valid,
+                clut_idx => kc_idx, clut_data => kc_entry,
+                done => tx_done, colour => tx_colour, busy => tx_busy);
+
+   texcache : entity work.gs_texcache
+      port map (clk => clk, reset => reset,
+                c_rd_en => tx_rd_en, c_rd_addr => tx_rd_addr,
+                c_rd_data => tx_rd_data, c_rd_valid => tx_rd_valid,
+                c_ready => open,
+                m_rd_en => tc_rd_en, m_rd_addr => tc_rd_addr,
+                m_rd_data => t_rd_data, m_rd_valid => t_rd_valid,
+                m_ready => t_rd_ready,
+                -- Every write this rasteriser makes is snooped. The frame
+                -- buffer it is filling and the texture it is reading are the
+                -- same 4 MB, and rendering to a texture is an ordinary PS2
+                -- idiom; a cache that did not watch this would serve the
+                -- texture as it stood before the render.
+                snoop_en => wr_en, snoop_addr => wr_addr,
+                flush => tex_flush,
+                dbg_hits => dbg_tex_hits, dbg_misses => dbg_tex_misses,
+                dbg_inval => open, dbg_dropped => open);
+
+   -- The palette loader wins the shared port whenever it is running; the
+   -- invariant above says the cache is not asking when it is.
+   t_rd_en   <= kc_rd_en or tc_rd_en;
+   t_rd_addr <= kc_rd_addr when kc_rd_en = '1' else tc_rd_addr;
+
+   dbg_tex_skip   <= dbg_tex_skip_i;
+   dbg_clut_loads <= kc_loads;
+   dbg_tex_unsup  <= kc_unsup;
 
    -- A triangle interpolates its depth; a sprite carries it as an integer from
    -- its second vertex and never interpolates at all, which is both what the
@@ -506,9 +742,15 @@ begin
    -- The one decision that a pixel is over.  Three ways out: the fast colour
    -- write, the read-modify-write coming back, and the depth test rejecting it
    -- -- either outright, because ZTST is NEVER, or on the comparison.
+   -- A textured pixel is not finished until its texel has arrived, so the fast
+   -- path out of S_DRAW has to wait for it. The NEVER case above it does not:
+   -- a pixel the depth test rejects is never read, never textured and never
+   -- written, which is both correct and the reason a rejected pixel costs the
+   -- texture unit nothing.
    px_step <= '1' when state = S_DRAW and dr_empty = '0' and dr_y <= dr_y1
                        and ((dr_zon = '1' and dr_zdone = '0' and dr_ztst = "00")
                             or ((dr_zon = '0' or dr_zdone = '1')
+                                and (dr_tme = '0' or dr_texdone = '1')
                                 and dr_fbmsk = x"00000000" and dr_abe = '0'))
               else '1' when state = S_DRAWWR
               else '1' when state = S_DRAWRD and rd_valid = '1' and dr_wide = '0'
@@ -534,8 +776,21 @@ begin
    -- describes by a cycle, and the producer then advances on an edge where
    -- nothing was taken -- which loses a quadword exactly when the consumer
    -- stops to do some work, which is the one case that matters.
+   -- **A deny-list, so a new state defaults to "ready" -- which is wrong.**
+   -- Anything not named here advertises the GIF as able to take a quadword,
+   -- and a quadword taken by a state that does not consume one is not
+   -- back-pressured, it is *dropped*. S_TEX was added to this block without
+   -- being added here and the stream lost one quadword per textured pixel: the
+   -- packets after it were parsed against the wrong tag, and the rasteriser
+   -- ended up idle in S_TAG waiting for a tag the testbench believed it had
+   -- already sent. Nothing reported an error, because nothing had noticed.
+   --
+   -- Left as a deny-list rather than inverted, because inverting it now would
+   -- be a larger edit than the bug deserves -- but a state added below must be
+   -- added here too unless it genuinely accepts input.
    gif_ready <= '0' when reset = '1' else
                 '0' when state = S_PIXELS or state = S_DRAW or state = S_DRAWRD
+                         or state = S_TEX
                          or state = S_DRAWWR
                          or state = S_SPR_CLAMP or state = S_SPR_TEST
                          or state = S_TRI_SET or state = S_TRI_CEIL
@@ -597,7 +852,8 @@ begin
       -- which is the whole reason the two are not written as one.
       procedure next_px is
       begin
-         dr_zdone <= '0';
+         dr_zdone   <= '0';
+         dr_texdone <= '0';
          -- resize before adding: dr_x + px_run can reach 2048, which wraps an
          -- eleven-bit unsigned to zero and would read as "not the end of the
          -- scanline" on the very last pixel of the widest possible span.
@@ -665,6 +921,10 @@ begin
       end procedure;
    begin
       if rising_edge(clk) then
+         -- One-cycle pulses, cleared whatever else happens this edge.
+         kc_we     <= '0';
+         tex_flush <= '0';
+
          wr_en     <= '0';
          rd_en     <= '0';
          e_step    <= '0';
@@ -785,6 +1045,20 @@ begin
                               -- HWREG: two PSMCT32 pixels of transfer data
                               px_data <= x"0000000000000000" & w_data;
                               px_n    <= to_unsigned(2, 3);
+                           elsif w_addr = 16#06# or w_addr = 16#07# then
+                              -- A palette reloads on the TEX0 *write*, not at
+                              -- draw time. A load deferred to the draw would
+                              -- read local memory as it stands then, so a
+                              -- primitive rendering into the page its palette
+                              -- came from would see its own output.
+                              kc_we   <= '1';
+                              kc_tex0 <= w_data;
+                           elsif w_addr = 16#3F# then
+                              -- TEXFLUSH carries no data: writing it is the
+                              -- whole instruction. It is what content issues
+                              -- after rendering into a page it is about to
+                              -- texture from.
+                              tex_flush <= '1';
                            elsif w_addr = 0 then
                               v_cnt <= (others => '0');   -- PRIM restarts it
                            elsif w_addr = 4 or w_addr = 5
@@ -792,15 +1066,18 @@ begin
                               v0_x <= v1_x;  v0_y <= v1_y;  v0_c <= v1_c;
                               v1_x <= v2_x;  v1_y <= v2_y;  v1_c <= v2_c;
                               v0_z <= v1_z;  v1_z <= v2_z;
+                              v0_uv <= v1_uv; v1_uv <= v2_uv;
                               v2_x <= unsigned(w_data(15 downto 0));
                               v2_y <= unsigned(w_data(31 downto 16));
                               v2_c <= reg(1)(31 downto 0);
                               v2_z <= w_data(63 downto 32);
+                              v2_uv <= reg(3)(31 downto 0);
                               if v_cnt = 0 then          -- the fan's anchor
                                  vf_x <= unsigned(w_data(15 downto 0));
                                  vf_y <= unsigned(w_data(31 downto 16));
                                  vf_c <= reg(1)(31 downto 0);
                                  vf_z <= w_data(63 downto 32);
+                                 vf_uv <= reg(3)(31 downto 0);
                               end if;
                               if v_cnt < 7 then
                                  v_cnt <= v_cnt + 1;
@@ -858,7 +1135,13 @@ begin
                         k_sx1 <= to_integer(unsigned(reg(16#40# + ctxi)(26 downto 16)));
                         k_sy0 <= to_integer(unsigned(reg(16#40# + ctxi)(42 downto 32)));
                         k_sy1 <= to_integer(unsigned(reg(16#40# + ctxi)(58 downto 48)));
-                        if fb_drawable(reg(16#4C# + ctxi)(29 downto 24)) then
+                        -- A textured sprite is refused here for now, by the
+                        -- same gate a frame-buffer format this rasteriser
+                        -- cannot write uses: its UV ramp is a plane and the
+                        -- interpolators would take it, but this path has no
+                        -- per-scanline seed state to pulse them with.
+                        if fb_drawable(reg(16#4C# + ctxi)(29 downto 24))
+                           and reg(0)(4) = '0' then
                            k_ok <= '1';
                         else
                            k_ok <= '0';
@@ -893,6 +1176,16 @@ begin
                         -- an integer: there is no DDA behind it at all
                         dr_z     <= w_data(63 downto 32);
                         dr_zdone <= '0';
+                        -- A sprite's UV ramp is a plane and the interpolators
+                        -- would take it, but this path has no per-scanline seed
+                        -- state to pulse them with. Until it does, a textured
+                        -- sprite is counted and drawn untextured is *not* the
+                        -- choice made: dr_tme stays low and the count says so,
+                        -- so a test sees a refusal rather than a wrong colour.
+                        dr_tme <= '0';
+                        if reg(0)(4) = '1' then
+                           dbg_tex_skip_i <= dbg_tex_skip_i + 1;
+                        end if;
                         v_cnt  <= (others => '0');
                         dr_ret <= S_PACKED;
                         if last then dr_ret <= S_TAG; end if;
@@ -908,18 +1201,52 @@ begin
                            t_x(0) <= to_signed(to_integer(vf_x) - ofx, 18);
                            t_y(0) <= to_signed(to_integer(vf_y) - ofy, 18);
                            t_c(0) <= vf_c;
+                           t_uv(0) <= vf_uv;
                         else
                            t_x(0) <= to_signed(to_integer(v1_x) - ofx, 18);
                            t_y(0) <= to_signed(to_integer(v1_y) - ofy, 18);
                            t_c(0) <= v1_c;
+                           t_uv(0) <= v1_uv;
                         end if;
                         t_x(1) <= to_signed(to_integer(v2_x) - ofx, 18);
                         t_y(1) <= to_signed(to_integer(v2_y) - ofy, 18);
                         t_c(1) <= v2_c;
+                        t_uv(1) <= v2_uv;
                         t_x(2) <= to_signed(to_integer(unsigned(w_data(15 downto 0))) - ofx, 18);
                         t_y(2) <= to_signed(to_integer(unsigned(w_data(31 downto 16))) - ofy, 18);
                         t_c(2) <= reg(1)(31 downto 0);
+                        t_uv(2) <= reg(3)(31 downto 0);
                         dr_iip <= reg(0)(3);
+                        -- The texture context, latched with everything else:
+                        -- TEX0 written part-way through a primitive must not
+                        -- change the primitive already being drawn.
+                        --
+                        -- PRIM.FST = 0 asks for STQ and the per-pixel divide,
+                        -- which is not built. The primitive is counted and not
+                        -- drawn rather than drawn with a coordinate nothing
+                        -- produced -- the same rule the 16-bit CLUT layout is
+                        -- under, and the alternative is a picture that is
+                        -- wrong without saying so.
+                        if reg(0)(4) = '1' and reg(0)(8) = '1' then
+                           dr_tme  <= '1';
+                           tex_ref <= '0';
+                        elsif reg(0)(4) = '1' then
+                           -- Refused, and refused means **not drawn**. Drawing
+                           -- it untextured instead would put a flat-shaded
+                           -- triangle where a textured one belongs, which is a
+                           -- wrong picture rather than a missing one -- and a
+                           -- wrong picture is the harder of the two to notice.
+                           dr_tme  <= '0';
+                           tex_ref <= '1';
+                           dbg_tex_skip_i <= dbg_tex_skip_i + 1;
+                        else
+                           dr_tme  <= '0';
+                           tex_ref <= '0';
+                        end if;
+                        dr_q      <= reg(1)(63 downto 32);
+                        dr_tex0   <= reg(16#06# + ctxi);
+                        dr_tex1   <= reg(16#14# + ctxi);
+                        dr_tclamp <= reg(16#08# + ctxi);
                         if reg(0)(2 downto 0) = "101" then
                            t_z(0) <= vf_z;
                         else
@@ -953,9 +1280,12 @@ begin
                         dr_alpha <= reg(16#42# + ctxi)(7 downto 0);
                         dr_fix   <= unsigned(reg(16#42# + ctxi)(39 downto 32));
                         dr_clamp <= reg(16#46#)(0);
-                        if not fb_drawable(reg(16#4C# + ctxi)(29 downto 24)) then
+                        if not fb_drawable(reg(16#4C# + ctxi)(29 downto 24))
+                           or (reg(0)(4) = '1' and reg(0)(8) = '0') then
                            dr_empty <= '1';            -- a format this
-                                                       -- rasteriser cannot write
+                                                       -- rasteriser cannot
+                                                       -- write, or a texture
+                                                       -- mode it cannot sample
                         else
                            dr_empty <= '0';
                         end if;
@@ -1143,6 +1473,9 @@ begin
                      if dr_iip = '1' then
                         c_start <= '1';
                      end if;
+                     if dr_tme = '1' then
+                        uv_start <= '1';
+                     end if;
                      if dr_zon = '1' then
                         z_start <= '1';
                      end if;
@@ -1152,11 +1485,13 @@ begin
                   state    <= S_TRI_WAIT;
 
                when S_TRI_WAIT =>
-                  e_start <= '0';
-                  c_start <= '0';
-                  z_start <= '0';
+                  e_start  <= '0';
+                  c_start  <= '0';
+                  uv_start <= '0';
+                  z_start  <= '0';
                   if e_start = '0' and e_busy = "000"
                      and c_start = '0' and c_busy = "0000"
+                     and uv_start = '0' and uv_busy = "00"
                      and z_start = '0' and z_busy = '0' then
                      if dr_empty = '1' then
                         tri_mode <= '0';
@@ -1176,9 +1511,11 @@ begin
                   state <= S_TRI_SCAN;
 
                when S_TRI_SEED =>
-                  c_sstart <= '0';
-                  z_sstart <= '0';
+                  c_sstart  <= '0';
+                  uv_sstart <= '0';
+                  z_sstart  <= '0';
                   if c_sstart = '0' and c_sbusy = "0000"
+                     and uv_sstart = '0' and uv_sbusy = "00"
                      and z_sstart = '0' and z_sbusy = '0' then
                      state <= S_DRAW;
                   end if;
@@ -1230,14 +1567,25 @@ begin
                      dr_x  <= to_unsigned(q_lft, 11);
                      dr_x0 <= to_unsigned(q_lft, 11);
                      dr_x1 <= to_unsigned(q_rgt, 11);
-                     if dr_iip = '1' or dr_zon = '1' then
+                     if dr_iip = '1' or dr_zon = '1' or dr_tme = '1' then
                         -- Every span is seeded at its own first pixel, which is
                         -- also where the blocking starts: lane 0 of block 0 is
                         -- the leftmost pixel of this scanline, not of the
                         -- triangle and not of an aligned x.
+                        --
+                        -- **dr_tme belongs in this condition and not only in
+                        -- the pulses below.** A flat, depth-less, textured
+                        -- triangle sets neither of the other two, so without it
+                        -- the whole seeding step is skipped: c_sx and c_sy are
+                        -- never written, no seed pulse is issued, and the UV
+                        -- interpolators sit at zero for the entire primitive.
+                        -- The symptom is a triangle painted in one texel --
+                        -- which reads as a texture-addressing fault rather than
+                        -- as a missing state transition.
                         c_sx <= to_signed(q_lft, 13);
                         c_sy <= signed(resize(dr_y, 13));
                         if dr_iip = '1' then c_sstart <= '1'; end if;
+                        if dr_tme = '1' then uv_sstart <= '1'; end if;
                         if dr_zon = '1' then z_sstart <= '1'; end if;
                         state <= S_TRI_SEED;
                      else
@@ -1280,7 +1628,12 @@ begin
                   -- test is one that needs no read: ZTST = ALWAYS writes every
                   -- pixel, so there is no per-lane pass mask to build.
                   -- GEQUAL and GREATER stay one at a time until there is.
-                  wide := tri_mode = '0' and dr_fb16 = '0'
+                  -- and never for a textured primitive: each of the four
+                  -- lanes needs its own texel, and this block fetches one at a
+                  -- time. tri_mode already excludes every textured primitive
+                  -- this rasteriser draws, so the term is belt and braces until
+                  -- the sprite path gains UV -- at which point it stops being.
+                  wide := dr_tme = '0' and tri_mode = '0' and dr_fb16 = '0'
                           and (dr_zon = '0'
                                or (dr_ztst = "01" and dr_z16 = '0'));
                   if wide then
@@ -1293,6 +1646,29 @@ begin
                   end if;
                   if dr_empty = '1' or dr_y > dr_y1 then
                      state <= dr_ret;
+                  elsif dr_tme = '1' and dr_texdone = '0'
+                        and (dr_zon = '0' or dr_zdone = '1') then
+                     -- After the depth test and before anything is read or
+                     -- blended. A pixel the test rejected never gets here, so
+                     -- it costs no texel -- which is the same ordering rule the
+                     -- depth test itself is under, one stage further on.
+                     --
+                     -- **Waiting for the palette is a branch of its own, not a
+                     -- term in this condition.** The palette shares this
+                     -- block's texture port and answers the sampler's index, so
+                     -- a fetch started under a half-loaded CLUT would be wrong
+                     -- rather than merely early -- but putting `kc_busy = '0'`
+                     -- into the condition above makes the *elsif* fall through
+                     -- to the colour write instead, which draws the pixel with
+                     -- whatever texel the previous one happened to leave in
+                     -- tex_colour. That is a textured primitive painted in one
+                     -- stale colour, and it looks like a cache fault.
+                     if kc_busy = '1' then
+                        null;              -- hold here; the palette is loading
+                     else
+                        tx_req <= '1';
+                        state  <= S_TEX;
+                     end if;
                   elsif dr_zon = '1' and dr_zdone = '0' then
                      -- The depth test comes first, and a pixel it rejects is
                      -- never read, never blended and never written.  Doing it
@@ -1426,6 +1802,21 @@ begin
                   end if;
 
                -- The wide read-modify-write's write, a cycle after its blend.
+               when S_TEX =>
+                  tx_req <= '0';
+                  if tx_done = '1' then
+                     tex_colour <= tx_colour;
+                     dr_texdone <= '1';
+                  end if;
+                  -- Back to S_DRAW either way: with the texel if it has
+                  -- arrived, and to wait again if it has not. The state is not
+                  -- left until tx_done, because tx_busy falls on the same edge
+                  -- and a return that watched *that* would re-enter with the
+                  -- colour already replaced by the next request's.
+                  if tx_done = '1' then
+                     state <= S_DRAW;
+                  end if;
+
                when S_DRAWWR =>
                   wr_en   <= '1';
                   wr_addr <= std_logic_vector(dr_addr(19 downto 3));

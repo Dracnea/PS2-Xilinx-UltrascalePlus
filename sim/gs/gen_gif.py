@@ -215,6 +215,115 @@ def gen(rng, ntags):
                     out.append(rng.randrange(1 << 32) | (0x01 << 64))
                 out.append((vx | (vy << 16) | (zval(rng) << 32)) | (0x05 << 64))
         elif pick < 0.46:
+            # A textured triangle, with its texture laid down first.
+            #
+            # The transfer is not decoration. Local memory starts as zeros in
+            # both models, so a texture read from it agrees trivially and proves
+            # nothing: every texel is zero, every format gives black, and a
+            # completely miswired address path passes. The eight-by-eight
+            # PSMCT32 block written here is what makes the addressing
+            # observable.
+            #
+            # The texture goes at block 96 -- page 3 -- and the frame buffer at
+            # page 0 or 1, so drawing cannot land on the texture. Overlapping
+            # them is a real thing to test, but it is a *coherence* test and it
+            # belongs with the cache's snoop rather than in a stream whose
+            # reference would then depend on the order of two unrelated writes.
+            TBP = 96
+            out.append(tag(1, 0, 0xEEEE, 4))
+            out.append((TBP << 32) | (1 << 48) | (0x50 << 64))   # BITBLTBUF
+            out.append((0 << 32) | (0 << 48) | (0x51 << 64))     # TRXPOS
+            out.append((8 | (8 << 32)) | (0x52 << 64))           # TRXREG
+            out.append((0) | (0x53 << 64))                       # TRXDIR: host->local
+            # 64 texels as IMAGE-mode data -- FLG = 2 and four PSMCT32 pixels
+            # to a quadword, the same shape the plain transfer above uses.
+            # PACKED mode with a register descriptor would be accepted and would
+            # write that register sixty-four times instead, which desynchronises
+            # the whole stream rather than producing a wrong texture.
+            #
+            # Deliberately not a gradient: a smooth texture makes a half-texel
+            # sampling error invisible, which is the error bilinear is most
+            # likely to have.
+            out.append(tag(16, 1, 0, 1, flg=2))
+            for i in range(16):
+                qw = 0
+                for j in range(4):
+                    qw |= (rng.randrange(1 << 32) | 0x80000000) << (32 * j)
+                out.append(qw)
+
+            # Indexed half the time, which brings the palette in. The texture
+            # bytes are the same ones just written -- read as PSMT8 they are
+            # four indices per word at a different swizzle, which is fine: both
+            # models read the same bytes the same way, and what is under test is
+            # the index path and not the plausibility of the picture.
+            indexed = rng.random() < 0.4
+            psm = 0x13 if indexed else 0x00
+            cld = 1 if indexed else 0
+            tex0 = (TBP | (1 << 14) | (psm << 20) | (3 << 26) | (3 << 30)
+                    | (rng.randint(0, 1) << 34)             # TCC
+                    | (rng.randrange(0, 4) << 35)           # TFX
+                    | (TBP << 37)                           # CBP: the same block
+                    | (0 << 51) | (0 << 55) | (0 << 56)     # PSMCT32, CSM1, CSA 0
+                    | (cld << 61))
+            # MMAG and MMIN, and a K/L that leaves the LOD where Q puts it. MXL
+            # stays zero: mipmap levels are not built in either model, and a
+            # non-zero MXL would ask them to agree about something neither does.
+            tex1 = ((rng.randint(0, 1) << 5)                # MMAG
+                    | (rng.choice([0, 1]) << 6)             # MMIN
+                    | (rng.randint(0, 1) << 19))            # LCM
+            # CLAMP: every wrap mode, and REGION_* bounds inside the 8x8.
+            tclamp = (rng.randrange(0, 4) | (rng.randrange(0, 4) << 2)
+                      | (rng.randrange(0, 8) << 4) | (rng.randrange(0, 8) << 14)
+                      | (rng.randrange(0, 8) << 24) | (rng.randrange(0, 8) << 34))
+
+            prim = rng.choice([3, 4, 5])
+            nv   = 3 if prim == 3 else rng.choice([3, 4])
+            bx, by = rng.randrange(0, 32), rng.randrange(0, 16)
+            msk = rng.choice([0x00000000, 0x00000000, 0xFF000000])
+            sc  = (rng.randrange(0, 4), rng.randrange(40, 64),
+                   rng.randrange(0, 4), rng.randrange(20, 32))
+            abe, alpha, cclamp = blend_regs(rng)
+            iip = rng.choice([0, 1])
+            fpsm = fbpsm(rng)
+            zbuf, ztest = depth_regs(rng, fpsm)
+            items = [(0x4C, rng.choice([0, 1]) | (1 << 16) | (fpsm << 24) | (msk << 32)),
+                     (0x18, 0),
+                     (0x40, sc[0] | (sc[1] << 16) | (sc[2] << 32) | (sc[3] << 48)),
+                     (0x42, alpha), (0x46, cclamp),
+                     (0x4E, zbuf), (0x47, ztest),
+                     (0x06, tex0), (0x14, tex1), (0x08, tclamp),
+                     (0x01, rng.randrange(1 << 32)),
+                     # TME and FST. FST = 0 asks for STQ and the per-pixel
+                     # divide, which neither model has; it is generated
+                     # occasionally anyway, because both must *refuse* it in the
+                     # same way and a refusal nothing exercises is not a refusal.
+                     (0x00, prim | (iip << 3) | (1 << 4) | (abe << 6)
+                            | (rng.choice([1, 1, 1, 0]) << 8))]
+            regs = 0
+            for i in range(len(items)):
+                regs |= 0xE << (4 * i)
+            out.append(tag(1, 0, regs, len(items)))
+            for a, d in items:
+                out.append((d & ((1 << 64) - 1)) | (a << 64))
+            # UV before every vertex, the way RGBAQ goes before a Gouraud one.
+            # The coordinates deliberately run past the 8x8 so the wrap modes
+            # are reached: a texture walked only inside its own bounds tests
+            # REPEAT and nothing else.
+            per = 3 if iip else 2
+            vr = 0
+            for i in range(nv * per):
+                vr |= 0xE << (4 * i)
+            out.append(tag(1, 1, vr, nv * per))
+            for _ in range(nv):
+                vx = (bx + rng.randrange(0, 14)) * 16 + rng.randrange(0, 16)
+                vy = (by + rng.randrange(0, 10)) * 16 + rng.randrange(0, 16)
+                u  = rng.randrange(0, 24) * 16 + rng.randrange(0, 16)
+                v  = rng.randrange(0, 24) * 16 + rng.randrange(0, 16)
+                out.append((u | (v << 16)) | (0x03 << 64))
+                if iip:
+                    out.append(rng.randrange(1 << 32) | (0x01 << 64))
+                out.append((vx | (vy << 16) | (zval(rng) << 32)) | (0x05 << 64))
+        elif pick < 0.58:
             # a host-to-local transfer of a small rectangle
             w = rng.randrange(1, 9)
             h = rng.randrange(1, 5)
