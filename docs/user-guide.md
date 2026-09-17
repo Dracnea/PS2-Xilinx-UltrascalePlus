@@ -1,4 +1,4 @@
-# Running the PS2 IOP on your own card
+# Running the PS2 hardware on your own card
 
 For someone who owns a Varium C1100 (Alveo U55N) and wants to run what is here
 today, without reading the rest of the docs. It says what the card can do
@@ -10,9 +10,11 @@ are in the linked pages.
 
 | you can | you cannot yet |
 |---|---|
-| Load a bitstream over the card's USB JTAG and talk to it over PCIe from Linux, or over the card's UART with no driver and no root at all | Play a game. There is no Emotion Engine, no Vector Unit, no Graphics Synthesizer |
-| Run the PS2 I/O processor — R3000A, RAM and ROM, timers, interrupt controller, SPU2 stand-in, SIO2 with a pad, CDVD with no disc | See a picture. Video comes from the GS, which does not exist |
-| **Load your own BIOS dump and watch it boot**: the reset code, then the IOP kernel loading 21 of its 29 modules | Get past that. The last modules want DMA and a SIF with an EE behind it, and both are register stubs |
+| Load a bitstream over the card's USB JTAG and talk to it over PCIe from Linux, or over the card's UART with no driver and no root at all | Play a game. Three of the console's blocks work and about fifteen do not — there are no vector units, no EE DMAC and no SIF on the EE side |
+| Run the PS2 I/O processor — R3000A, RAM and ROM, timers, interrupt controller, SPU2 stand-in, SIO2 with a pad, CDVD reading a real disc out of HBM | Boot a game from that disc. The IOP finds and opens the executable; nothing runs it |
+| **Load your own BIOS dump and watch it boot** to `BOOTEND`, and have `CDVDMAN` open `SLUS_212.40` off your own disc image by name | Get to the browser screen. That wants the EE and the SIF together |
+| **Run programs on the Emotion Engine's R5900** — 64-bit MIPS III plus the 128-bit MMI set, at the console's 294.912 MHz, executing out of its real 32 MB in HBM | Run a game on it. The FPU is half built and the DMAC, VIF, GIF-side and IPU are not started |
+| **Draw with the Graphics Synthesizer**: sprites, flat and Gouraud triangles, the depth test, alpha blending, and **textures** — nine formats, a palette, all four wrap modes, nearest and bilinear — and read the frame back as a PNG | See it on a monitor. There is no sync generator and nothing leaves a connector; the picture comes back over PCIe |
 | Read the IOP's RAM and ROM back for a post-mortem, and see which modules loaded | Use Windows. The PCIe driver is Linux only |
 | Build every image yourself from source with Vivado | |
 
@@ -165,6 +167,59 @@ fault from another and not for anything that ships — a setup-timing problem go
 away when the period doubles, and a hold violation or a logic fault does not
 care. A build made with it will fail `--clock`, correctly, because that check
 hard-compares against the console's rate.
+
+## Drawing a picture with the Graphics Synthesizer
+
+The GS image is the rasteriser, its 4 MB of local memory, the texture unit and
+the display circuit. Like the EE image it is driven from the host: you hand it
+GIF packets, it draws, and you read the frame back. There is no sync generator,
+so nothing comes out of a connector — the picture returns over PCIe.
+
+```sh
+sudo tools/reload.sh c1100_gs_tex
+
+# a scene meant to be looked at: triangles, sprites, blending, the depth test
+tools/gs/gen_scene.py > scene.hex
+python3 tools/gs/gsrun.py  --csr build/c1100_gs_tex/csr.csv --prog scene.hex
+python3 tools/gs/gsgrab.py --csr build/c1100_gs_tex/csr.csv --prog scene.hex \
+                           --size 320 224 -o scene.png
+```
+
+`gsrun.py` prints how many pixels the card drew and **runs the same packets
+through the reference model**, so a run that disagrees says so rather than
+quietly producing a wrong picture.
+
+For textures there is a second scene, built so that the ways texturing goes
+wrong are visible:
+
+```sh
+tools/gs/gen_texscene.py > texscene.hex
+python3 tools/gs/gsrun.py     --csr build/c1100_gs_tex/csr.csv --prog texscene.hex
+python3 tools/gs/pcrtcgrab.py --csr build/c1100_gs_tex/csr.csv --raster 64 64 -o pcrtc.png
+```
+
+It draws one texture four times: nearest and bilinear, at one texel per pixel
+and at two. The top two quadrants should be **pixel-identical** and the bottom
+two clearly different — blocks against a gradient. If the top pair differs, the
+filter's half-texel offset is wrong; if the bottom pair matches, the filter is
+not filtering.
+
+The two grabbers take different routes to the same memory and it is worth
+knowing which you are using:
+
+* `gsgrab.py` reads the frame buffer over PCIe and de-swizzles it on the host.
+  Any size.
+* `pcrtcgrab.py` reads it through **the card's own display circuit**, which is
+  the path a monitor would eventually see. Its grab buffer holds 4096 pixels, so
+  64 × 64 and no larger.
+* `gsgrab.py --model-only` needs no card at all and renders the same packets
+  with `sim/gs/gs_ref.py`, which is how you tell a card fault from a packet you
+  wrote wrong.
+
+**What the GS does not do yet:** textured sprites and `PRIM.FST = 0` (which
+needs the perspective divide) are counted and skipped rather than drawn wrong —
+`gsrun.py` reports the count. There is no mipmapping, no dither, and no alpha
+test.
 
 ## Driving the card with no driver and no root
 
