@@ -1,1 +1,0 @@
-xsim {memsim} -autoloadwcfg -runall

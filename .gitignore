@@ -23,8 +23,9 @@ venv/
 # simulation and fit scratch
 sim/work/
 sim/work_dbg/
-sim/ee/work/
-sim/gs/work/
+# Any sim/<unit>/work, not a list of the units that happened to exist. The
+# per-unit list is why sim/mem/work escaped and got committed.
+sim/*/work/
 fit/ee/*.rpt
 # Vivado batch-mode droppings: fmax.tcl and fmax_pblock.tcl are run from the
 # repo root, and Vivado writes these into the working directory.
